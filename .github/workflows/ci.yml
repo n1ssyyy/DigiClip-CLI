@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake clang libclang-dev build-essential
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: test
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: digiclip.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe: digiclip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            exe: digiclip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake clang libclang-dev build-essential
+
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: brew install cmake llvm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Smoke check
+        shell: bash
+        run: |
+          ./target/${{ matrix.target }}/release/${{ matrix.exe }} --help
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digiclip-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.exe }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: digiclip-x86_64-pc-windows-msvc
+          path: artifacts/windows
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: digiclip-x86_64-unknown-linux-gnu
+          path: artifacts/linux
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: digiclip-aarch64-apple-darwin
+          path: artifacts/macos
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/windows/**/*
+            artifacts/linux/**/*
+            artifacts/macos/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
