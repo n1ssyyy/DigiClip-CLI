@@ -83,11 +83,25 @@ jobs:
         run: |
           ./target/${{ matrix.target }}/release/${{ matrix.exe }} --help
 
+      - name: Rename binary per target
+        # Release assets share one flat namespace: linux `digiclip` and
+        # macOS `digiclip` would collide and one would silently win.
+        # Unique names per target (v2.0.0 lost the macOS binary this way).
+        shell: bash
+        run: |
+          mkdir -p dist
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-msvc) cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" dist/digiclip-win-x64.exe ;;
+            x86_64-unknown-linux-gnu) cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" dist/digiclip-linux-x64 ;;
+            aarch64-apple-darwin) cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" dist/digiclip-macos-arm64 ;;
+          esac
+          ls -la dist/
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: digiclip-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.exe }}
+          path: dist/*
           if-no-files-found: error
           retention-days: 14
 
