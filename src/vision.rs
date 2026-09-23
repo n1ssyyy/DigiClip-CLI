@@ -57,7 +57,7 @@ pub fn grab_frame(
     t: f64,
 ) -> anyhow::Result<Vec<u8>> {
     let out = std::env::temp_dir().join(format!("digiclip-vlm-{}.jpg", std::process::id()));
-    let status = std::process::Command::new(ffmpeg)
+    let status = crate::process::command(ffmpeg)
         .args([
             "-hide_banner",
             "-loglevel",

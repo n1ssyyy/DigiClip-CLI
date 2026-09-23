@@ -343,8 +343,8 @@ pub fn sample_frames(
     sample_h: u32,
     seek: Option<(f64, f64)>,
 ) -> anyhow::Result<Vec<(f64, Vec<u8>)>> {
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new(ffmpeg);
+    use std::process::Stdio;
+    let mut cmd = crate::process::command(ffmpeg);
     cmd.arg("-hide_banner").arg("-v").arg("error");
     let t0 = seek.map(|(s, _)| s).unwrap_or(0.0);
     if let Some((s, d)) = seek {

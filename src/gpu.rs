@@ -36,7 +36,7 @@ pub fn looks_discrete(name: &str) -> bool {
 }
 
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    let out = crate::process::command(cmd).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -96,7 +96,7 @@ pub fn from_wmi() -> Vec<GpuDevice> {
         #[serde(rename = "AdapterRAM")]
         ram: Option<i64>,
     }
-    let out = std::process::Command::new("powershell")
+    let out = crate::process::command("powershell")
         .args([
             "-NoProfile",
             "-Command",

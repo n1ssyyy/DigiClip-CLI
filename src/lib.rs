@@ -8,6 +8,7 @@ pub mod kit;
 pub mod models;
 pub mod openrouter;
 pub mod pipeline;
+pub mod process;
 pub mod progress;
 pub mod prompt;
 pub mod provision;
