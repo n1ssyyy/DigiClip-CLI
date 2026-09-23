@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+*.rs diff=rust
+*.md diff=markdown
+*.toml text
+*.lock text
+
+# ONNX weights / binaries are binary
+*.onnx binary
+*.bin binary
+*.exe binary
+*.ttf binary

@@ -1,0 +1,34 @@
+# Build output (never committed — CI rebuilds it)
+/target/
+**/*.rs.bk
+
+# Debug symbols / incremental artifacts that escape target/ on Windows
+**/*.pdb
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Downloaded-at-runtime weights (75MB–3GB, over GitHub's 100MB cap).
+# Fetched on first transcribe via `digiclip --provision`; never committed.
+models/ggml-*.bin
+models/*.part
+
+# Provisioned user-data caches that may land in-repo during dev
+/resources/models/*.bin
+/resources/models/*.part
+
+# Platform sidecar binaries built by CI (see resources/bin/README.md).
+# Checked-in set is intentional (small CPU builds); CI fills the rest.
+# Uncomment to keep all binaries out of git:
+# resources/bin/*/*
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
