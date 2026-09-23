@@ -142,7 +142,7 @@ pub fn scan(
         a * 100.0
     ));
     let run = |args: &[String]| -> anyhow::Result<std::process::Output> {
-        Ok(std::process::Command::new(ffmpeg).args(args).output()?)
+        Ok(crate::process::command(ffmpeg).args(args).output()?)
     };
     let s = |v: &dyn ToString| v.to_string();
     run(&[

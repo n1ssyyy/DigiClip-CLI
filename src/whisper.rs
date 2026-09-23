@@ -41,7 +41,7 @@ pub fn cpu_count() -> usize {
             }
         }
     }
-    if let Ok(out) = std::process::Command::new("nproc").output() {
+    if let Ok(out) = crate::process::command("nproc").output() {
         if out.status.success() {
             let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if let Ok(v) = t.parse::<usize>() {
@@ -263,7 +263,6 @@ pub async fn transcribe(
     opts: &TranscribeOptions,
     cancel: &crate::progress::CancelFlag,
 ) -> anyhow::Result<Transcription> {
-    use std::process::Command;
     if !wav.is_file() {
         anyhow::bail!("Audio not found: {}", wav.display());
     }
@@ -308,7 +307,7 @@ pub async fn transcribe(
     let (prog, args) = cmd.split_first().unwrap();
     // Enforce the model-tier timeout (PHP used Process::setTimeout).
     // Poll the child; kill on expiry so a stuck sidecar can't hang the CLI.
-    let mut child = Command::new(prog).args(args).spawn()?;
+    let mut child = crate::process::command(prog).args(args).spawn()?;
     let deadline = std::time::Duration::from_secs(opts.timeout_s.max(60));
     let start = std::time::Instant::now();
     let status = loop {

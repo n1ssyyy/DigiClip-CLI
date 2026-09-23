@@ -15,7 +15,6 @@
 //! `cpus-2` rule as transcription.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::framing::CamPose;
 use crate::track::RawTarget;
@@ -115,7 +114,7 @@ fn fonts_dir() -> PathBuf {
 }
 
 fn encoder_available(ffmpeg: &Path, name: &str) -> bool {
-    let out = std::process::Command::new(ffmpeg)
+    let out = crate::process::command(ffmpeg)
         .args(["-hide_banner", "-encoders"])
         .output();
     let Ok(out) = out else { return false };
@@ -149,7 +148,7 @@ pub fn pick_encoder(gpu: bool) -> String {
 }
 
 fn has_nvidia() -> bool {
-    Command::new("nvidia-smi")
+    crate::process::command("nvidia-smi")
         .args(["-L"])
         .output()
         .map(|o| o.status.success())
@@ -281,7 +280,7 @@ fn run_ffmpeg_progress(
     cancel: &crate::progress::CancelFlag,
 ) -> anyhow::Result<()> {
     use std::io::BufRead;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     tracing::info!("{what}");
     if args.len() < 2 {
         anyhow::bail!("{what}: empty ffmpeg command");
@@ -296,7 +295,7 @@ fn run_ffmpeg_progress(
         full.push("pipe:1".into());
         full.push(out);
     }
-    let mut child = Command::new(prog)
+    let mut child = crate::process::command(prog)
         .args(&full)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

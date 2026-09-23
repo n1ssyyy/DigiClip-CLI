@@ -100,14 +100,12 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         // NOTE: no Unix `2>/dev/null` redirect here — that syntax breaks
         // `cmd /C where` on Windows. Stderr is simply discarded below.
         let out = if cfg!(windows) {
-            std::process::Command::new("cmd")
+            crate::process::command("cmd")
                 .args(["/C", "where", n])
                 .output()
         } else {
             let script = format!("command -v {n}");
-            std::process::Command::new("sh")
-                .args(["-c", &script])
-                .output()
+            crate::process::command("sh").args(["-c", &script]).output()
         };
         if let Ok(out) = out {
             if out.status.success() {
@@ -161,7 +159,7 @@ pub fn require(name: &str) -> anyhow::Result<PathBuf> {
 /// Primary signal is `--enable-libass` in the build config (stable text);
 /// the `-filters` listing is the fallback (its layout varies by build).
 pub fn ffmpeg_has_libass(ffmpeg: &Path) -> bool {
-    let conf = std::process::Command::new(ffmpeg)
+    let conf = crate::process::command(ffmpeg)
         .args(["-hide_banner", "-buildconf"])
         .output();
     if let Ok(o) = conf {
@@ -174,7 +172,7 @@ pub fn ffmpeg_has_libass(ffmpeg: &Path) -> bool {
             return true;
         }
     }
-    let out = std::process::Command::new(ffmpeg)
+    let out = crate::process::command(ffmpeg)
         .args(["-hide_banner", "-filters"])
         .output();
     match out {

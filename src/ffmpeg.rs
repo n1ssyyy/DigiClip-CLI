@@ -2,7 +2,6 @@
 //! parsing `ffmpeg -i` stderr. All meta fields optional, never block ingest.
 
 use std::path::Path;
-use std::process::Command;
 
 #[derive(Debug, Clone, Default)]
 pub struct Probe {
@@ -16,7 +15,7 @@ pub fn extract_wav(source: &Path, dest: &Path, rate: u32) -> anyhow::Result<()> 
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p)?;
     }
-    let status = Command::new(&ffmpeg)
+    let status = crate::process::command(&ffmpeg)
         .args([
             "-y",
             "-i",
@@ -44,7 +43,7 @@ pub fn poster(source: &Path, dest: &Path) -> bool {
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p)?;
         }
-        let status = Command::new(&ffmpeg)
+        let status = crate::process::command(&ffmpeg)
             .args([
                 "-y",
                 "-ss",
@@ -77,7 +76,7 @@ pub fn probe(source: &Path) -> Probe {
 
 fn probe_via_ffprobe(source: &Path) -> Option<Probe> {
     let ffprobe = crate::binaries::resolve("ffprobe")?;
-    let out = Command::new(&ffprobe)
+    let out = crate::process::command(&ffprobe)
         .args([
             "-v",
             "quiet",
@@ -129,7 +128,7 @@ fn probe_via_ffmpeg_stderr(source: &Path) -> Probe {
         Ok(f) => f,
         Err(_) => return Probe::default(),
     };
-    let out = Command::new(&ffmpeg)
+    let out = crate::process::command(&ffmpeg)
         .args(["-hide_banner", "-i", &source.display().to_string()])
         .output();
     let Ok(out) = out else {
