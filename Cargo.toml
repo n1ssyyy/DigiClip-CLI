@@ -1,6 +1,6 @@
 [package]
 name = "digiclip-rs"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 description = "DigiClip CLI — drop a video, get TikTok-ready clips or a subtitled full video. Offline STT via whisper.cpp, clip-picking via OpenRouter with heuristic fallback, 9:16 renders via ffmpeg."
 license = "MIT"
