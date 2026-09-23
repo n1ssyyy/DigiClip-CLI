@@ -233,7 +233,7 @@ cargo run --example stt_check     # embedded STT vs whisper-cli ground truth
 Cut a release:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v2.0.0 && git push origin v2.0.0
 ```
 
 ## 🗺 Project map
