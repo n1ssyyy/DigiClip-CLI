@@ -15,6 +15,10 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     if args.serve {
+        // Never outlive our spawner: an orphaned engine keeps
+        // `resources\digiclip.exe` locked and the next install/update
+        // fails with "Error opening file for writing".
+        digiclip_rs::watchdog::watch_parent();
         // Own runtime (fixed workers): the default runtime sizes itself
         // to the machine and a 1-CPU sandbox would starve the socket pump.
         return digiclip_rs::serve::run_serve_blocking(

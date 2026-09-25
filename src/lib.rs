@@ -21,4 +21,5 @@ pub mod timeline;
 pub mod track;
 pub mod validator;
 pub mod vision;
+pub mod watchdog;
 pub mod whisper;
