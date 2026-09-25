@@ -85,14 +85,18 @@ pub fn threads() -> usize {
 }
 
 /// Escape a path for use inside an ffmpeg -vf filter argument.
+///
+/// Two parsing levels see it: the option value (`\:`, `\,`, `\'` escapes)
+/// and then the filtergraph, where it sits in single quotes. Nothing can be
+/// escaped inside graph-level quotes, so a quote is written close-quote,
+/// escaped quote, reopen (`'\''`) — e.g. `C:\Users\O'Brien`.
 pub fn filter_escape(path: &Path) -> String {
     let s = path.display().to_string().replace('\\', "/");
-    format!(
-        "'{}'",
-        s.replace('\'', "\\'")
-            .replace(':', "\\:")
-            .replace(',', "\\,")
-    )
+    let option_level = s
+        .replace('\'', "\\'")
+        .replace(':', "\\:")
+        .replace(',', "\\,");
+    format!("'{}'", option_level.replace('\'', "'\\''"))
 }
 
 fn fonts_dir() -> PathBuf {
@@ -806,4 +810,28 @@ pub fn render_full(
         source, words, style, chunks, src_w, src_h, gpu, out_mp4, threads, "full", None, progress,
         cancel,
     )
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::filter_escape;
+    use std::path::Path;
+
+    #[test]
+    fn drive_colons_and_commas_are_escaped() {
+        assert_eq!(
+            filter_escape(Path::new("C:/Users/me/a,b.ass")),
+            r"'C\:/Users/me/a\,b.ass'"
+        );
+    }
+
+    #[test]
+    fn quotes_close_and_reopen_the_graph_quote() {
+        // Graph level: 'C\:/Users/O\' + \' + 'Brien/x.ass' → option level
+        // sees C\:/Users/O\'Brien/x.ass → C:/Users/O'Brien/x.ass.
+        assert_eq!(
+            filter_escape(Path::new("C:/Users/O'Brien/x.ass")),
+            r"'C\:/Users/O\'\''Brien/x.ass'"
+        );
+    }
 }

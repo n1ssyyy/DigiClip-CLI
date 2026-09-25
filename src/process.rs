@@ -14,6 +14,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 /// Build a child-process command that never opens a visible console
 /// window on Windows. Drop-in for `std::process::Command::new`.
 pub fn command<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command {
+    #[allow(unused_mut)] // only Windows sets creation flags
     let mut cmd = std::process::Command::new(program);
     #[cfg(target_os = "windows")]
     {

@@ -86,10 +86,17 @@ flowchart LR
 
 **Users:** just the exe (first run needs network once to provision).
 
+- **Windows** — needs the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+  (whisper.cpp / ONNX Runtime link the DLL runtime). Most PCs already have
+  it; the DigiClip desktop app ships these DLLs itself.
+- **Linux** — glibc 2.38+ (Ubuntu 24.04+, Debian 13+, Fedora 39+): ONNX
+  Runtime's prebuilt libraries set that floor.
+- **macOS** — Apple Silicon.
+
 | OS | ffmpeg | Notes |
 |----|--------|-------|
 | Windows | auto-downloaded (~80MB gyan build) or `winget install Gyan.FFmpeg` | zero setup either way |
-| macOS | `brew install ffmpeg` | must include libass; VideoToolbox used for GPU renders |
+| macOS | `brew install ffmpeg` | must include libass; VideoToolbox used for GPU renders. Homebrew/MacPorts bins are found even when launched from Finder (GUI apps don't get the shell PATH) |
 | Linux | `sudo apt install ffmpeg` (or `dnf`) | must include libass; NVENC used when an NVIDIA GPU is present |
 
 **Building:**
@@ -110,7 +117,7 @@ cargo build --release
 ./target/release/digiclip input.mp4
 ```
 
-First run provisions `%LOCALAPPDATA%/digiclip` (Windows), `~/.local/share/digiclip`
+First run provisions `%APPDATA%/digiclip` (Windows), `~/.local/share/digiclip`
 (Linux) or `~/Library/Application Support/digiclip` (macOS):
 
 | What | Source | Size | When |
@@ -226,9 +233,9 @@ cargo run --example stt_check     # embedded STT vs whisper-cli ground truth
 
 | Job | Runner | Does |
 |-----|--------|------|
-| `test` | `ubuntu-latest` | `cargo test` (all targets) + fmt check |
-| `build` | `windows-latest`, `ubuntu-latest`, `macos-latest` | `cargo build --release` → `digiclip(.exe)` artifact per OS |
-| `release` | `ubuntu-latest` | on `v*` tags only: attaches all three binaries to the GitHub Release |
+| `test` | `ubuntu-24.04` | `cargo test` (all targets) + fmt check |
+| `build` | `windows-latest`, `ubuntu-24.04`, `macos-latest` | `cargo build --release` → `--help`/`--version` smoke → serve-watchdog test (`.github/scripts/watchdog-test.*`) → `digiclip(.exe)` artifact per OS |
+| `release` | `ubuntu-24.04` | on `v*` tags only: attaches all three binaries to the GitHub Release |
 
 Cut a release:
 

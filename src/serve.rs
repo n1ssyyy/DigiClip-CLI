@@ -1055,7 +1055,7 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             vec![ok(id, Some(serde_json::json!({ "job": record })))]
         }
         Cmd::JobCancel { job: jid } => {
-            let mut jobs = st.jobs.lock().await;
+            let jobs = st.jobs.lock().await;
             match jobs.get(&jid) {
                 Some(live) => {
                     live.cancel.cancel();

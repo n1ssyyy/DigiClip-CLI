@@ -1,6 +1,6 @@
 //! First-run provisioning: keep the exe small, download the heavy bits.
 //!
-//! Layout under the OS user-data dir (`%LOCALAPPDATA%/digiclip` on Windows,
+//! Layout under the OS user-data dir (`%APPDATA%/digiclip` on Windows,
 //! `~/.local/share/digiclip` on Linux, `~/Library/Application Support/digiclip`
 //! on macOS — see [`root`]):
 //! - `bin/ffmpeg(.exe)`, `bin/ffprobe(.exe)` (Windows: gyan essentials,

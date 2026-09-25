@@ -15,7 +15,10 @@ concurrency:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # Pinned (not ubuntu-latest): the Linux binary's glibc floor follows the
+    # runner. ONNX Runtime's prebuilt libs already need glibc >= 2.38, so
+    # 24.04 is the oldest runner that can link the engine.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -47,7 +50,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             exe: digiclip.exe
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             exe: digiclip
           - os: macos-latest
@@ -82,6 +85,16 @@ jobs:
         shell: bash
         run: |
           ./target/${{ matrix.target }}/release/${{ matrix.exe }} --help
+          ./target/${{ matrix.target }}/release/${{ matrix.exe }} --version
+
+      - name: Serve watchdog (unix)
+        if: runner.os != 'Windows'
+        run: .github/scripts/watchdog-test.sh ./target/${{ matrix.target }}/release/${{ matrix.exe }}
+
+      - name: Serve watchdog (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .github/scripts/watchdog-test.ps1 -Engine ./target/${{ matrix.target }}/release/${{ matrix.exe }}
 
       - name: Rename binary per target
         # Release assets share one flat namespace: linux `digiclip` and
@@ -109,7 +122,7 @@ jobs:
     name: Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
