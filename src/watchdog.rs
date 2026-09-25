@@ -21,6 +21,10 @@ pub fn watch_parent() {
 
 #[cfg(unix)]
 mod unix {
+    extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+
     /// Orphans get re-parented (to init or a subreaper), so a changed
     /// parent PID means the spawner is gone.
     pub fn watch() {
@@ -34,8 +38,11 @@ mod unix {
             .spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 if std::os::unix::process::parent_id() != original {
-                    tracing::info!("parent process gone — exiting orphaned engine");
-                    std::process::exit(0);
+                    // Leave at once, without logging: stdout/stderr are
+                    // pipes to the dead parent, a failed write inside the
+                    // logger panics this thread (and the orphan lives on),
+                    // and C++ static teardown must not keep it around.
+                    unsafe { _exit(0) };
                 }
             })
             .ok();
