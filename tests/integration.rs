@@ -270,7 +270,7 @@ fn yunet_decode_matches_opencv_math() {
     let n = 4;
     let mut cls = vec![0.0f32; n];
     let mut obj = vec![0.0f32; n];
-    let mut bbox = vec![0.0f32; n * 4];
+    let bbox = vec![0.0f32; n * 4];
     let kps = vec![0.0f32; n * 10];
     cls[2] = 0.9;
     obj[2] = 0.9; // idx = r*cols+c = 1*2+0

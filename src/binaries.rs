@@ -80,6 +80,27 @@ fn bundled_candidates(name: &str) -> Vec<PathBuf> {
     out
 }
 
+/// Package-manager bin dirs a GUI launch doesn't put on PATH: apps opened
+/// from Finder/Dock get only `/usr/bin:/bin:/usr/sbin:/sbin`, so a
+/// Homebrew/MacPorts ffmpeg would otherwise never be found.
+fn extra_unix_dirs() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/local/bin"),
+        PathBuf::from("/home/linuxbrew/.linuxbrew/bin"),
+        PathBuf::from("/snap/bin"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".nix-profile").join("bin"));
+    }
+    dirs
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     // `where.exe` on Windows returns CRLF lines; PATH search handles .exe.
     // Try plain + .exe so `whisper-cli` resolves `whisper-cli.exe`.
@@ -88,12 +109,13 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         names.push(format!("{name}.exe"));
     }
     for n in &names {
-        if let Ok(paths) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                let p = dir.join(n);
-                if p.is_file() {
-                    return Some(p);
-                }
+        let path_dirs = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for dir in path_dirs.into_iter().chain(extra_unix_dirs()) {
+            let p = dir.join(n);
+            if p.is_file() {
+                return Some(p);
             }
         }
         // Fall back to the shell lookup for shims (scoop/choco/winget).

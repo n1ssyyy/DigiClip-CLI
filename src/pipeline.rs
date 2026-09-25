@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use crate::cli::{Args, Framing, Mode};
-use crate::progress::{CancelFlag, ClipArtifact, Emitter, JobEvent, PctFn, Stage};
+use crate::progress::{CancelFlag, ClipArtifact, Emitter, JobEvent, Stage};
 use crate::render::{Chunk, ChunkKind};
 use crate::track::RawTarget;
 
@@ -615,7 +615,9 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
         crate::whisper::transcribe(&wav, &out.join("transcript"), &topts, cancel).await?
     } else {
         if gpu_on {
-            tracing::warn!("whisper-cli-vulkan.exe not provisioned: CPU transcription (build it once, see README)");
+            tracing::warn!(
+                "whisper-cli-vulkan not provisioned: CPU transcription (build it once, see README)"
+            );
         }
         let sopts = crate::stt::SttOptions {
             model: args.model.clone(),

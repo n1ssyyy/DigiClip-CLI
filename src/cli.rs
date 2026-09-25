@@ -206,7 +206,7 @@ pub struct Args {
     pub token: Option<String>,
 
     /// Serve data dir: jobs + settings.json (default: the provision
-    /// root, i.e. %LOCALAPPDATA%/digiclip on Windows).
+    /// root, i.e. %APPDATA%/digiclip on Windows).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 }
