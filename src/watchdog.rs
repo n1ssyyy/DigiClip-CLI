@@ -62,6 +62,8 @@ mod windows {
 
     extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
+        fn GetLastError() -> u32;
+        fn TerminateProcess(h: *mut c_void, code: u32) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
         fn CloseHandle(h: *mut c_void) -> i32;
         fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
@@ -92,15 +94,21 @@ mod windows {
     }
 
     pub fn watch() {
-        let Some(pid) = parent_pid() else { return };
+        let Some(pid) = parent_pid() else {
+            tracing::warn!("parent watchdog off: no parent pid");
+            return;
+        };
         // Hold a handle to the parent itself: waiting on it can't be fooled
         // by PID reuse, and it costs nothing while the parent lives.
         let handle =
             unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             // Parent already gone (or not ours to open): nothing to watch.
+            let err = unsafe { GetLastError() };
+            tracing::warn!("parent watchdog off: cannot open parent pid {pid} (error {err})");
             return;
         }
+        tracing::info!("parent watchdog: watching pid {pid}");
         let handle = handle as usize;
         std::thread::Builder::new()
             .name("parent-watch".into())
@@ -110,7 +118,10 @@ mod windows {
                 unsafe { CloseHandle(h) };
                 if res == WAIT_OBJECT_0 {
                     tracing::info!("parent process gone — exiting orphaned engine");
-                    std::process::exit(0);
+                    // Terminate, don't unwind: an orphan has nothing worth
+                    // flushing, and CRT/static teardown must not keep it
+                    // alive holding digiclip.exe open.
+                    unsafe { TerminateProcess(GetCurrentProcess(), 0) };
                 }
             })
             .ok();

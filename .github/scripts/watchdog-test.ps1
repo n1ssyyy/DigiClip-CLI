@@ -39,7 +39,14 @@ $parentPid = [int](Get-Content (Join-Path $t 'parent.pid'))
 Start-Sleep -Seconds 5
 if ($engineProc.HasExited) { Fail 'engine exited while its parent was alive' }
 Write-Host 'ok: engine alive with its grandparent gone'
+$info = Get-CimInstance Win32_Process -Filter "ProcessId=$($engineProc.Id)"
+Write-Host "engine pid $($engineProc.Id), parent pid $($info.ParentProcessId) (launcher script pid $parentPid)"
+Get-Content $log
 
 Stop-Process -Id $parentPid -Force
-if (-not $engineProc.WaitForExit(10000)) { Fail 'engine outlived its parent' }
+if (-not $engineProc.WaitForExit(10000)) {
+    $info = Get-CimInstance Win32_Process -Filter "ProcessId=$($engineProc.Id)"
+    Write-Host "still running: parent pid $($info.ParentProcessId); parent alive: $([bool](Get-Process -Id $info.ParentProcessId -ErrorAction SilentlyContinue))"
+    Fail 'engine outlived its parent'
+}
 Write-Host 'ok: engine exited after its parent died'
