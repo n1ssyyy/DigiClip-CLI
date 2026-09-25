@@ -57,8 +57,8 @@ mod windows {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const PROCESS_BASIC_INFORMATION: i32 = 0;
-    const INFINITE: u32 = 0xFFFF_FFFF;
     const WAIT_OBJECT_0: u32 = 0;
+    const STILL_ACTIVE: u32 = 259;
 
     extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
@@ -67,6 +67,7 @@ mod windows {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
         fn CloseHandle(h: *mut c_void) -> i32;
         fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+        fn GetExitCodeProcess(h: *mut c_void, code: *mut u32) -> i32;
         fn NtQueryInformationProcess(
             h: *mut c_void,
             class: i32,
@@ -114,15 +115,22 @@ mod windows {
             .name("parent-watch".into())
             .spawn(move || {
                 let h = handle as *mut c_void;
-                let res = unsafe { WaitForSingleObject(h, INFINITE) };
-                unsafe { CloseHandle(h) };
-                if res == WAIT_OBJECT_0 {
-                    tracing::info!("parent process gone — exiting orphaned engine");
-                    // Terminate, don't unwind: an orphan has nothing worth
-                    // flushing, and CRT/static teardown must not keep it
-                    // alive holding digiclip.exe open.
-                    unsafe { TerminateProcess(GetCurrentProcess(), 0) };
+                // Once a second: the handle is signalled when the parent has
+                // fully exited, its exit code is set as soon as it starts to.
+                loop {
+                    if unsafe { WaitForSingleObject(h, 1000) } == WAIT_OBJECT_0 {
+                        break;
+                    }
+                    let mut code = STILL_ACTIVE;
+                    if unsafe { GetExitCodeProcess(h, &mut code) } != 0 && code != STILL_ACTIVE {
+                        break;
+                    }
                 }
+                unsafe { CloseHandle(h) };
+                // Terminate, don't unwind or log: the parent (which read our
+                // output) is gone, and CRT/static teardown must never keep
+                // an orphan alive holding digiclip.exe open.
+                unsafe { TerminateProcess(GetCurrentProcess(), 0) };
             })
             .ok();
     }

@@ -43,10 +43,17 @@ $info = Get-CimInstance Win32_Process -Filter "ProcessId=$($engineProc.Id)"
 Write-Host "engine pid $($engineProc.Id), parent pid $($info.ParentProcessId) (launcher script pid $parentPid)"
 Get-Content $log
 
+$sw = [Diagnostics.Stopwatch]::StartNew()
 Stop-Process -Id $parentPid -Force
-if (-not $engineProc.WaitForExit(10000)) {
-    $info = Get-CimInstance Win32_Process -Filter "ProcessId=$($engineProc.Id)"
-    Write-Host "still running: parent pid $($info.ParentProcessId); parent alive: $([bool](Get-Process -Id $info.ParentProcessId -ErrorAction SilentlyContinue))"
+$parentGoneMs = $null
+while ($sw.ElapsedMilliseconds -lt 15000 -and -not $engineProc.HasExited) {
+    if ($null -eq $parentGoneMs -and -not (Get-Process -Id $parentPid -ErrorAction SilentlyContinue)) { $parentGoneMs = $sw.ElapsedMilliseconds }
+    Start-Sleep -Milliseconds 100
+}
+Write-Host "parent gone after $parentGoneMs ms; engine exited: $($engineProc.HasExited) after $($sw.ElapsedMilliseconds) ms"
+if (-not $engineProc.HasExited) {
+    $engineProc.Refresh()
+    $engineProc.Threads | Select-Object Id, ThreadState, WaitReason | Format-Table | Out-String | Write-Host
     Fail 'engine outlived its parent'
 }
 Write-Host 'ok: engine exited after its parent died'
