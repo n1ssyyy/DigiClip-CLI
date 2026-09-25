@@ -17,6 +17,99 @@ pub struct Word {
     pub conf: Option<f64>,
 }
 
+/// Whisper tokens are word *pieces* (byte-level BPE): a piece that begins
+/// with a space opens a new word, anything else continues the one before —
+/// "It" + "'d", "Urs" + "ula", "don" + "'t", or the two halves of a
+/// multi-byte character. Taking every piece as a word put those splits
+/// straight into the captions ("IT 'D", "URS ULA"). Pieces are joined as
+/// raw bytes and decoded once per word.
+#[derive(Default)]
+pub struct WordBuilder {
+    words: Vec<Word>,
+    cur: Option<PendingWord>,
+    /// The current word's opening piece had no timing: drop the whole word.
+    skipping: bool,
+}
+
+struct PendingWord {
+    bytes: Vec<u8>,
+    s: f64,
+    e: f64,
+    conf: Option<f64>,
+}
+
+impl WordBuilder {
+    /// Add one token piece. `timing` is (start, end) in seconds when known.
+    pub fn push(&mut self, raw: &[u8], timing: Option<(f64, f64)>, conf: Option<f64>) {
+        let text = String::from_utf8_lossy(raw);
+        let t = text.trim();
+        // Whitespace-only pieces carry nothing; [_BEG_]/[_TT_n] are markers.
+        if t.is_empty() || (t.starts_with('[') && t.ends_with(']')) {
+            return;
+        }
+        let opens = raw.first().is_some_and(|b| b.is_ascii_whitespace())
+            || (self.cur.is_none() && !self.skipping);
+        if opens {
+            self.flush();
+            match timing {
+                Some((s, e)) => {
+                    let start = raw
+                        .iter()
+                        .position(|b| !b.is_ascii_whitespace())
+                        .unwrap_or(0);
+                    self.cur = Some(PendingWord {
+                        bytes: raw[start..].to_vec(),
+                        s,
+                        e,
+                        conf,
+                    });
+                    self.skipping = false;
+                }
+                None => self.skipping = true,
+            }
+            return;
+        }
+        if self.skipping {
+            return;
+        }
+        if let Some(p) = self.cur.as_mut() {
+            p.bytes.extend_from_slice(raw);
+            if let Some((_, e)) = timing {
+                p.e = p.e.max(e);
+            }
+            p.conf = match (p.conf, conf) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+    }
+
+    /// Segment boundary: the next piece always opens a new word.
+    pub fn break_word(&mut self) {
+        self.flush();
+        self.skipping = false;
+    }
+
+    pub fn finish(mut self) -> Vec<Word> {
+        self.flush();
+        self.words
+    }
+
+    fn flush(&mut self) {
+        if let Some(p) = self.cur.take() {
+            let w = String::from_utf8_lossy(&p.bytes).trim().to_string();
+            if !w.is_empty() {
+                self.words.push(Word {
+                    w,
+                    s: p.s,
+                    e: p.e,
+                    conf: p.conf,
+                });
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Segment {
     pub s: f64,
@@ -143,28 +236,21 @@ fn token_words(seg: &Seg) -> Option<Vec<Word>> {
     if tokens.is_empty() {
         return None;
     }
-    let mut out = Vec::new();
+    let mut wb = WordBuilder::default();
     for t in tokens {
-        let text = t.text.as_deref().unwrap_or("").trim().to_string();
-        if text.is_empty() {
-            continue;
-        }
-        if text.starts_with('[') && text.ends_with(']') {
-            continue;
-        }
-        let (Some(f), Some(to)) = (
-            t.timestamps.as_ref()?.from.as_deref(),
-            t.timestamps.as_ref()?.to.as_deref(),
-        ) else {
-            continue;
+        let raw = t.text.as_deref().unwrap_or("");
+        let ts = t.timestamps.as_ref()?;
+        let timing = match (ts.from.as_deref(), ts.to.as_deref()) {
+            (Some(f), Some(to)) => Some((to_seconds(f), to_seconds(to))),
+            _ => None,
         };
-        out.push(Word {
-            w: text,
-            s: to_seconds(f),
-            e: to_seconds(to),
-            conf: t.p.map(|p| (p * 1000.0).round() / 1000.0),
-        });
+        wb.push(
+            raw.as_bytes(),
+            timing,
+            t.p.map(|p| (p * 1000.0).round() / 1000.0),
+        );
     }
+    let out = wb.finish();
     if out.is_empty() {
         None
     } else {
@@ -345,4 +431,72 @@ pub async fn transcribe(
     let data: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json_path)?)?;
     let _ = std::fs::remove_file(&json_path);
     Ok(parse_output(&data, &opts.model))
+}
+
+#[cfg(test)]
+mod word_builder_tests {
+    use super::WordBuilder;
+
+    fn words(pieces: &[(&str, Option<(f64, f64)>)]) -> Vec<(String, f64, f64)> {
+        let mut wb = WordBuilder::default();
+        for (raw, t) in pieces {
+            wb.push(raw.as_bytes(), *t, None);
+        }
+        wb.finish().into_iter().map(|w| (w.w, w.s, w.e)).collect()
+    }
+
+    #[test]
+    fn pieces_without_a_leading_space_continue_the_word() {
+        // Real splits from a base.en transcript: "It'd", "Ursula", "don't".
+        let got = words(&[
+            (" It", Some((1.0, 1.2))),
+            ("'d", Some((1.2, 1.3))),
+            (" be", Some((1.3, 1.5))),
+            (" Urs", Some((2.0, 2.2))),
+            ("ula", Some((2.2, 2.5))),
+            (" don", Some((3.0, 3.1))),
+            ("'t", Some((3.1, 3.2))),
+            (".", Some((3.2, 3.2))),
+        ]);
+        let text: Vec<&str> = got.iter().map(|w| w.0.as_str()).collect();
+        assert_eq!(text, ["It'd", "be", "Ursula", "don't."]);
+        // A joined word spans all of its pieces.
+        assert_eq!((got[0].1, got[0].2), (1.0, 1.3));
+        assert_eq!((got[2].1, got[2].2), (2.0, 2.5));
+    }
+
+    #[test]
+    fn multibyte_characters_split_across_pieces_rejoin() {
+        let mut wb = WordBuilder::default();
+        wb.push(b" caf", Some((0.0, 0.2)), None);
+        wb.push(&[0xC3], Some((0.2, 0.3)), None); // first byte of "é"
+        wb.push(&[0xA9], Some((0.3, 0.4)), None); // second byte
+        let w = wb.finish();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].w, "café");
+    }
+
+    #[test]
+    fn markers_and_untimed_words_are_dropped() {
+        let got = words(&[
+            ("[_BEG_]", Some((0.0, 0.0))),
+            (" hello", Some((0.0, 0.4))),
+            (" ghost", None),         // no timing: can't be placed
+            ("ly", Some((0.5, 0.6))), // ...and neither can its tail
+            (" world", Some((0.7, 1.0))),
+            ("[_TT_50]", Some((1.0, 1.0))),
+        ]);
+        let text: Vec<&str> = got.iter().map(|w| w.0.as_str()).collect();
+        assert_eq!(text, ["hello", "world"]);
+    }
+
+    #[test]
+    fn segment_breaks_open_a_new_word() {
+        let mut wb = WordBuilder::default();
+        wb.push(b" end", Some((0.0, 0.3)), None);
+        wb.break_word();
+        wb.push(b"start", Some((0.4, 0.6)), None); // no leading space after a break
+        let text: Vec<String> = wb.finish().into_iter().map(|w| w.w).collect();
+        assert_eq!(text, ["end", "start"]);
+    }
 }

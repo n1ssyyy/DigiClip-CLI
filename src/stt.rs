@@ -92,34 +92,23 @@ pub fn transcribe_embedded(wav: &Path, opts: &SttOptions) -> anyhow::Result<Tran
             text: text.clone(),
         });
 
-        // Prefer token timing; skip special tokens ([_BEG_], [_TT_*]…).
-        let mut tw = Vec::new();
+        // Prefer token timing. Tokens are word pieces: WordBuilder joins
+        // them into real words and skips special tokens ([_BEG_], [_TT_*]…).
+        let mut wb = crate::whisper::WordBuilder::default();
         for j in 0..seg.n_tokens() {
             let Some(tok) = seg.get_token(j) else {
                 continue;
             };
-            let t = tok
-                .to_str_lossy()
-                .map(|c| c.trim().to_string())
-                .unwrap_or_default();
-            if t.is_empty() {
+            let Ok(raw) = tok.to_bytes() else {
                 continue;
-            }
-            if t.starts_with('[') && t.ends_with(']') {
-                continue;
-            }
+            };
             let d = tok.token_data();
             // t0/t1 < 0 means "no timing for this token".
-            if d.t0 < 0 || d.t1 < 0 {
-                continue;
-            }
-            tw.push(Word {
-                w: t,
-                s: d.t0 as f64 / 100.0,
-                e: d.t1 as f64 / 100.0,
-                conf: Some(((d.p * 1000.0).round() / 1000.0) as f64),
-            });
+            let timing =
+                (d.t0 >= 0 && d.t1 >= 0).then(|| (d.t0 as f64 / 100.0, d.t1 as f64 / 100.0));
+            wb.push(raw, timing, Some(((d.p * 1000.0).round() / 1000.0) as f64));
         }
+        let tw = wb.finish();
         if !tw.is_empty() {
             words.extend(tw);
             continue;

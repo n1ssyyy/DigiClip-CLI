@@ -33,9 +33,9 @@ impl<'a> JobCtx<'a> {
 }
 
 /// Build the UI-facing artifact for a finished clip. Names are the exact
-/// files `render_job` (per-rank kit) plus the per-rank copies serve keeps
-/// of the shared `clip.ass`/`clip.srt` sidecars (the CLI keeps sharing
-/// them — last clip wins, exactly as today).
+/// files `exec_clip` writes per rank (mp4, kit, `.ass`/`.srt` sidecars);
+/// the shared `clip.ass`/`clip.srt` are still written too — last clip
+/// wins, exactly as before.
 fn artifact_for(clip: &crate::validator::Clip, mp4: &str, kit: Option<String>) -> ClipArtifact {
     let rank = clip.rank;
     let stem = mp4.strip_suffix(".mp4").unwrap_or(mp4);
@@ -1122,11 +1122,34 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                 return Ok(vec![]);
             }
 
-            let mut report: Vec<ClipArtifact> = Vec::with_capacity(jobs.len());
             emit.stage(Stage::Render, None);
+            // Face tracking and punch look-ups plan one clip at a time (one
+            // shared tracker); the ffmpeg passes then run side by side, so
+            // clip N+1 plans while clip N renders.
+            let par = render_parallelism(jobs.len());
+            let per_threads = (threads / par).max(1);
+            if par > 1 {
+                tracing::info!(
+                    "rendering up to {par} clips at once ({per_threads} ffmpeg threads each)"
+                );
+            }
+            let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(par));
+            let mut running: tokio::task::JoinSet<anyhow::Result<ClipArtifact>> =
+                tokio::task::JoinSet::new();
+            let mut report: Vec<ClipArtifact> = Vec::with_capacity(jobs.len());
+            let mut first_err: Option<anyhow::Error> = None;
             for (clip, groups) in &jobs {
-                cancel.check()?;
-                let done = render_job(
+                while let Some(r) = running.try_join_next() {
+                    settle_render(r, &mut report, &mut first_err);
+                }
+                if first_err.is_some() {
+                    break;
+                }
+                if let Err(e) = cancel.check() {
+                    first_err = Some(e);
+                    break;
+                }
+                let plan = match plan_clip(
                     clip,
                     groups,
                     args.merge_flash && args.merge.is_some(),
@@ -1141,11 +1164,53 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                     &out,
                     &ocfg,
                     &vision_model,
-                    threads,
                     ctx,
                 )
-                .await?;
-                report.push(done);
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        first_err = Some(e);
+                        break;
+                    }
+                };
+                let slot = slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("render slots never close");
+                let (input, ffmpeg, out) = (input.clone(), ffmpeg.clone(), out.clone());
+                let (emit, cancel, kit) = (emit.clone(), cancel.clone(), args.kit);
+                running.spawn_blocking(move || {
+                    let _slot = slot;
+                    exec_clip(
+                        plan,
+                        &input,
+                        &ffmpeg,
+                        &out,
+                        src_w,
+                        src_h,
+                        gpu_on,
+                        per_threads,
+                        kit,
+                        &emit,
+                        &cancel,
+                    )
+                });
+            }
+            // A failure stops new renders; those already running finish.
+            while let Some(r) = running.join_next().await {
+                settle_render(r, &mut report, &mut first_err);
+            }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+            report.sort_by_key(|a| a.rank);
+            // The shared `clip.ass`/`clip.srt` stay "last clip wins" (CLI).
+            if let Some((last, _)) = jobs.last() {
+                let stem = format!("clip-{:02}-9x16", last.rank);
+                let _ = std::fs::copy(out.join(format!("{stem}.ass")), out.join("clip.ass"));
+                let _ = std::fs::copy(out.join(format!("{stem}.srt")), out.join("clip.srt"));
             }
             emit.stage(Stage::Render, Some(100));
             println!("done: {} clip(s) in {}", jobs.len(), out.display());
@@ -1155,13 +1220,70 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     }
 }
 
-/// Render one finished clip job: a direct single pass when nothing was cut
-/// (today's exact path), else one segment render per keep (each with its
-/// own local dolly schedule and rebased captions) concatenated with stream
-/// copy. Joins are hard jump cuts — the path snaps, never glides across
-/// deleted time.
+/// How many clips render at once: roughly one per 4 hardware threads, at
+/// most 3 (consumer NVENC session limits, memory), never more than there
+/// are clips. `DIGICLIP_RENDER_JOBS` overrides.
+fn render_parallelism(clips: usize) -> usize {
+    let clips = clips.max(1);
+    if let Some(n) = std::env::var("DIGICLIP_RENDER_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return n.clamp(1, clips);
+    }
+    (crate::whisper::cpu_count() / 4).clamp(1, 3).min(clips)
+}
+
+/// Collect one finished render (keeps the first error).
+fn settle_render(
+    r: Result<anyhow::Result<ClipArtifact>, tokio::task::JoinError>,
+    report: &mut Vec<ClipArtifact>,
+    first_err: &mut Option<anyhow::Error>,
+) {
+    match r {
+        Ok(Ok(a)) => report.push(a),
+        Ok(Err(e)) => {
+            first_err.get_or_insert(e);
+        }
+        Err(e) => {
+            first_err.get_or_insert(anyhow::anyhow!("render task failed: {e}"));
+        }
+    }
+}
+
+/// One ffmpeg pass of a clip: the whole clip, or one keep of a
+/// tightened/merged clip.
+struct RenderUnit {
+    words: Vec<crate::whisper::Word>,
+    chunks: Vec<crate::render::Chunk>,
+    out: PathBuf,
+    flash: Option<(bool, bool)>,
+    hook: Option<crate::progress::SharedPct>,
+    /// Source range, for the timing log (segments only).
+    seg: Option<(f64, f64)>,
+}
+
+/// A clip after its sequential phase (tracking, punch look-ups). Owns
+/// everything the render needs, so it can run on a blocking thread next to
+/// other clips' renders.
+struct ClipPlan {
+    clip: crate::validator::Clip,
+    mp4: PathBuf,
+    /// Tightened/merged clips render one segment per keep into here, then
+    /// concatenate; `None` is the direct single pass.
+    segdir: Option<PathBuf>,
+    units: Vec<RenderUnit>,
+    retimed: Vec<crate::whisper::Word>,
+    tight_total: f64,
+    kinds_all: Vec<String>,
+}
+
+/// Plan one clip's render: a direct single pass when nothing was cut, else
+/// one segment per keep (each with its own local dolly schedule and
+/// rebased captions) to be concatenated with stream copy. Joins are hard
+/// jump cuts — the path snaps, never glides across deleted time.
 #[allow(clippy::too_many_arguments)]
-async fn render_job(
+async fn plan_clip(
     clip: &crate::validator::Clip,
     groups: &[crate::timeline::CutPlan],
     merge_flash: bool,
@@ -1176,9 +1298,8 @@ async fn render_job(
     out: &PathBuf,
     ocfg: &crate::openrouter::Config,
     vision_model: &str,
-    threads: usize,
     ctx: &JobCtx<'_>,
-) -> anyhow::Result<ClipArtifact> {
+) -> anyhow::Result<ClipPlan> {
     let emit = ctx.emit;
     let cancel = ctx.cancel;
     let rank = clip.rank;
@@ -1191,9 +1312,13 @@ async fn render_job(
         && (all_keeps[0].a - clip.start_s).abs() < 0.05
         && (all_keeps[0].b - clip.end_s).abs() < 0.05;
     let mut kinds_all: Vec<String> = Vec::new();
-    let enc: String;
+    let mut units: Vec<RenderUnit> = Vec::new();
     if fast {
         // Untouched range: today's exact single pass (punch still applies).
+        let slice = crate::render::words_in(words, clip.start_s, clip.end_s);
+        if slice.is_empty() {
+            anyhow::bail!("No transcript words inside clip range.");
+        }
         let punches = scan_punches(
             ffmpeg,
             input,
@@ -1223,152 +1348,189 @@ async fn render_job(
         let chunks = chunks_for(&timeline, clip.start_s, clip.end_s);
         let chunks = resolve_punches(chunks, words, ffmpeg, input, ocfg, vision_model).await;
         kinds_all = kind_names(&chunks);
-        let t = std::time::Instant::now();
-        let render_hook = emit.shared_hook(move |p| JobEvent::ClipRender { rank, pct: p });
-        enc = crate::render::render_clip(
-            input,
-            clip,
+        log_group_shots(&chunks, clip);
+        units.push(RenderUnit {
+            words: slice,
+            chunks,
+            out: mp4.clone(),
+            flash: None,
+            hook: emit.shared_hook(move |p| JobEvent::ClipRender { rank, pct: p }),
+            seg: None,
+        });
+        return Ok(ClipPlan {
+            clip: clip.clone(),
+            mp4,
+            segdir: None,
+            units,
+            retimed,
+            tight_total,
+            kinds_all,
+        });
+    }
+    // Tightened/merged: one render per keep, concatenated.
+    let segdir = out.join(".segs").join(format!("{rank:02}"));
+    std::fs::create_dir_all(&segdir)?;
+    let mut o = 0.0;
+    let n_groups = groups.len().max(1);
+    let n_segs = all_keeps.len().max(1);
+    for (gi, g) in groups.iter().enumerate() {
+        cancel.check()?;
+        let ga = g.keeps.first().map(|k| k.a).unwrap_or(clip.start_s);
+        let gb = g.keeps.last().map(|k| k.b).unwrap_or(clip.end_s);
+        let forced: Vec<f64> = g.keeps.iter().skip(1).map(|k| k.a).collect();
+        let punches = scan_punches(ffmpeg, input, words, &g.keeps, ga, gb, args);
+        // Group-local track pct maps onto the clip's overall track phase.
+        let track_hook = emit.shared_hook(move |p| JobEvent::ClipTrack {
+            rank,
+            pct: ((gi as u32 * 100 + p as u32) / n_groups as u32).min(100) as u8,
+        });
+        let timeline = resolve_timeline(
+            args,
+            ffmpeg,
+            tracker,
+            gpu_on,
+            src_w,
+            src_h,
+            ga,
+            gb,
             words,
-            &chunks,
+            &forced,
+            &punches,
+            track_hook.clone(),
+            cancel,
+        )
+        .await;
+        for k in &g.keeps {
+            cancel.check()?;
+            let len = (k.b - k.a).max(0.1);
+            let chunks = chunks_for(&timeline, k.a, k.b);
+            let chunks = resolve_punches(chunks, words, ffmpeg, input, ocfg, vision_model).await;
+            kinds_all.extend(kind_names(&chunks));
+            log_group_shots(&chunks, clip);
+            // Caption slice: tight clock rebased to this keep's source
+            // clock (render seeks + stamps from chunk times).
+            let seg_cap: Vec<crate::whisper::Word> = retimed
+                .iter()
+                .filter(|w| w.s >= o - 1e-6 && w.s < o + len - 1e-6)
+                .map(|w| {
+                    let mut q = (*w).clone();
+                    q.s += k.a - o;
+                    q.e += k.a - o;
+                    q
+                })
+                .collect();
+            let si = units.len();
+            // Merge flash joins: this segment carries its half of every
+            // white dip (head dip unless first, tail dip unless last).
+            let flash = merge_flash.then_some((si > 0, si + 1 < all_keeps.len()));
+            // Segment-local render pct maps onto the clip overall.
+            let hook = emit.shared_hook(move |p| JobEvent::ClipRender {
+                rank,
+                pct: ((si as u32 * 100 + p as u32) / n_segs as u32).min(100) as u8,
+            });
+            units.push(RenderUnit {
+                words: seg_cap,
+                chunks,
+                out: segdir.join(format!("seg{si:03}.mp4")),
+                flash,
+                hook,
+                seg: Some((k.a, k.b)),
+            });
+            o += len;
+        }
+    }
+    Ok(ClipPlan {
+        clip: clip.clone(),
+        mp4,
+        segdir: Some(segdir),
+        units,
+        retimed,
+        tight_total,
+        kinds_all,
+    })
+}
+
+/// Render a planned clip (blocking: ffmpeg passes, concat, sidecars,
+/// poster). Runs next to other clips' renders, so everything it writes is
+/// named after its own rank.
+#[allow(clippy::too_many_arguments)]
+fn exec_clip(
+    plan: ClipPlan,
+    input: &std::path::Path,
+    ffmpeg: &std::path::Path,
+    out: &std::path::Path,
+    src_w: u32,
+    src_h: u32,
+    gpu_on: bool,
+    threads: usize,
+    kit: bool,
+    emit: &Emitter,
+    cancel: &CancelFlag,
+) -> anyhow::Result<ClipArtifact> {
+    let ClipPlan {
+        clip,
+        mp4,
+        segdir,
+        units,
+        retimed,
+        tight_total,
+        kinds_all,
+    } = plan;
+    let rank = clip.rank;
+    let stem = format!("clip-{rank:02}-9x16");
+    let mut enc = String::from("copy");
+    for u in &units {
+        cancel.check()?;
+        let t = std::time::Instant::now();
+        enc = crate::render::render_timeline(
+            input,
+            &u.words,
+            &clip.caption_style,
+            &u.chunks,
             src_w,
             src_h,
             gpu_on,
-            &mp4,
+            &u.out,
             threads,
-            render_hook.clone(),
+            "clip",
+            u.flash,
+            u.hook.clone(),
             cancel,
         )?;
-        tracing::info!(
-            "clip #{} render took {:.1}s",
-            clip.rank,
-            t.elapsed().as_secs_f64()
-        );
-        log_group_shots(&chunks, clip);
-    } else {
-        // Tightened/merged: one render per keep, concatenated.
-        let segdir = out.join(".segs").join(format!("{rank:02}"));
-        std::fs::create_dir_all(&segdir)?;
-        let mut seg_files: Vec<PathBuf> = Vec::new();
-        let mut o = 0.0;
-        let mut last_enc = String::from("copy");
-        let n_groups = groups.len().max(1);
-        let n_segs = all_keeps.len().max(1);
-        for (gi, g) in groups.iter().enumerate() {
-            cancel.check()?;
-            let ga = g.keeps.first().map(|k| k.a).unwrap_or(clip.start_s);
-            let gb = g.keeps.last().map(|k| k.b).unwrap_or(clip.end_s);
-            let forced: Vec<f64> = g.keeps.iter().skip(1).map(|k| k.a).collect();
-            let punches = scan_punches(ffmpeg, input, words, &g.keeps, ga, gb, args);
-            // Group-local track pct maps onto the clip's overall track phase.
-            let track_hook = emit.shared_hook(move |p| JobEvent::ClipTrack {
-                rank,
-                pct: ((gi as u32 * 100 + p as u32) / n_groups as u32).min(100) as u8,
-            });
-            let timeline = resolve_timeline(
-                args,
-                ffmpeg,
-                tracker,
-                gpu_on,
-                src_w,
-                src_h,
-                ga,
-                gb,
-                words,
-                &forced,
-                &punches,
-                track_hook.clone(),
-                cancel,
-            )
-            .await;
-            for k in &g.keeps {
-                cancel.check()?;
-                let len = (k.b - k.a).max(0.1);
-                let chunks = chunks_for(&timeline, k.a, k.b);
-                let chunks =
-                    resolve_punches(chunks, words, ffmpeg, input, ocfg, vision_model).await;
-                kinds_all.extend(kind_names(&chunks));
-                log_group_shots(&chunks, clip);
-                // Caption slice: tight clock rebased to this keep's source
-                // clock (render seeks + stamps from chunk times).
-                let seg_cap: Vec<crate::whisper::Word> = retimed
-                    .iter()
-                    .filter(|w| w.s >= o - 1e-6 && w.s < o + len - 1e-6)
-                    .map(|w| {
-                        let mut q = (*w).clone();
-                        q.s += k.a - o;
-                        q.e += k.a - o;
-                        q
-                    })
-                    .collect();
-                let seg_mp4 = segdir.join(format!("seg{:03}.mp4", seg_files.len()));
-                let t = std::time::Instant::now();
-                // Merge flash joins: this segment carries its half of every
-                // white dip (head dip unless first, tail dip unless last).
-                let flash = if merge_flash {
-                    let si = seg_files.len();
-                    Some((si > 0, si + 1 < all_keeps.len()))
-                } else {
-                    None
-                };
-                // Segment-local render pct maps onto the clip overall.
-                let base = seg_files.len();
-                let render_hook = emit.shared_hook(move |p| JobEvent::ClipRender {
-                    rank,
-                    pct: ((base as u32 * 100 + p as u32) / n_segs as u32).min(100) as u8,
-                });
-                last_enc = crate::render::render_timeline(
-                    input,
-                    &seg_cap,
-                    &clip.caption_style,
-                    &chunks,
-                    src_w,
-                    src_h,
-                    gpu_on,
-                    &seg_mp4,
-                    threads,
-                    "clip",
-                    flash,
-                    render_hook.clone(),
-                    cancel,
-                )?;
-                tracing::info!(
-                    "clip #{} seg {:.0}s-{:.0}s took {:.1}s",
-                    clip.rank,
-                    k.a,
-                    k.b,
-                    t.elapsed().as_secs_f64()
-                );
-                seg_files.push(seg_mp4);
-                o += len;
-            }
+        let took = t.elapsed().as_secs_f64();
+        match u.seg {
+            Some((a, b)) => tracing::info!("clip #{rank} seg {a:.0}s-{b:.0}s took {took:.1}s"),
+            None => tracing::info!("clip #{rank} render took {took:.1}s"),
         }
+    }
+    if let Some(segdir) = &segdir {
         cancel.check()?;
+        let seg_files: Vec<PathBuf> = units.iter().map(|u| u.out.clone()).collect();
         if seg_files.len() == 1 {
             std::fs::rename(&seg_files[0], &mp4)?;
         } else {
             crate::render::concat_copy(ffmpeg, &seg_files, &mp4)?;
         }
-        let _ = std::fs::remove_dir_all(&segdir);
+        let _ = std::fs::remove_dir_all(segdir);
         let _ = std::fs::remove_dir(out.join(".segs")); // drops the parent when empty
         tracing::info!(
             "clip #{} assembled {:.1}s tight from {} segs",
-            clip.rank,
+            rank,
             tight_total,
             seg_files.len()
         );
         // Whole-clip sidecars on the tight clock (segments wrote temps).
         std::fs::write(
-            out.join("clip.ass"),
+            out.join(format!("{stem}.ass")),
             crate::captions::ass::build(&retimed, &clip.caption_style, 0.0),
         )?;
         std::fs::write(
-            out.join("clip.srt"),
+            out.join(format!("{stem}.srt")),
             crate::captions::srt::from_words(&retimed),
         )?;
-        enc = last_enc;
     }
     // Upload kit on the tight clock (cut fillers never become titles).
-    if args.kit {
+    if kit {
         let kit_clip = crate::validator::Clip {
             start_s: 0.0,
             end_s: tight_total,
@@ -1376,19 +1538,14 @@ async fn render_job(
         };
         let kit_path = out.join(kit_name(rank));
         if let Err(e) = crate::kit::write(&kit_path, &kit_clip, &retimed) {
-            tracing::warn!("upload kit failed for clip #{}: {e}", clip.rank);
+            tracing::warn!("upload kit failed for clip #{}: {e}", rank);
         }
     }
-    // Serve-only sidecars: per-rank copies of the shared clip.ass/clip.srt
-    // (the CLI keeps sharing them, last clip wins, exactly as today) plus
-    // a tile poster. Skipped on the CLI so outputs never change there.
-    let mp4_name = format!("clip-{rank:02}-9x16.mp4");
-    let mut artifact = artifact_for(clip, &mp4_name, args.kit.then(|| kit_name(rank)));
+    let mp4_name = format!("{stem}.mp4");
+    let mut artifact = artifact_for(&clip, &mp4_name, kit.then(|| kit_name(rank)));
     artifact.tight_dur = tight_total;
+    // Serve-only: tile poster + live events (skipped on the CLI).
     if emit.active() {
-        let stem = mp4_name.strip_suffix(".mp4").unwrap_or(&mp4_name);
-        let _ = std::fs::copy(out.join("clip.ass"), out.join(format!("{stem}.ass")));
-        let _ = std::fs::copy(out.join("clip.srt"), out.join(format!("{stem}.srt")));
         let _ = crate::ffmpeg::poster(&mp4, &out.join(format!("{stem}-poster.jpg")));
         emit.emit(JobEvent::ClipRender { rank, pct: 100 });
         emit.emit(JobEvent::ClipDone {
@@ -1397,7 +1554,7 @@ async fn render_job(
     }
     println!(
         "clip #{}: {:.1}s-{:.1}s [{:.1}s tight|{}|{}] -> {} (encoder {enc}, {})",
-        clip.rank,
+        rank,
         clip.start_s,
         clip.end_s,
         tight_total,
