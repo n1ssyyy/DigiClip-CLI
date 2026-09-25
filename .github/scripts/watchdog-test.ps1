@@ -23,7 +23,9 @@ $inner = Join-Path $t 'inner.ps1'
 # outer: starts inner and exits at once — the engine's grandparent is gone.
 $outer = Join-Path $t 'outer.ps1'
 "Start-Process pwsh -ArgumentList '-NoProfile','-File','$inner' -WindowStyle Hidden" | Set-Content $outer
-Start-Process pwsh -ArgumentList '-NoProfile', '-File', $outer -Wait -WindowStyle Hidden
+# Not `Start-Process -Wait`: that waits for every descendant, i.e. the engine.
+$outerProc = Start-Process pwsh -ArgumentList '-NoProfile', '-File', $outer -PassThru -WindowStyle Hidden
+if (-not $outerProc.WaitForExit(60000)) { Fail 'outer launcher did not exit' }
 
 $log = Join-Path $t 'engine.log'
 for ($i = 0; $i -lt 100; $i++) {
