@@ -22,6 +22,7 @@ pub mod redo;
 pub mod render;
 pub mod scorer;
 pub mod serve;
+pub mod split;
 pub mod stt;
 pub mod timeline;
 pub mod track;

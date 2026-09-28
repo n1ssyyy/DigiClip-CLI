@@ -367,6 +367,9 @@ pub struct Job<'a> {
     pub spans: &'a [Span],
     /// One camera pose per output frame (source px).
     pub poses: &'a [Pose],
+    /// Split-screen crops per output frame (top, bottom; source px). When
+    /// set they replace `poses`; empty = one camera.
+    pub split: &'a [(Rect, Rect)],
     /// Per-frame white flash 0..1 (merge joins); empty = none.
     pub flash: &'a [f32],
     /// Captions to burn (output clock), if any.
@@ -901,16 +904,20 @@ fn run(
             .or(job.poses.last())
             .map(|p| p.rect)
             .unwrap_or(base);
-        let rect = Rect {
-            x: rect.x * dg.sx,
-            y: rect.y * dg.sy,
-            w: rect.w * dg.sx,
-            h: rect.h * dg.sy,
+        let dec = |r: Rect| Rect {
+            x: r.x * dg.sx,
+            y: r.y * dg.sy,
+            w: r.w * dg.sx,
+            h: r.h * dg.sy,
         };
         let flash = job.flash.get(i).copied().unwrap_or(0.0);
         let t0 = std::time::Instant::now();
         let done = (i + 1) as f32 / total as f32;
-        let composed = match comp.compose(&frame, rect, flash, done) {
+        let composed = match job.split.get(i).or(job.split.last()) {
+            Some(&(top, bottom)) => comp.compose_split(&frame, dec(top), dec(bottom), flash, done),
+            None => comp.compose(&frame, dec(rect), flash, done),
+        };
+        let composed = match composed {
             Ok(c) => c,
             Err(e) => {
                 failure = Some(e);

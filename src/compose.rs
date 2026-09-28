@@ -326,12 +326,56 @@ impl Compositor {
             anyhow::bail!("short source frame ({} < {})", frame.len(), src.frame_len());
         }
         let canvas = self.canvas;
-        let (out_w, out_h) = (canvas.w, canvas.h);
         let r = rect.clamped(src.w as f64, src.h as f64);
         let lay = layout(&r, canvas);
         if !lay.covers(canvas) {
             self.blur_fill(frame, &r)?;
         }
+        self.place(frame, &lay.src, (lay.dx, lay.dy, lay.dw, lay.dh))?;
+        self.finish(flash, progress);
+        Ok(&self.out)
+    }
+
+    /// Compose a split-screen frame: `top` fills the upper half, `bottom`
+    /// the lower (camera rects in decoded pixels, trimmed to the half's
+    /// aspect around their centers).
+    pub fn compose_split(
+        &mut self,
+        frame: &[u8],
+        top: Rect,
+        bottom: Rect,
+        flash: f32,
+        progress: f32,
+    ) -> anyhow::Result<&[u8]> {
+        let src = self.src;
+        if frame.len() < src.frame_len() {
+            anyhow::bail!("short source frame ({} < {})", frame.len(), src.frame_len());
+        }
+        let (out_w, out_h) = (self.canvas.w, self.canvas.h);
+        // Even halves (4:2:0 chroma rows).
+        let half = (out_h / 2) & !1;
+        for (r, dy, dh) in [(top, 0, half), (bottom, half, out_h - half)] {
+            let r = r.clamped(src.w as f64, src.h as f64);
+            let aspect = out_w as f64 / dh as f64;
+            let (w, h) = if r.w / r.h > aspect {
+                (r.h * aspect, r.h)
+            } else {
+                (r.w, r.w / aspect)
+            };
+            self.place(
+                frame,
+                &Rect::from_center(r.cx(), r.cy(), w, h),
+                (0, dy, out_w, dh),
+            )?;
+        }
+        self.finish(flash, progress);
+        Ok(&self.out)
+    }
+
+    /// Resample source rect `r` into the output region `d` (all planes).
+    fn place(&mut self, frame: &[u8], r: &Rect, d: (u32, u32, u32, u32)) -> anyhow::Result<()> {
+        let src = self.src;
+        let (out_w, out_h) = (self.canvas.w, self.canvas.h);
         let out_g = Geom { w: out_w, h: out_h };
         let (sy, su, sv) = src.split(frame);
         let (oy, ou, ov) = out_g.split_mut(&mut self.out);
@@ -341,18 +385,26 @@ impl Compositor {
         // resizes are independent and luma is 2/3 of the work.
         std::thread::scope(|s| -> anyhow::Result<()> {
             let chroma = s.spawn(move || -> anyhow::Result<()> {
-                let c = lay.src.scaled(0.5);
+                let c = r.scaled(0.5);
                 let (cw, ch) = (src.cw(), src.ch());
-                let d = (lay.dx / 2, lay.dy / 2, lay.dw / 2, lay.dh / 2);
-                resize_into(ruv, su, cw, ch, &c, ou, out_w / 2, out_h / 2, d, fg)?;
-                resize_into(ruv, sv, cw, ch, &c, ov, out_w / 2, out_h / 2, d, fg)
+                let dc = (d.0 / 2, d.1 / 2, d.2 / 2, d.3 / 2);
+                resize_into(ruv, su, cw, ch, &c, ou, out_w / 2, out_h / 2, dc, fg)?;
+                resize_into(ruv, sv, cw, ch, &c, ov, out_w / 2, out_h / 2, dc, fg)
             });
-            let d = (lay.dx, lay.dy, lay.dw, lay.dh);
-            resize_into(ry, sy, src.w, src.h, &lay.src, oy, out_w, out_h, d, fg)?;
+            resize_into(ry, sy, src.w, src.h, r, oy, out_w, out_h, d, fg)?;
             chroma
                 .join()
                 .map_err(|_| anyhow::anyhow!("chroma worker panicked"))?
-        })?;
+        })
+    }
+
+    /// Flash dip and progress bar over the composed frame.
+    fn finish(&mut self, flash: f32, progress: f32) {
+        let canvas = self.canvas;
+        let out_g = Geom {
+            w: canvas.w,
+            h: canvas.h,
+        };
         if flash > 0.0 {
             let a = flash.clamp(0.0, 1.0);
             let (oy, uv) = self.out.split_at_mut(out_g.luma_len());
@@ -366,7 +418,6 @@ impl Compositor {
         if let Some(color) = self.bar {
             draw_bar(&mut self.out, canvas, color, progress);
         }
-        Ok(&self.out)
     }
 
     /// Blurred, dimmed fill behind a letterboxed framing: the 9:16 slice of

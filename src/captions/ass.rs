@@ -457,6 +457,8 @@ pub struct AssOpts {
     pub clear: Option<Clear>,
     /// Caption motion.
     pub anim: Anim,
+    /// Split screen: captions sit on the seam between the halves.
+    pub seam: bool,
 }
 
 /// Corner space taken by a logo: text on that band (headline at the top,
@@ -477,6 +479,7 @@ impl Default for AssOpts {
             dur: 0.0,
             clear: None,
             anim: Anim::default(),
+            seam: false,
         }
     }
 }
@@ -621,7 +624,9 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     let k = (pw as f64 / PLAY_W as f64).min(ph as f64 / 1200.0).min(1.0);
     let px = |v: u32| ((v as f64 * k).round() as u32).max(1);
     let tall = (pw as f64 / ph as f64) < 0.6;
-    let (alignment, margin_v) = if tall {
+    let (alignment, margin_v) = if o.seam {
+        (5, 0)
+    } else if tall {
         (style.alignment, style.margin_v)
     } else if style.alignment == 5 {
         (2, (ph as f64 * 0.14).round() as u32)
@@ -955,6 +960,7 @@ mod tests {
                 dur: 9.0,
                 clear: None,
                 anim: Anim::Pop,
+                seam: false,
             },
         );
         assert!(ass.contains("PlayResX: 1080\nPlayResY: 1080"));
@@ -969,6 +975,23 @@ mod tests {
     }
 
     #[test]
+    fn split_screen_captions_sit_on_the_seam() {
+        let ass = build_for(
+            &words(),
+            "karaoke",
+            0.0,
+            &AssOpts {
+                w: 1080,
+                h: 1920,
+                seam: true,
+                ..Default::default()
+            },
+        );
+        let cap = style_line(&ass, "Karaoke");
+        assert_eq!((cap[18], cap[21]), ("5", "0"));
+    }
+
+    #[test]
     fn text_keeps_clear_of_a_corner_logo() {
         let opts = |top, left| AssOpts {
             w: 1080,
@@ -977,6 +1000,7 @@ mod tests {
             dur: 9.0,
             clear: Some(Clear { top, left, px: 260 }),
             anim: Anim::Pop,
+            seam: false,
         };
         // Top-right logo: headline's right margin widens, captions untouched.
         let ass = build_for(&words(), "karaoke", 0.0, &opts(true, false));
