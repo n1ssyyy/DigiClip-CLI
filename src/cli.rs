@@ -239,6 +239,19 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
 
+    /// Re-render exact clips instead of picking: a JSON list of
+    /// `{rank, start_s, end_s, title?, style?, fixes?: [{s, w}]}` (clips
+    /// mode). Only those ranks render, over their existing files. `fixes`
+    /// rewrite the caption word starting at `s` (empty `w` drops it) and
+    /// persist into `transcript.json`.
+    #[arg(long)]
+    pub redo: Option<PathBuf>,
+
+    /// Always extract audio and transcribe again, even when the out dir
+    /// already holds a transcript of this exact source, model and language.
+    #[arg(long, default_value_t = false)]
+    pub no_cache: bool,
+
     /// Download everything the exe needs (ffmpeg, face model, STT model,
     /// fonts) into the provision dir, then exit.
     #[arg(long, default_value_t = false)]

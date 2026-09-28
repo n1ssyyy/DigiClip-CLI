@@ -229,6 +229,16 @@ pub struct ClipState {
     pub render_pct: u8,
     #[serde(default = "pending_state")]
     pub render_status: String,
+    #[serde(default)]
+    pub why: String,
+    #[serde(default)]
+    pub scores: Option<crate::openrouter::Scores>,
+    #[serde(default)]
+    pub hashtags: Vec<String>,
+    /// Bumps every time this clip's files are (re)written, so the UI can
+    /// cache-bust the video and poster after an edit.
+    #[serde(default)]
+    pub rev: u32,
 }
 
 fn pending_state() -> String {
@@ -255,6 +265,10 @@ impl ClipState {
             track_pct: 0,
             render_pct: 0,
             render_status: "pending".into(),
+            why: a.why.clone(),
+            scores: a.scores.clone(),
+            hashtags: a.hashtags.clone(),
+            rev: 0,
         }
     }
 
@@ -295,6 +309,24 @@ struct LiveJob {
     cancel: crate::progress::CancelFlag,
     running: bool,
     removing: bool,
+    /// A run is spawned and waiting for the worker.
+    queued: bool,
+    /// Clips the next run re-renders (edits, clips from the transcript)
+    /// instead of a full pick.
+    redo: Option<Vec<crate::redo::Spec>>,
+}
+
+impl LiveJob {
+    fn new(record: JobRecord) -> Self {
+        Self {
+            record,
+            cancel: crate::progress::CancelFlag::new(),
+            running: false,
+            removing: false,
+            queued: false,
+            redo: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +429,36 @@ enum Cmd {
     ClipKit {
         job: String,
         rank: usize,
+    },
+    /// Re-render one clip with a new range / title / caption style /
+    /// fixed caption words.
+    ClipEdit {
+        job: String,
+        rank: usize,
+        #[serde(default)]
+        start_s: Option<f64>,
+        #[serde(default)]
+        end_s: Option<f64>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        style: Option<String>,
+        #[serde(default)]
+        fixes: Vec<crate::redo::Fix>,
+    },
+    /// A new clip over an exact range (picked from the transcript).
+    ClipAdd {
+        job: String,
+        start_s: f64,
+        end_s: f64,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        style: Option<String>,
+    },
+    /// The job's transcript words (editor + transcript clip maker).
+    TranscriptGet {
+        job: String,
     },
 }
 
@@ -770,24 +832,47 @@ fn publish(st: &AppState, r: &JobRecord) {
 async fn run_job(st: Arc<AppState>, id: String) {
     // Single GPU worker: queued jobs wait here (status stays Queued).
     let _permit = st.worker.acquire().await.unwrap();
-    let (args, cancel) = {
+    let (args, cancel, redo_ranks) = {
         let mut jobs = st.jobs.lock().await;
         let Some(live) = jobs.get_mut(&id) else {
             return;
         };
+        live.queued = false;
         if live.removing {
             return;
         }
         live.running = true;
         live.record.status = JobStatus::Extracting;
         live.record.error = None;
+        let redo = live.redo.take();
         let r = live.record.clone();
         publish(&st, &r);
         let settings = st.settings.lock().await.clone();
         let source = PathBuf::from(&r.source);
         let out_dir = PathBuf::from(&r.out_dir);
-        match args_for(&source, &out_dir, &r.options, &settings) {
-            Ok(a) => (a, live.cancel.clone()),
+        let built = match &redo {
+            // Redo: exact clips on the same out dir (the transcript cache
+            // makes it a straight re-render), whatever the job's mode.
+            Some(specs) => {
+                let options = JobOptions {
+                    mode: Some("clips".into()),
+                    merge: None,
+                    ..r.options.clone()
+                };
+                args_for(&source, &out_dir, &options, &settings).and_then(|mut a| {
+                    let p = out_dir.join("redo.json");
+                    std::fs::create_dir_all(&out_dir)?;
+                    std::fs::write(&p, serde_json::to_string_pretty(specs)?)?;
+                    a.redo = Some(p);
+                    Ok(a)
+                })
+            }
+            None => args_for(&source, &out_dir, &r.options, &settings),
+        };
+        let redo_ranks: Option<Vec<usize>> =
+            redo.map(|specs| specs.iter().map(|s| s.rank).collect());
+        match built {
+            Ok(a) => (a, live.cancel.clone(), redo_ranks),
             Err(e) => {
                 live.record.status = JobStatus::Failed;
                 live.record.error = Some(e.to_string());
@@ -812,6 +897,7 @@ async fn run_job(st: Arc<AppState>, id: String) {
     // Event forwarder: pipeline events -> record mutations + socket events.
     let stf = st.clone();
     let idf = id.clone();
+    let redo_run = redo_ranks.is_some();
     let fwd = tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             let mut jobs = stf.jobs.lock().await;
@@ -850,7 +936,31 @@ async fn run_job(st: Arc<AppState>, id: String) {
                     });
                 }
                 JobEvent::ClipsPicked { clips } => {
-                    live.record.clips = clips.iter().map(ClipState::pending).collect();
+                    if redo_run {
+                        // Only the redone ranks go back to "making"; the
+                        // rest of the grid stays as it is.
+                        for a in &clips {
+                            let mut fresh = ClipState::pending(a);
+                            match live.record.clips.iter_mut().find(|c| c.rank == a.rank) {
+                                Some(c) => {
+                                    fresh.rev = c.rev;
+                                    *c = fresh;
+                                }
+                                None => live.record.clips.push(fresh),
+                            }
+                        }
+                        live.record.clips.sort_by_key(|c| c.rank);
+                    } else {
+                        let prev = std::mem::take(&mut live.record.clips);
+                        live.record.clips = clips
+                            .iter()
+                            .map(|a| {
+                                let mut c = ClipState::pending(a);
+                                c.rev = prev.iter().find(|p| p.rank == a.rank).map_or(0, |p| p.rev);
+                                c
+                            })
+                            .collect();
+                    }
                     live.record.status = JobStatus::ClipsReady;
                     let r = live.record.clone();
                     publish(&stf, &r);
@@ -892,10 +1002,12 @@ async fn run_job(st: Arc<AppState>, id: String) {
                     });
                 }
                 JobEvent::ClipDone { clip } => {
-                    let state = ClipState::done(&clip);
+                    let mut state = ClipState::done(&clip);
                     if let Some(c) = live.record.clips.iter_mut().find(|c| c.rank == clip.rank) {
+                        state.rev = c.rev + 1;
                         *c = state.clone();
                     } else {
+                        state.rev = 1;
                         live.record.clips.push(state.clone());
                     }
                     let r = live.record.clone();
@@ -990,18 +1102,42 @@ async fn run_job(st: Arc<AppState>, id: String) {
             }
             publish(&st, &r);
             if live.record.status == JobStatus::Done {
+                let (title, body) = if redo_run {
+                    ("Clip updated", format!("{name} — re-rendered."))
+                } else {
+                    ("Clips ready", format!("{name} — all done."))
+                };
                 let _ = st.bus.send(ServerMsg::Ev {
                     ev: Event::Toast {
                         tone: "success".into(),
-                        title: "Clips ready".into(),
-                        body: format!("{} — all done.", name),
+                        title: title.into(),
+                        body,
                     },
                 });
             }
         }
         Err(e) => {
             let msg = e.to_string();
-            if cancel.is_cancelled() || msg.contains("cancelled by user") {
+            if let Some(ranks) = &redo_ranks {
+                // A failed edit never fails the job: the other clips are
+                // fine. The redone ranks show as failed (their files may be
+                // half-written) and the error goes to a toast.
+                for c in live.record.clips.iter_mut() {
+                    if ranks.contains(&c.rank) && c.render_status != "done" {
+                        c.render_status = "failed".into();
+                    }
+                }
+                live.record.status = JobStatus::Done;
+                if !(cancel.is_cancelled() || msg.contains("cancelled by user")) {
+                    let _ = st.bus.send(ServerMsg::Ev {
+                        ev: Event::Toast {
+                            tone: "error".into(),
+                            title: "Edit failed".into(),
+                            body: truncate(&msg, 160),
+                        },
+                    });
+                }
+            } else if cancel.is_cancelled() || msg.contains("cancelled by user") {
                 live.record.status = JobStatus::Cancelled;
                 live.record.error = None;
             } else {
@@ -1117,15 +1253,9 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             st.persist_job(&record);
             {
                 let mut jobs = st.jobs.lock().await;
-                jobs.insert(
-                    job_id.clone(),
-                    LiveJob {
-                        record: record.clone(),
-                        cancel: crate::progress::CancelFlag::new(),
-                        running: false,
-                        removing: false,
-                    },
-                );
+                let mut live = LiveJob::new(record.clone());
+                live.queued = true;
+                jobs.insert(job_id.clone(), live);
             }
             let _ = st.bus.send(ServerMsg::Ev {
                 ev: Event::JobCreated {
@@ -1171,7 +1301,8 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
         Cmd::JobRetry { job: jid } => {
             let exists_running = {
                 let jobs = st.jobs.lock().await;
-                jobs.get(&jid).map(|l| (l.running, l.record.clone()))
+                jobs.get(&jid)
+                    .map(|l| (l.running || l.queued, l.record.clone()))
             };
             match exists_running {
                 Some((true, _)) => vec![err(id, "job is running")],
@@ -1188,6 +1319,8 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                             live.record = record.clone();
                             live.cancel = crate::progress::CancelFlag::new();
                             live.removing = false;
+                            live.queued = true;
+                            live.redo = None;
                         }
                     }
                     let _ = st.bus.send(ServerMsg::Ev {
@@ -1407,7 +1540,166 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 None => vec![err(id, "unknown job")],
             }
         }
+        Cmd::ClipEdit {
+            job,
+            rank,
+            start_s,
+            end_s,
+            title,
+            style,
+            fixes,
+        } => {
+            let res = queue_redo(&st, &job, |live| {
+                let c = live
+                    .record
+                    .clips
+                    .iter()
+                    .find(|c| c.rank == rank)
+                    .ok_or("unknown clip")?;
+                let (a, b) = (start_s.unwrap_or(c.start_s), end_s.unwrap_or(c.end_s));
+                // The hook is the clip's opening words: a new range
+                // gets new ones.
+                let same_range = (a - c.start_s).abs() < 1e-3 && (b - c.end_s).abs() < 1e-3;
+                Ok(crate::redo::Spec {
+                    rank,
+                    start_s: a,
+                    end_s: b,
+                    title: Some(title.unwrap_or_else(|| c.title.clone())),
+                    hook: same_range.then(|| c.hook.clone()),
+                    style: Some(style.unwrap_or_else(|| c.style.clone())),
+                    why: Some(c.why.clone()).filter(|w| !w.is_empty()),
+                    score: Some(c.score),
+                    scores: c.scores.clone(),
+                    hashtags: c.hashtags.clone(),
+                    source: Some(c.source.clone()),
+                    fixes,
+                })
+            })
+            .await;
+            match res {
+                Ok(()) => vec![ok(id, None)],
+                Err(e) => vec![err(id, e)],
+            }
+        }
+        Cmd::ClipAdd {
+            job,
+            start_s,
+            end_s,
+            title,
+            style,
+        } => {
+            let mut new_rank = 0;
+            let res = queue_redo(&st, &job, |live| {
+                let pending = live.redo.iter().flatten().map(|s| s.rank);
+                let rank = live
+                    .record
+                    .clips
+                    .iter()
+                    .map(|c| c.rank)
+                    .chain(pending)
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                new_rank = rank;
+                Ok(crate::redo::Spec {
+                    rank,
+                    start_s,
+                    end_s,
+                    title,
+                    style,
+                    ..Default::default()
+                })
+            })
+            .await;
+            match res {
+                Ok(()) => vec![ok(id, Some(serde_json::json!({ "rank": new_rank })))],
+                Err(e) => vec![err(id, e)],
+            }
+        }
+        Cmd::TranscriptGet { job } => {
+            let out_dir = {
+                let jobs = st.jobs.lock().await;
+                match jobs.get(&job) {
+                    Some(live) => PathBuf::from(&live.record.out_dir),
+                    None => return vec![err(id, "unknown job")],
+                }
+            };
+            let tr = std::fs::read(out_dir.join("transcript.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<crate::whisper::Transcription>(&b).ok());
+            match tr {
+                Some(tr) => {
+                    let words: Vec<serde_json::Value> = tr
+                        .words
+                        .iter()
+                        .map(|w| serde_json::json!({ "w": w.w, "s": w.s, "e": w.e }))
+                        .collect();
+                    vec![ok(
+                        id,
+                        Some(serde_json::json!({ "words": words, "language": tr.language })),
+                    )]
+                }
+                None => vec![err(id, "no transcript yet")],
+            }
+        }
     }
+}
+
+/// Queue a redo (clip edit or new clip) on a finished clips job. The spec
+/// is built under the jobs lock; when a redo is already waiting for the
+/// worker the new spec joins it (same rank replaces) instead of queueing
+/// another run.
+async fn queue_redo(
+    st: &Arc<AppState>,
+    jid: &str,
+    build: impl FnOnce(&LiveJob) -> Result<crate::redo::Spec, &'static str>,
+) -> Result<(), String> {
+    let record = {
+        let mut jobs = st.jobs.lock().await;
+        let Some(live) = jobs.get_mut(jid) else {
+            return Err("unknown job".into());
+        };
+        if live.running {
+            return Err("job is busy — wait for it to finish".into());
+        }
+        if live.record.options.mode.as_deref() == Some("full") {
+            return Err("clip edits need a clips job".into());
+        }
+        if !PathBuf::from(&live.record.out_dir)
+            .join("transcript.json")
+            .is_file()
+        {
+            return Err("no transcript yet — run the job first".into());
+        }
+        let spec = build(live).map_err(String::from)?;
+        if spec.end_s - spec.start_s < crate::redo::MIN_LEN_S {
+            return Err(format!("a clip needs at least {}s", crate::redo::MIN_LEN_S));
+        }
+        if live.queued {
+            return match &mut live.redo {
+                Some(specs) => {
+                    specs.retain(|s| s.rank != spec.rank);
+                    specs.push(spec);
+                    Ok(())
+                }
+                None => Err("job is queued — wait for it to finish".into()),
+            };
+        }
+        live.redo = Some(vec![spec]);
+        live.queued = true;
+        live.cancel = crate::progress::CancelFlag::new();
+        live.removing = false;
+        live.record.status = JobStatus::Queued;
+        live.record.error = None;
+        live.record.clone()
+    };
+    publish(st, &record);
+    let st2 = st.clone();
+    let jid2 = jid.to_string();
+    tokio::spawn(async move {
+        run_job(st2, jid2).await;
+    });
+    Ok(())
 }
 
 /// OpenRouter model catalog (for the model picker), cached 24h.
@@ -1651,15 +1943,7 @@ fn reload_jobs() -> HashMap<String, LiveJob> {
                 }
             }
         }
-        out.insert(
-            r.id.clone(),
-            LiveJob {
-                record: r,
-                cancel: crate::progress::CancelFlag::new(),
-                running: false,
-                removing: false,
-            },
-        );
+        out.insert(r.id.clone(), LiveJob::new(r));
     }
     out
 }
@@ -1885,5 +2169,49 @@ mod tests {
         let a = args_for(&src, &out, &o, &s).unwrap();
         assert_eq!(a.openrouter_key.as_deref(), Some("sk-test"));
         assert_eq!(a.openrouter_model.as_deref(), Some("x/y"));
+    }
+
+    #[test]
+    fn clip_edit_frames_parse() {
+        let m: ClientMsg = serde_json::from_str(
+            r#"{"id":3,"cmd":"clip_edit","job":"job-1","rank":2,"end_s":41.5,
+                "fixes":[{"s":12.3,"w":"Hormozi"}]}"#,
+        )
+        .unwrap();
+        match m.cmd {
+            Cmd::ClipEdit {
+                rank,
+                start_s,
+                end_s,
+                title,
+                fixes,
+                ..
+            } => {
+                assert_eq!(rank, 2);
+                assert_eq!((start_s, end_s), (None, Some(41.5)));
+                assert!(title.is_none());
+                assert_eq!(fixes[0].w, "Hormozi");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+        let m: ClientMsg = serde_json::from_str(
+            r#"{"id":4,"cmd":"clip_add","job":"job-1","start_s":10,"end_s":40}"#,
+        )
+        .unwrap();
+        assert!(matches!(m.cmd, Cmd::ClipAdd { .. }));
+    }
+
+    #[test]
+    fn old_job_files_load_without_insights() {
+        // A clip saved before why/scores/rev existed still loads.
+        let c: ClipState = serde_json::from_str(
+            r#"{"rank":1,"title":"t","hook":"h","start_s":0,"end_s":30,"tight_dur":28,
+                "style":"karaoke","source":"llm","score":80,"mp4":"clip_01.mp4",
+                "poster":null,"ass":null,"srt":null,"kit":null}"#,
+        )
+        .unwrap();
+        assert_eq!(c.rev, 0);
+        assert!(c.why.is_empty() && c.scores.is_none() && c.hashtags.is_empty());
+        assert_eq!(c.render_status, "pending");
     }
 }
