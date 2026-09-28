@@ -1980,14 +1980,15 @@ fn exec_clip(
     let stem = format!("clip-{rank:02}-{}", look.canvas.tag());
     // Captions on the tight clock — the same clock the frames are on.
     let ass = out.join(format!("{stem}.ass"));
-    // Bare `--headline`: the picker's headline title, else one lifted
-    // from the clip's own words — never a raw mid-sentence hook quote.
+    // Bare `--headline`: the picker's headline title, else the hook line
+    // or a sentence from the clip that stands on its own — never a cut-off
+    // quote.
     let headline = headline.and_then(|h| {
         if h.trim().is_empty() {
             clip.title
                 .clone()
                 .filter(|t| !t.trim().is_empty())
-                .or_else(|| crate::kit::headline_from_words(&plan.retimed))
+                .or_else(|| crate::kit::headline_for(&clip.hook_line, &plan.retimed))
         } else {
             Some(h.to_string())
         }

@@ -432,7 +432,7 @@ impl Anim {
 }
 
 /// Headline budget (chars): two short lines on the card.
-const HEADLINE_MAX: usize = 44;
+const HEADLINE_MAX: usize = 48;
 /// Headline type and accent on the white card (&HAABBGGRR).
 const HEADLINE_INK: &str = "&H00111111";
 const HEADLINE_ACCENT: &str = "&H001E3CFF";
@@ -541,8 +541,13 @@ pub fn headline_text(raw: &str, max: usize) -> String {
 fn headline_markup(h: &str, ink: &str, accent: &str) -> String {
     let words: Vec<&str> = h.split(' ').collect();
     // Accent: a keyword, else the longest content word.
+    // "I", "I'm"… are capitalized but never the point.
     let pick = (1..words.len())
-        .find(|&i| is_keyword(words[i], false))
+        .find(|&i| {
+            is_keyword(words[i], false)
+                && !bare(words[i]).starts_with("i'")
+                && bare(words[i]) != "i"
+        })
         .or_else(|| {
             (0..words.len())
                 .filter(|&i| {
@@ -803,6 +808,9 @@ mod tests {
         );
         let m = headline_markup("I made $1 million", "&H00111111", "&H001E3CFF");
         assert_eq!(m, "I made {\\1c&H001E3CFF&}$1{\\1c&H00111111&} million");
+        // "I'm" is capitalized, not a keyword.
+        let m = headline_markup("Feel like I'm in a coffin", "&H00111111", "&H001E3CFF");
+        assert!(m.contains("{\\1c&H001E3CFF&}coffin"), "{m}");
         let ass = build_for(
             &words(),
             "karaoke",
