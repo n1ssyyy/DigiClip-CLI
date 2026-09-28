@@ -689,7 +689,7 @@ fn args_for(
     if let Some(v) = o.threads {
         flag(&mut argv, "--threads", v.to_string());
     }
-    if let Some(v) = &o.aspect {
+    if let Some(v) = o.aspect.as_ref().filter(|v| !v.trim().is_empty()) {
         flag(&mut argv, "--aspect", v.clone());
     }
     // `""` = on with the default (clip title / brand yellow).
@@ -709,8 +709,8 @@ fn args_for(
     }
     if let Some(v) = o.logo.as_ref().filter(|v| !v.is_empty()) {
         flag(&mut argv, "--logo", v.clone());
-        if let Some(p) = &o.logo_pos {
-            flag(&mut argv, "--logo-pos", p.clone());
+        if let Some(p) = o.logo_pos.as_ref().filter(|p| !p.trim().is_empty()) {
+            flag(&mut argv, "--logo-pos", p.trim().to_ascii_lowercase());
         }
     }
     if let Some(v) = o.music.as_ref().filter(|v| !v.is_empty()) {
@@ -1753,7 +1753,12 @@ mod tests {
         let a = args_for(&src, &out, &o, &s).unwrap();
         assert_eq!(a.headline.as_deref(), Some("Big news"));
         assert_eq!(a.progress_bar.as_deref(), Some("#00E5FF"));
-        // A bad value is a clear error, not a silent default.
+        // Empty = default; a bad value is a clear error, not a silent default.
+        o.aspect = Some(String::new());
+        o.logo_pos = Some(" ".into());
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.canvas(), crate::compose::Canvas::TALL);
+        assert_eq!(a.logo_pos, "tr");
         o.aspect = Some("3:1".into());
         assert!(args_for(&src, &out, &o, &s).is_err());
     }
