@@ -220,6 +220,13 @@ pub struct Args {
     #[arg(long, value_enum, default_value = "center")]
     pub framing: Framing,
 
+    /// Two-person layout on tall canvases: `single` (one camera), `split`
+    /// (left person on top, right person below, captions on the seam) or
+    /// `auto` (split when two people share the frame most of the clip).
+    /// Needs --framing smart.
+    #[arg(long, value_enum, default_value = "single")]
+    pub layout: crate::split::Mode,
+
     /// Path to a crop-plan JSON file (required with --framing plan).
     /// Format: {"tracks":[{"t":0.0,"x":320.0}]} — x = crop-left in source
     /// pixels at time t (seconds). Y stays 0 (full-height crop).

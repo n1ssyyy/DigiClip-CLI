@@ -94,6 +94,10 @@ struct Timeline {
     raw: Vec<RawTarget>,
     segments: Vec<crate::track::Seg>,
     shots: Vec<f64>,
+    /// Two-people-side-by-side sightings and the sample count (split
+    /// layout evidence; empty for external plans).
+    duo: Vec<crate::track::Duo>,
+    samples: usize,
 }
 
 /// Canvas and overlays from the CLI flags. Missing logo/music files fail
@@ -129,6 +133,7 @@ fn ass_opts(
     look: &crate::render::Look,
     headline: Option<String>,
     dur: f64,
+    seam: bool,
 ) -> crate::captions::ass::AssOpts {
     let c = look.canvas;
     crate::captions::ass::AssOpts {
@@ -137,6 +142,7 @@ fn ass_opts(
         headline,
         dur,
         anim: look.anim,
+        seam,
         // Logo width + its inset + a gap.
         clear: look.logo.as_ref().map(|l| crate::captions::ass::Clear {
             top: l.corner.is_top(),
@@ -383,6 +389,8 @@ async fn resolve_timeline(
                             kind: crate::track::SegKind::Track,
                         }],
                         shots: vec![],
+                        duo: vec![],
+                        samples: 0,
                     };
                     Some(tl)
                 }
@@ -456,6 +464,8 @@ async fn resolve_timeline(
                         raw: tracked.raw,
                         segments: tracked.segments,
                         shots: tracked.shots,
+                        duo: tracked.duo,
+                        samples: tracked.samples,
                     })
                 }
                 Err(e) => {
@@ -975,6 +985,12 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
         extra: false,
     };
 
+    if args.layout != crate::split::Mode::Single && args.framing != Framing::Smart {
+        tracing::warn!(
+            "--layout {:?} needs --framing smart: one camera",
+            args.layout
+        );
+    }
     match args.mode {
         Mode::Full => {
             // --- full-video subtitle mode -----------------------------------
@@ -1048,7 +1064,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                     &plan.retimed,
                     &style,
                     0.0,
-                    &ass_opts(&look, headline, plan.tight_total),
+                    &ass_opts(&look, headline, plan.tight_total, !plan.split.is_empty()),
                 ),
             )?;
             std::fs::write(
@@ -1065,6 +1081,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                     spans: &plan.spans,
                     poses: &plan.poses,
                     flash: &plan.flash,
+                    split: &plan.split,
                     ass: Some(&ass),
                     out: &mp4,
                     gpu: gpu_on,
@@ -1764,6 +1781,9 @@ struct RenderPlan {
     retimed: Vec<Word>,
     tight_total: f64,
     kinds: Vec<String>,
+    /// Split layout: (top, bottom) source crops per output frame; empty
+    /// for one camera.
+    split: Vec<(crate::compose::Rect, crate::compose::Rect)>,
 }
 
 /// Utterance onsets (output clock): word starts after a beat of silence.
@@ -1935,6 +1955,10 @@ async fn plan_render(
     let mut jumps: Vec<f64> = Vec::new();
     let mut punches: Vec<(f64, f64)> = Vec::new();
     let mut kinds: Vec<String> = Vec::new();
+    // Split-layout evidence and crops, per part.
+    let mut split_plans: Vec<Vec<(f64, crate::compose::Rect, crate::compose::Rect)>> =
+        vec![vec![]; parts.len()];
+    let (mut duo_n, mut samples) = (0usize, 0usize);
     let n_parts = parts.len().max(1);
     for (pi, part) in parts.iter().enumerate() {
         cancel.check()?;
@@ -1992,6 +2016,10 @@ async fn plan_render(
             hards.push(out0);
         }
         if let Some(tl) = &tl {
+            duo_n += tl.duo.len();
+            samples += tl.samples;
+            split_plans[pi] =
+                crate::split::plan(&tl.duo, &tl.shots, ga, gb, sw, sh, pc.look.canvas);
             for &s in &tl.shots {
                 if let Some(o) = crate::timeline::tight(s, &part.keeps) {
                     hards.push(out0 + o);
@@ -2016,6 +2044,10 @@ async fn plan_render(
         }
     }
     hards.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let split = split_frames(pc, &spans, &split_plans, duo_n, samples, r, rank);
+    if !split.is_empty() {
+        kinds.push("split".into());
+    }
     let ons = onsets(&retimed);
     let mut poses = camera::plan(
         &camera::PlanInput {
@@ -2115,7 +2147,43 @@ async fn plan_render(
         retimed,
         tight_total: total_frames as f64 / r,
         kinds,
+        split,
     })
+}
+
+/// Per-frame split crops when this render splits (`--layout`), else empty.
+fn split_frames(
+    pc: &PlanCtx<'_>,
+    spans: &[crate::render::Span],
+    plans: &[Vec<(f64, crate::compose::Rect, crate::compose::Rect)>],
+    duo_n: usize,
+    samples: usize,
+    r: f64,
+    rank: usize,
+) -> Vec<(crate::compose::Rect, crate::compose::Rect)> {
+    let mode = pc.args.layout;
+    let canvas = pc.look.canvas;
+    if !crate::split::wanted(mode, canvas, duo_n, samples) {
+        if mode == crate::split::Mode::Split && crate::split::fits(canvas) && !pc.extra {
+            tracing::warn!(
+                "clip #{rank}: split layout needs two people side by side ({duo_n} sighting(s)): one camera"
+            );
+        }
+        return vec![];
+    }
+    // A part without its own pair borrows the first part that has one.
+    let Some(fallback) = plans.iter().find_map(|p| p.first()).map(|p| (p.1, p.2)) else {
+        return vec![];
+    };
+    tracing::info!("clip #{rank}: split screen ({duo_n}/{samples} samples show two people)");
+    let mut out = Vec::with_capacity(spans.iter().map(|s| s.frames).sum());
+    for s in spans {
+        let plan = plans.get(s.part).map(Vec::as_slice).unwrap_or(&[]);
+        for k in 0..s.frames {
+            out.push(crate::split::at(plan, s.a + k as f64 / r).unwrap_or(fallback));
+        }
+    }
+    out
 }
 
 /// A clip after its sequential phase (tracking, punch look-ups, camera
@@ -2201,7 +2269,7 @@ fn exec_clip(
             &plan.retimed,
             &clip.caption_style,
             0.0,
-            &ass_opts(look, headline, plan.tight_total),
+            &ass_opts(look, headline, plan.tight_total, !plan.split.is_empty()),
         ),
     )?;
     std::fs::write(
@@ -2217,6 +2285,7 @@ fn exec_clip(
             spans: &plan.spans,
             poses: &plan.poses,
             flash: &plan.flash,
+            split: &plan.split,
             ass: Some(&ass),
             out: &mp4,
             gpu: gpu_on,

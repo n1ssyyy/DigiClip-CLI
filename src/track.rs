@@ -635,6 +635,39 @@ pub struct Tracked {
     pub shots: Vec<f64>,
     /// Seconds held in two-shot (both talkers framed).
     pub group_secs: f64,
+    /// Samples where two people share the frame side by side (split-screen
+    /// evidence), and how many samples there were in all.
+    pub duo: Vec<Duo>,
+    pub samples: usize,
+}
+
+/// Two people side by side in one sample (source px, left first).
+#[derive(Debug, Clone)]
+pub struct Duo {
+    pub t: f64,
+    pub left: Face,
+    pub right: Face,
+}
+
+/// The split-screen pair in a sample: the two most prominent confident
+/// faces, when they are of a size (one isn't the TV behind the other) and
+/// apart (not a duplicate box). Pure (unit-tested).
+pub fn duo_of(faces: &[Face], t: f64, src_w: f64) -> Option<Duo> {
+    let mut fs: Vec<&Face> = faces.iter().filter(|f| f.score >= 0.6).collect();
+    if fs.len() < 2 {
+        return None;
+    }
+    fs.sort_by(|a, b| (b.area() * b.score).total_cmp(&(a.area() * a.score)));
+    let (a, b) = (fs[0], fs[1]);
+    if a.h.min(b.h) < 0.6 * a.h.max(b.h) || (a.cx() - b.cx()).abs() < 0.2 * src_w {
+        return None;
+    }
+    let (left, right) = if a.cx() <= b.cx() { (a, b) } else { (b, a) };
+    Some(Duo {
+        t,
+        left: left.clone(),
+        right: right.clone(),
+    })
 }
 
 /// Post-cut settle (s): after a shot cut the challenger gate needs a beat
@@ -964,6 +997,7 @@ pub fn plan_tracks(
     let mut seen: Vec<(f64, bool)> = Vec::new();
     let mut ever_seen = false;
     let mut group_samples = 0u32;
+    let mut duo: Vec<Duo> = Vec::new();
     // Last pushed target + anchor (silence and dropouts hold them).
     let mut prev_raw: Option<(f64, f64, f64, f64)> = None;
     let mut prev_anchor: Option<(f64, f64)> = None;
@@ -1053,6 +1087,7 @@ pub fn plan_tracks(
                 f
             })
             .collect();
+        duo.extend(duo_of(&faces, *t, src_wf));
         // Two-shot candidate: a real pair sharing the scene while the
         // conversation is alive. Entry is strict (both confident, distinct
         // and moving now); holding is lenient (2s speech memory covers
@@ -1305,9 +1340,11 @@ pub fn plan_tracks(
     Ok(Tracked {
         segments: merged,
         ever_seen,
+        samples: raw.len(),
         raw,
         shots,
         group_secs,
+        duo,
     })
 }
 
@@ -1428,6 +1465,41 @@ pub fn build_segments(seen: &[(f64, bool)], end: f64, shots: &[f64]) -> Vec<Seg>
 mod tests {
     use super::*;
     use crate::compose::Canvas;
+
+    #[test]
+    fn duo_needs_two_similar_faces_apart() {
+        let mk = |x: f64, h: f64, score: f64| Face {
+            x,
+            y: 300.0,
+            w: h * 0.8,
+            h,
+            score,
+        };
+        // Two hosts, far apart: right one listed first, left comes out first.
+        let d = duo_of(
+            &[mk(1300.0, 170.0, 0.9), mk(400.0, 180.0, 0.9)],
+            2.0,
+            1920.0,
+        )
+        .unwrap();
+        assert!(d.left.x < d.right.x);
+        assert_eq!(d.t, 2.0);
+        // Too close together, a tiny background face, a weak detection.
+        assert!(duo_of(
+            &[mk(800.0, 170.0, 0.9), mk(1000.0, 170.0, 0.9)],
+            0.0,
+            1920.0
+        )
+        .is_none());
+        assert!(duo_of(&[mk(300.0, 200.0, 0.9), mk(1400.0, 60.0, 0.9)], 0.0, 1920.0).is_none());
+        assert!(duo_of(
+            &[mk(300.0, 200.0, 0.9), mk(1400.0, 200.0, 0.4)],
+            0.0,
+            1920.0
+        )
+        .is_none());
+        assert!(duo_of(&[mk(300.0, 200.0, 0.9)], 0.0, 1920.0).is_none());
+    }
 
     #[test]
     fn cluster_members_wants_close_confident_crews() {
