@@ -233,7 +233,7 @@ fn segments_split_track_and_wide() {
         .map(|i| (i as f64 * 0.25, !(20..40).contains(&i)))
         .collect();
     let _ = &mut seen;
-    let segs = build_segments(&seen, 20.0);
+    let segs = build_segments(&seen, 20.0, &[]);
     assert!(segs.len() >= 3, "{segs:?}");
     assert_eq!(segs[0].kind, SegKind::Track);
     assert!(segs
