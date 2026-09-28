@@ -1,89 +1,42 @@
-//! Clip → 1080×1920 captioned MP4 (port of RenderService.php).
+//! Render engine: kept source spans + a per-frame camera path → one
+//! 1080x1920 captioned MP4, in a single pass.
 //!
-//! One continuous virtual-camera pass per timeline: the tracker segments
-//! each output into Track (face-following), Wide (full horizontal frame)
-//! and Punch (static VLM-chosen framing) ranges, render stitches them into
-//! a single raw camera path and smooths it once — every framing change
-//! arrives as a bezier dolly through an animated crop+scale+overlay comp,
-//! never a dissolve. Audio is one contiguous slice, so A/V drift is
-//! structurally impossible. Loudness-normalized mobile audio, H.264 +
-//! faststart. GPU mode uses NVENC; CPU mode uses libx264.
+//! ```text
+//!  ffmpeg decode ──yuv420p──▶ compositor (Rust) ──yuv420p──▶ ffmpeg encode
+//!  (one per span,              f64 crop, SIMD resize,        (ass burn-in,
+//!   CFR via fps filter)        blur fill, flash)              audio graph)
+//! ```
 //!
-//! Windows notes: every path inside `-vf` goes through `filter_escape`
-//! (backslash -> slash, wrap in single quotes, escape `':,`), which is
-//! mandatory for `C:\...` drive colons. Thread count uses the same
-//! `cpus-2` rule as transcription.
+//! Why not an ffmpeg filtergraph: `crop` only takes whole (even) pixels and
+//! `scale` rebuilds itself whenever the crop size changes, so pans stepped
+//! several output pixels at a time and zooms flickered bars; `sendcmd`
+//! schedules had to be regenerated per keep and the keeps concatenated.
+//! Here every output frame gets its exact fractional camera rect, all keeps
+//! of a clip decode back to back into ONE encoder (no segment files, no
+//! concat, no re-encode), and the three stages run concurrently on bounded
+//! queues, so memory stays at a handful of frames.
+//!
+//! A/V sync is by construction: every span renders a whole number of
+//! frames `n` and exactly `n / fps` seconds of audio (sample-exact `atrim`
+//! on a sample-count clock), so the two can never drift, however many
+//! jump cuts a clip has. Joins get 8 ms fades (no clicks, no gap you can
+//! hear), clip edges a soft in/out. Loudness is two-pass: measure the
+//! assembled audio, then one linear gain to -14 LUFS with a true-peak-safe
+//! limiter — no pumping.
+//!
+//! Windows notes: every path inside a filter goes through
+//! [`filter_escape`] (backslash → slash, quotes, escaped `':,`), which is
+//! mandatory for `C:\...` drive colons.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
+use std::sync::mpsc;
 
-use crate::framing::CamPose;
-use crate::track::RawTarget;
-use crate::validator::Clip;
-use crate::whisper::Word;
-
-/// One output chunk (absolute source seconds).
-#[derive(Debug, Clone)]
-pub struct Chunk {
-    pub t0: f64,
-    pub t1: f64,
-    pub kind: ChunkKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum ChunkKind {
-    /// Face-following raw camera targets (smoothed once, clip-wide, at render).
-    Track(Vec<RawTarget>),
-    /// Nobody on camera: dolly holds the full horizontal frame.
-    Wide,
-    /// Static punch-in at 0..1 frame position (VLM suggestion) — arrived
-    /// at via dolly, not cut to.
-    Punch(f64),
-}
-
-/// Concatenate same-codec segments with stream copy (no re-encode):
-/// every segment comes from one encoder with identical settings, so the
-/// join is sample-exact and A/V drift stays impossible.
-pub fn concat_copy(
-    ffmpeg: &Path,
-    segs: &[std::path::PathBuf],
-    out_mp4: &Path,
-) -> anyhow::Result<()> {
-    // Named after the output: clips assembling side by side share a dir.
-    let stem = out_mp4
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "out".into());
-    let list = out_mp4.parent().unwrap().join(format!("{stem}.concat.txt"));
-    let mut txt = String::new();
-    for s in segs {
-        txt.push_str(&format!(
-            "file '{}'\n",
-            s.display().to_string().replace('\'', "'\\''")
-        ));
-    }
-    std::fs::write(&list, txt)?;
-    let args: Vec<String> = vec![
-        ffmpeg.display().to_string(),
-        "-y".into(),
-        "-f".into(),
-        "concat".into(),
-        "-safe".into(),
-        "0".into(),
-        "-i".into(),
-        list.display().to_string(),
-        "-c".into(),
-        "copy".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-        out_mp4.display().to_string(),
-    ];
-    run_ffmpeg(&args, "concat segments")?;
-    let _ = std::fs::remove_file(&list);
-    if !out_mp4.is_file() {
-        anyhow::bail!("concat produced no file.");
-    }
-    Ok(())
-}
+use crate::camera::Pose;
+use crate::compose::{Compositor, Geom, Rect, OUT_H, OUT_W};
+use crate::ffmpeg::Probe;
+use crate::progress::{CancelFlag, SharedPct};
 
 pub fn threads() -> usize {
     crate::whisper::cpu_count().saturating_sub(2).max(1)
@@ -137,8 +90,22 @@ fn encoder_available(ffmpeg: &Path, name: &str) -> bool {
 
 /// Encoder pick follows the master GPU switch (see `GpuMode`): VideoToolbox
 /// on macOS, NVENC on Windows/Linux when actually present in the ffmpeg
-/// build (plus an NVIDIA GPU for NVENC), else libx264. Never fails.
+/// build (plus an NVIDIA GPU for NVENC), else libx264. Never fails. The
+/// probe (two child processes) runs once per process and mode.
 pub fn pick_encoder(gpu: bool) -> String {
+    static CACHE: std::sync::Mutex<[Option<String>; 2]> = std::sync::Mutex::new([None, None]);
+    let slot = gpu as usize;
+    if let Some(e) = CACHE.lock().ok().and_then(|c| c[slot].clone()) {
+        return e;
+    }
+    let picked = probe_encoder(gpu);
+    if let Ok(mut c) = CACHE.lock() {
+        c[slot] = Some(picked.clone());
+    }
+    picked
+}
+
+fn probe_encoder(gpu: bool) -> String {
     if gpu {
         if let Some(ffmpeg) = crate::binaries::resolve("ffmpeg") {
             if cfg!(target_os = "macos") {
@@ -164,693 +131,848 @@ fn has_nvidia() -> bool {
         .unwrap_or(false)
 }
 
-fn ass_filter(ass: &Path) -> String {
-    format!(
-        "ass={}:fontsdir={}",
-        filter_escape(ass),
-        filter_escape(&fonts_dir())
-    )
-}
-
-/// Virtual-camera frame: one source rect per output frame. `crop` selects
-/// the rect, `scale` fits it inside 1080x1920 (fit-width for wide rects,
-/// fill for 9:16), `overlay` centers it over the blurred full-frame
-/// backdrop. All three ride the same 30Hz sendcmd schedule, so
-/// wide<->closeup moves render as continuous bezier dollies — never fades.
-#[derive(Debug, Clone)]
-pub struct Dolly {
-    pub cw: i64,
-    pub ch: i64,
-    pub cx: i64,
-    pub cy: i64,
-    pub sw: i64,
-    pub sh: i64,
-    pub ox: i64,
-    pub oy: i64,
-}
-
-/// Derive the comp from a source-px pose rect.
-pub fn dolly_for(p: &CamPose, src_w: f64, src_h: f64) -> Dolly {
-    let cw = ((p.w / 2.0).round() * 2.0).clamp(2.0, src_w) as i64;
-    let ch = ((p.h / 2.0).round() * 2.0).clamp(2.0, src_h) as i64;
-    let cx = p.x.round().clamp(0.0, (src_w - cw as f64).max(0.0)) as i64;
-    let cy = p.y.round().clamp(0.0, (src_h - ch as f64).max(0.0)) as i64;
-    let s = (1080.0 / cw as f64).min(1920.0 / ch as f64);
-    let sw = ((cw as f64 * s / 2.0).round() * 2.0).clamp(2.0, 1080.0) as i64;
-    let sh = ((ch as f64 * s / 2.0).round() * 2.0).clamp(2.0, 1920.0) as i64;
-    Dolly {
-        cw,
-        ch,
-        cx,
-        cy,
-        sw,
-        sh,
-        ox: ((1080 - sw) / 2).max(0),
-        oy: ((1920 - sh) / 2).max(0),
-    }
-}
-
-/// Dolly chain: sendcmd-driven crop + scale + overlay. `cmd_file=None` →
-/// static comp.
-///
-/// Cost notes (measured, 18s clip, NVENC): the backdrop is blurred at a
-/// quarter of its size and scaled up — identical after a blur, ~10x
-/// cheaper than blurring 1080x1920. The foreground uses bicubic, not
-/// lanczos: the dolly changes the crop size every frame, so swscale
-/// rebuilds its filter each frame and lanczos coefficients dominated the
-/// render; on the upscaled source the two are visually the same.
-/// Together: 24.1s -> ~9s.
-fn vf_dolly(ass: &Path, cmd_file: Option<&Path>, init: &Dolly) -> String {
-    let send = cmd_file
-        .map(|p| format!("sendcmd=f={},", filter_escape(p)))
-        .unwrap_or_default();
-    format!(
-        "{send}split=2[bg][fg];[bg]crop=ih*9/16:ih,scale=270:480:flags=bilinear,boxblur=luma_radius=5:luma_power=2,scale=1080:1920:flags=bilinear[bg2];[fg]crop@c={cw}:{ch}:{cx}:{cy},scale@s={sw}:{sh}:flags=bicubic[fg2];[bg2][fg2]overlay@o={ox}:{oy},{},format=yuv420p",
-        ass_filter(ass),
-        cw = init.cw,
-        ch = init.ch,
-        cx = init.cx,
-        cy = init.cy,
-        sw = init.sw,
-        sh = init.sh,
-        ox = init.ox,
-        oy = init.oy,
-    )
-}
-
-/// Build the dolly `sendcmd` schedule: 8 commands per pose (crop x/y/w/h,
-/// scale w/h, overlay x/y). Returns `(initial, commands)`; `offset` shifts
-/// times (clip seeks reset frame timestamps to 0).
-pub fn dolly_commands(poses: &[CamPose], src_w: f64, src_h: f64, offset: f64) -> (Dolly, String) {
-    let base = Dolly {
-        cw: (src_h * 9.0 / 16.0) as i64,
-        ch: src_h as i64,
-        cx: ((src_w - src_h * 9.0 / 16.0).max(0.0) / 2.0) as i64,
-        cy: 0,
-        sw: 1080,
-        sh: 1920,
-        ox: 0,
-        oy: 0,
-    };
-    if poses.is_empty() {
-        return (base, String::new());
-    }
-    let mut lines = String::with_capacity(poses.len() * 160);
-    let mut initial = dolly_for(&poses[0], src_w, src_h);
-    let mut last_t = f64::NEG_INFINITY;
-    for p in poses {
-        let t = (p.t - offset).max(0.0);
-        if t - last_t < 0.005 && last_t > f64::NEG_INFINITY / 2.0 {
-            continue; // sub-frame dup: sendcmd would step twice, not glide
-        }
-        last_t = t;
-        let d = dolly_for(p, src_w, src_h);
-        if p.t - offset <= 0.0 {
-            initial = d.clone();
-        }
-        lines.push_str(&format!(
-            "{t:.3} crop@c x {};{t:.3} crop@c y {};{t:.3} crop@c w {};{t:.3} crop@c h {};{t:.3} scale@s w {};{t:.3} scale@s h {};{t:.3} overlay@o x {};{t:.3} overlay@o y {};\n",
-            d.cx, d.cy, d.cw, d.ch, d.sw, d.sh, d.ox, d.oy
-        ));
-    }
-    (initial, lines)
-}
-
-fn run_ffmpeg(args: &[String], what: &str) -> anyhow::Result<()> {
-    run_ffmpeg_progress(args, what, 0.0, None, &crate::progress::CancelFlag::never())
-}
-
-/// Streaming ffmpeg run with machine-readable progress.
-///
-/// Two live sources feed one deduping hook: `-progress pipe:1` parsed on
-/// the caller (`out_time_ms=`) and stderr status lines (`time=HH:MM:SS`)
-/// parsed on the drain thread. Either alone would do; together they
-/// survive whichever stream a build buffers (seen live: `-progress`
-/// arriving as one end-of-job burst on NVENC). On
-/// [`CancelFlag`](crate::progress::CancelFlag) the child is killed and
-/// this bails with "cancelled by user".
-fn run_ffmpeg_progress(
-    args: &[String],
-    what: &str,
-    total_s: f64,
-    on_pct: Option<crate::progress::SharedPct>,
-    cancel: &crate::progress::CancelFlag,
-) -> anyhow::Result<()> {
-    use std::io::BufRead;
-    use std::process::Stdio;
-    tracing::info!("{what}");
-    if args.len() < 2 {
-        anyhow::bail!("{what}: empty ffmpeg command");
-    }
-    let (prog, rest) = args.split_first().unwrap();
-    // Fast path (total unknown, e.g. concat): today's exact behavior.
-    let stream = total_s > 0.0 && on_pct.is_some();
-    let mut full: Vec<String> = rest.to_vec();
-    if stream {
-        let out = full.pop().unwrap();
-        full.push("-progress".into());
-        full.push("pipe:1".into());
-        full.push(out);
-    }
-    let mut child = crate::process::command(prog)
-        .args(&full)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let total_ms = (total_s * 1000.0).max(1.0);
-    // Plain forward (callers clamp work-in-progress to 99 and finish
-    // with exactly 100); the hook itself dedupes repeats.
-    let report = |p: u8| {
-        if let Some(f) = on_pct.as_deref() {
-            f(p);
-        }
-    };
-    // Drain stderr on a side thread (bounded tail for error reports);
-    // without this a chatty ffmpeg could block on a full pipe. The
-    // thread also mines `time=` status lines for live progress.
-    let mut err_taker = child.stderr.take().map(|e| {
-        let hook = on_pct.clone();
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut tail = vec![0u8; 0];
-            let mut buf = [0u8; 8192];
-            let mut e = e;
-            let mut carry = String::new();
-            loop {
-                match e.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        tail.extend_from_slice(&buf[..n]);
-                        let excess = tail.len().saturating_sub(4096);
-                        if excess > 0 {
-                            tail.drain(..excess);
-                        }
-                        if let Some(h) = hook.as_deref() {
-                            carry.push_str(&String::from_utf8_lossy(&buf[..n]));
-                            // Status lines end in \r (single line that
-                            // rewrites itself); split on both separators.
-                            let mut rest = String::new();
-                            for chunk in carry.split(['\r', '\n']) {
-                                if let Some(t) = parse_status_time(chunk) {
-                                    let p = ((t * 1000.0 / total_ms * 100.0) as u8).min(99);
-                                    h(p);
-                                    rest.clear();
-                                } else {
-                                    // Keep only the tail: a `time=` token
-                                    // never spans more than one line.
-                                    rest = chunk[chunk.len().saturating_sub(32)..].to_string();
-                                }
-                            }
-                            carry = rest;
-                        }
-                    }
-                }
+/// Quality encode flags. NVENC runs constant-quality VBR with no bitrate
+/// cap (`-b:v 0`; without it the 2 Mbit/s default starves 1080x1920) and
+/// spatial AQ; x264 `veryfast` CRF 20; VideoToolbox (no CRF) a generous
+/// fixed bitrate.
+fn video_codec_args(encoder: &str, threads: usize, fps: (u32, u32)) -> Vec<String> {
+    let gop = ((fps.0 as f64 / fps.1 as f64) * 2.0).round().max(1.0) as u32;
+    let mut v: Vec<String> = match encoder {
+        "h264_nvenc" => [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-tune",
+            "hq",
+            "-rc",
+            "vbr",
+            "-cq",
+            "21",
+            "-b:v",
+            "0",
+            "-spatial-aq",
+            "1",
+            "-profile:v",
+            "high",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        "h264_videotoolbox" => [
+            "-c:v",
+            "h264_videotoolbox",
+            "-b:v",
+            "12M",
+            "-maxrate",
+            "16M",
+            "-profile:v",
+            "high",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        other => {
+            let mut v: Vec<String> = vec!["-c:v".into(), other.to_string()];
+            if other == "libx264" {
+                v.extend(
+                    ["-preset", "veryfast", "-crf", "20", "-profile:v", "high"]
+                        .iter()
+                        .map(|s| s.to_string()),
+                );
+                v.push("-threads".into());
+                v.push(threads.to_string());
             }
-            String::from_utf8_lossy(&tail).into_owned()
-        })
-    });
-    let mut pct_emitted = false;
-    if stream {
-        let stdout = child.stdout.take().unwrap();
-        let reader = std::io::BufReader::new(stdout);
-        let total_ms = (total_s * 1000.0).max(1.0);
-        for line in reader.lines() {
-            if cancel.is_cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(h) = err_taker.take() {
-                    let _ = h.join();
-                }
-                anyhow::bail!("cancelled by user");
-            }
-            let Ok(line) = line else { break };
-            if let Some(us) = line.strip_prefix("out_time_ms=") {
-                if let Ok(us) = us.trim().parse::<f64>() {
-                    report(out_time_pct(us, total_ms));
-                    pct_emitted = true;
-                }
-            }
-            if line.starts_with("progress=end") {
-                break;
-            }
-        }
-    }
-    // Wait (poll so cancel still kills a silent child).
-    let status = loop {
-        match child.try_wait()? {
-            Some(s) => break s,
-            None => {
-                if cancel.is_cancelled() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if let Some(h) = err_taker.take() {
-                        let _ = h.join();
-                    }
-                    anyhow::bail!("cancelled by user");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-    };
-    let err_tail = err_taker
-        .take()
-        .map(|h| h.join().unwrap_or_default())
-        .unwrap_or_default();
-    if !status.success() {
-        let tail: String = err_tail
-            .chars()
-            .rev()
-            .take(600)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        anyhow::bail!("{what} failed (exit {status}):\n{tail}");
-    }
-    if pct_emitted {
-        report(100);
-    }
-    Ok(())
-}
-
-/// Parse ffmpeg's stderr `time=HH:MM:SS.cs` status stamp into seconds.
-/// `time=N/A` (head/tail of the run) and garbage parse to None.
-
-/// Final quality encode. NOTE: `-crf` is x264-only — NVENC gets `-cq`
-/// (a previous revision passed `-crf` to NVENC, which silently fell back
-/// to a starved default bitrate).
-fn video_codec_args(encoder: &str) -> Vec<String> {
-    match encoder {
-        "h264_nvenc" => vec![
-            "-c:v".into(),
-            "h264_nvenc".into(),
-            "-preset".into(),
-            "p5".into(),
-            "-tune".into(),
-            "hq".into(),
-            "-cq".into(),
-            "23".into(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            "192k".into(),
-            "-movflags".into(),
-            "+faststart".into(),
-        ],
-        _ => {
-            let mut v = vec!["-c:v".into(), encoder.to_string()];
-            if encoder == "libx264" {
-                v.push("-preset".into());
-                v.push("veryfast".into());
-            }
-            v.extend(
-                [
-                    "-crf",
-                    "20",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "192k",
-                    "-movflags",
-                    "+faststart",
-                ]
-                .into_iter()
-                .map(str::to_string),
-            );
             v
         }
+    };
+    v.extend([
+        "-g".to_string(),
+        gop.to_string(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-color_primaries".into(),
+        "bt709".into(),
+        "-color_trc".into(),
+        "bt709".into(),
+        "-colorspace".into(),
+        "bt709".into(),
+        "-color_range".into(),
+        "tv".into(),
+    ]);
+    v
+}
+
+/// Output rate as f64.
+pub fn rate(fps: (u32, u32)) -> f64 {
+    fps.0 as f64 / fps.1.max(1) as f64
+}
+
+/// One kept source span: `frames` output frames starting at source time
+/// `a`. `part` numbers merge parts (a new part = a different moment of
+/// the video; joins between parts get longer audio fades).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Span {
+    pub a: f64,
+    pub frames: usize,
+    pub part: usize,
+}
+
+impl Span {
+    pub fn secs(&self, fps: (u32, u32)) -> f64 {
+        self.frames as f64 / rate(fps)
     }
 }
 
-/// Loudness filter only (codec flags come from [`video_codec_args`]).
-fn audio_args() -> Vec<String> {
-    vec![
-        "-af".into(),
-        "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000".into(),
-    ]
-}
-
-pub(crate) fn words_in(words: &[Word], a: f64, b: f64) -> Vec<Word> {
-    words
-        .iter()
-        .filter(|w| w.e > a && w.s < b)
-        .cloned()
-        .collect()
-}
-
-fn base_pose(src_w: f64, src_h: f64) -> CamPose {
-    let w = src_h * 9.0 / 16.0;
-    CamPose {
-        t: 0.0,
-        x: (src_w - w).max(0.0) / 2.0,
-        y: 0.0,
-        w,
-        h: src_h,
-    }
-}
-
-/// Stitch chunk framings into ONE raw camera timeline. Track chunks
-/// contribute their raw targets; Wide synthesizes full-frame holds and
-/// Punch a static focus window. Every kind change after the first is flagged
-/// `cut` so arrival dollies in on a bezier bridge instead of dissolving.
-fn assemble(chunks: &[Chunk], src_w: f64, src_h: f64) -> Vec<RawTarget> {
-    let base_w = src_h * 9.0 / 16.0;
-    let center = (src_w - base_w).max(0.0) / 2.0;
-    let mut out = Vec::new();
-    for (ci, chunk) in chunks.iter().enumerate() {
-        let boundary = ci > 0;
-        match &chunk.kind {
-            ChunkKind::Track(raws) if raws.is_empty() => {
-                for &t in &[chunk.t0, chunk.t1] {
-                    out.push(RawTarget {
-                        t,
-                        x: center,
-                        y: 0.0,
-                        w: base_w,
-                        h: src_h,
-                        cut: false,
-                        hard: false,
-                        n_faces: 0,
-                        pick_cx: f64::NAN,
-                    });
-                }
-            }
-            ChunkKind::Track(raws) => {
-                for (i, r) in raws.iter().enumerate() {
-                    let mut q = r.clone();
-                    if i == 0 && boundary {
-                        q.cut = true; // dolly in across the framing change
-                    }
-                    out.push(q);
-                }
-            }
-            ChunkKind::Wide => {
-                let mk = |t: f64, cut: bool| RawTarget {
-                    t,
-                    x: 0.0,
-                    y: 0.0,
-                    w: src_w,
-                    h: src_h,
-                    cut,
-                    hard: false,
-                    n_faces: 0,
-                    pick_cx: f64::NAN,
-                };
-                out.push(mk(chunk.t0, boundary));
-                if chunk.t1 - chunk.t0 > 2.0 {
-                    out.push(mk((chunk.t0 + chunk.t1) / 2.0, false));
-                }
-                out.push(mk(chunk.t1, false));
-            }
-            ChunkKind::Punch(focus01) => {
-                let x = (focus01 * src_w - base_w / 2.0).clamp(0.0, (src_w - base_w).max(0.0));
-                let mk = |t: f64, cut: bool| RawTarget {
-                    t,
-                    x,
-                    y: 0.0,
-                    w: base_w,
-                    h: src_h,
-                    cut,
-                    hard: false,
-                    n_faces: 0,
-                    pick_cx: f64::NAN,
-                };
-                out.push(mk(chunk.t0, boundary));
-                if chunk.t1 - chunk.t0 > 2.0 {
-                    out.push(mk((chunk.t0 + chunk.t1) / 2.0, false));
-                }
-                out.push(mk(chunk.t1, false));
-            }
+/// Frame-count each kept `(a, b, part)` range on one output clock:
+/// cumulative rounding, so the total is exact and no span drifts.
+/// Callers snap keeps to the frame grid first (see
+/// [`crate::timeline::snap_keeps`]), which makes this exact per span too.
+pub fn spans_for(keeps: &[(f64, f64, usize)], fps: (u32, u32)) -> Vec<Span> {
+    let r = rate(fps);
+    let mut out = Vec::with_capacity(keeps.len());
+    let mut acc = 0.0f64;
+    let mut done = 0usize;
+    for &(a, b, part) in keeps {
+        acc += (b - a).max(0.0);
+        let end = (acc * r).round() as usize;
+        let n = end.saturating_sub(done);
+        if n > 0 {
+            out.push(Span { a, frames: n, part });
         }
+        done = end.max(done);
     }
     out
 }
 
-/// Map a `-progress` `out_time_ms` stamp onto 0-99 against the expected
-/// total. Despite the name the stamp is MICROseconds (29_960_000 ≈ 30s);
-/// dividing by the millisecond total directly parks every encode at 99.
-fn out_time_pct(us: f64, total_ms: f64) -> u8 {
-    ((us / 1000.0 / total_ms.max(1.0) * 100.0) as u8).min(99)
+/// Everything one render needs.
+pub struct Job<'a> {
+    pub source: &'a Path,
+    pub probe: &'a Probe,
+    pub fps: (u32, u32),
+    pub spans: &'a [Span],
+    /// One camera pose per output frame (source px).
+    pub poses: &'a [Pose],
+    /// Per-frame white flash 0..1 (merge joins); empty = none.
+    pub flash: &'a [f32],
+    /// Captions to burn (output clock), if any.
+    pub ass: Option<&'a Path>,
+    pub out: &'a Path,
+    pub gpu: bool,
+    pub threads: usize,
+    pub label: &'a str,
 }
 
-/// Parse ffmpeg's stderr `time=HH:MM:SS.cs` status stamp into seconds.
-/// `time=N/A` (head/tail of the run) and garbage parse to None.
-fn parse_status_time(chunk: &str) -> Option<f64> {
-    let i = chunk.find("time=")?;
-    let t: String = chunk[i + 5..]
-        .chars()
-        .take_while(|c| *c == ':' || *c == '.' || c.is_ascii_digit())
-        .collect();
-    let mut it = t.split(':');
-    let h: f64 = it.next()?.parse().ok()?;
-    let m: f64 = it.next()?.parse().ok()?;
-    let s: f64 = it.next()?.parse().ok()?;
-    if it.next().is_some() {
-        return None;
-    }
-    Some(h * 3600.0 + m * 60.0 + s)
-}
-
-#[cfg(test)]
-mod progress_tests {
-    use super::{out_time_pct, parse_status_time};
-
-    #[test]
-    fn status_time_parses() {
-        let t = parse_status_time("frame=  42 fps=30 time=00:00:08.42 bitrate=100k").unwrap();
-        assert!((t - 8.42).abs() < 1e-9, "got {t}");
-        assert!(parse_status_time("frame=1 time=N/A bitrate=N/A").is_none());
-        assert!(parse_status_time("nothing here").is_none());
-        assert!(parse_status_time("time=-00:00:01.20 hmm").is_none());
-    }
-
-    #[test]
-    fn out_time_microseconds_map_against_total() {
-        // 30s encode: the stamp reads ~29_960_000 (µs, not ms).
-        assert_eq!(out_time_pct(29_960_000.0, 30_000.0), 99);
-        assert_eq!(out_time_pct(15_000_000.0, 30_000.0), 50);
-        assert_eq!(out_time_pct(0.0, 30_000.0), 0);
-        // Wild values clamp instead of wrapping the u8 cast.
-        assert_eq!(out_time_pct(999_999_999.0, 30_000.0), 99);
+impl Job<'_> {
+    pub fn total_frames(&self) -> usize {
+        self.spans.iter().map(|s| s.frames).sum()
     }
 }
 
-/// Render a full timeline (one clip or the whole video).
-///
-/// `words` cover the whole output range; `chunks` use absolute source
-/// times. `style` is the caption preset. `progress`/`cancel` are serve
-/// hooks (`None`/never on the CLI): progress reports 0-100 of the encode.
-#[allow(clippy::too_many_arguments)]
-pub fn render_timeline(
-    source: &Path,
-    words: &[Word],
-    style: &str,
-    chunks: &[Chunk],
-    src_w: u32,
-    src_h: u32,
-    gpu: bool,
-    out_mp4: &Path,
-    threads: usize,
-    label: &str,
-    // White edge dips (fade-in at head, fade-out at tail): used for merge
-    // flash joins, where each segment carries its own half of the dip.
-    // Edge-anchored fades are exact; mid-stream `fade=t=in` would hold the
-    // fade color over everything before it (all-white output — seen live).
-    flash: Option<(bool, bool)>,
-    progress: Option<crate::progress::SharedPct>,
-    cancel: &crate::progress::CancelFlag,
+/// Render a job. Returns the encoder used. NVENC failures (session limits
+/// on consumer cards, driver hiccups) retry once on libx264.
+pub fn render(
+    job: &Job,
+    progress: Option<SharedPct>,
+    cancel: &CancelFlag,
 ) -> anyhow::Result<String> {
-    // Segments of pure pause carry no words — still legal (empty sidecars
-    // below); only the chunk list is required.
-    let chunks: Vec<Chunk> = chunks.iter().filter(|c| c.t1 > c.t0).cloned().collect();
-    if chunks.is_empty() {
-        anyhow::bail!("No timeline chunks to render.");
+    if job.total_frames() == 0 {
+        anyhow::bail!("nothing to render ({})", job.label);
     }
-    if let Some(p) = out_mp4.parent() {
+    if let Some(p) = job.out.parent() {
         std::fs::create_dir_all(p)?;
     }
-    let dir = out_mp4.parent().unwrap().to_path_buf();
     let ffmpeg = crate::binaries::require("ffmpeg")?;
-    let encoder = pick_encoder(gpu);
-    let (sw, sh) = (src_w as f64, src_h as f64);
-    // Sidecars are named after this output (`clip-03-9x16.ass`,
-    // `seg002.ass`, …) so renders running side by side in one job dir never
-    // overwrite each other's captions or camera path. The full render keeps
-    // its public `full.ass/srt` names.
-    let stem = if label == "full" {
-        "full".to_string()
+    let audio = AudioPlan::new(job.spans, job.fps, job.probe.has_audio);
+    let gain = if audio.inputs.is_empty() {
+        Loudness::Silent
     } else {
-        out_mp4
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "clip".into())
-    };
-
-    // Whole-output SRT sidecar (absolute times, as before).
-    let srt_path = dir.join(format!("{stem}.srt"));
-    std::fs::write(&srt_path, crate::captions::srt::from_words(words))?;
-
-    // ONE continuous pass for the whole timeline (no chunk files, no joins,
-    // no dissolves): the camera path carries every framing change as a
-    // bezier dolly, and audio is a single contiguous slice — A/V drift is
-    // structurally impossible.
-    let a0 = chunks[0].t0;
-    let b1 = chunks.iter().map(|c| c.t1).fold(a0, f64::max);
-    let total = (b1 - a0).max(1.0);
-    let slice = words_in(words, a0, b1);
-    let ass_path = dir.join(format!("{stem}.ass"));
-    std::fs::write(&ass_path, crate::captions::ass::build(&slice, style, a0))?;
-
-    let raw_all = assemble(&chunks, sw, sh);
-    let mut poses = if raw_all.is_empty() {
-        vec![base_pose(sw, sh)]
-    } else {
-        crate::track::smooth_path(&raw_all, sw, sh)
-    };
-    if poses.len() > 12000 {
-        poses = poses.into_iter().step_by(2).collect();
-    }
-    let (init, commands) = dolly_commands(&poses, sw, sh, a0);
-    let cmd_path = dir.join(format!("{stem}.dolly.cmd"));
-    let vf = if commands.is_empty() {
-        vf_dolly(&ass_path, None, &init)
-    } else {
-        std::fs::write(&cmd_path, &commands)?;
-        vf_dolly(&ass_path, Some(&cmd_path), &init)
-    };
-    // Optional white edge dips (merge flash joins), appended after the
-    // caption burn so the whole frame dips.
-    let vf = match flash {
-        Some((fi, fo)) => {
-            let d = 0.15f64.min((total / 2.0 - 0.02).max(0.0));
-            let mut parts = vec![vf];
-            if d > 0.01 {
-                if fi {
-                    parts.push(format!("fade=t=in:st=0:d={d:.2}:color=white"));
-                }
-                if fo {
-                    parts.push(format!(
-                        "fade=t=out:st={:.2}:d={d:.2}:color=white",
-                        total - d
-                    ));
-                }
+        match measure_loudness(&ffmpeg, job.source, &audio, cancel) {
+            Ok(l) => l,
+            Err(e) => {
+                cancel.check()?;
+                tracing::warn!("loudness measure failed ({e}): single-pass loudnorm");
+                Loudness::Dynamic
             }
-            parts.join(",")
         }
-        None => vf,
     };
-    let mut args: Vec<String> = vec![
-        ffmpeg.display().to_string(),
-        "-y".into(),
-        "-threads".into(),
-        threads.to_string(),
-        "-ss".into(),
-        a0.to_string(),
-        "-t".into(),
-        total.to_string(),
-        "-i".into(),
-        source.display().to_string(),
-        "-vf".into(),
-        vf,
-    ];
-    args.extend(audio_args());
-    args.extend(video_codec_args(&encoder));
-    args.push(out_mp4.display().to_string());
-    let rendered = run_ffmpeg_progress(
-        &args,
-        &format!("render {label} ({total:.0}s, {encoder})"),
-        total,
-        progress,
+    let encoder = pick_encoder(job.gpu);
+    match run(
+        job,
+        &ffmpeg,
+        &audio,
+        &gain,
+        &encoder,
+        progress.clone(),
         cancel,
+    ) {
+        Ok(()) => Ok(encoder),
+        Err(e) if encoder != "libx264" && !cancel.is_cancelled() => {
+            tracing::warn!("{encoder} render failed ({e:#}): retrying on libx264");
+            let _ = std::fs::remove_file(job.out);
+            run(job, &ffmpeg, &audio, &gain, "libx264", progress, cancel)?;
+            Ok("libx264".into())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(job.out);
+            Err(e)
+        }
+    }
+}
+
+/// Decoded-frame geometry and the decoder's filter chain.
+struct DecodeGeom {
+    w: u32,
+    h: u32,
+    sx: f64,
+    sy: f64,
+    vf: String,
+}
+
+/// Decode at source size (capped at 2160 on the short side — 8K sources
+/// would only burn bandwidth), as limited-range BT.709 4:2:0 on a CFR grid.
+fn decode_geom(probe: &Probe, fps: (u32, u32)) -> DecodeGeom {
+    let sw = probe.width.unwrap_or(1280).max(2);
+    let sh = probe.height.unwrap_or(720).max(2);
+    let s = (2160.0 / sw.min(sh) as f64).min(1.0);
+    let even = |v: f64| (((v / 2.0).round() as u32) * 2).max(2);
+    let (w, h) = (even(sw as f64 * s), even(sh as f64 * s));
+    let mut vf = format!(
+        "fps={}/{},scale={w}:{h}:flags=bicubic:out_range=tv,format=yuv420p",
+        fps.0, fps.1
     );
-    // The camera schedule is only ffmpeg's input — never an artifact.
-    let _ = std::fs::remove_file(&cmd_path);
-    rendered?;
-    if !out_mp4.is_file() {
+    if probe.is_bt601() {
+        // Composited in YUV and tagged BT.709: SD matrices must convert or
+        // skin tones shift.
+        vf.push_str(",colorspace=all=bt709:iall=bt601-6-625:fast=1:format=yuv420p");
+    }
+    DecodeGeom {
+        w,
+        h,
+        sx: w as f64 / sw as f64,
+        sy: h as f64 / sh as f64,
+        vf,
+    }
+}
+
+/// Audio of the whole job on a sample-count clock.
+struct AudioPlan {
+    /// One source input per stretch of nearby spans (empty: no audio).
+    inputs: Vec<AudioInput>,
+    /// Spans in output order.
+    n_spans: usize,
+    total_samples: u64,
+}
+
+/// One `-ss/-t -i source` input and the spans cut from it.
+struct AudioInput {
+    ss: f64,
+    dur: f64,
+    /// `(span index, start sample in this input, samples, fade-in, fade-out)`.
+    cuts: Vec<(usize, u64, u64, u64, u64)>,
+}
+
+const SR: f64 = 48000.0;
+/// Fade at jump-cut joins (s): long enough to kill the click, short enough
+/// that no gap is heard.
+const JOIN_FADE: f64 = 0.008;
+/// Fade at merge-part joins (s).
+const PART_FADE: f64 = 0.03;
+/// Clip head fade-in (s).
+const HEAD_FADE: f64 = 0.015;
+/// Clip tail fade-out (s): the room tone lands instead of stopping dead.
+const TAIL_FADE: f64 = 0.12;
+
+impl AudioPlan {
+    fn new(spans: &[Span], fps: (u32, u32), has_audio: bool) -> Self {
+        let r = rate(fps);
+        // Output sample boundaries from cumulative frames (exact).
+        let mut bounds = vec![0u64];
+        let mut frames = 0usize;
+        for s in spans {
+            frames += s.frames;
+            bounds.push((frames as f64 * SR / r).round() as u64);
+        }
+        let total_samples = *bounds.last().unwrap_or(&0);
+        if !has_audio || spans.is_empty() {
+            return Self {
+                inputs: vec![],
+                n_spans: spans.len(),
+                total_samples,
+            };
+        }
+        // Spans that sit close together in the source share one input
+        // (one seek + decode per stretch, not per keep).
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (i, s) in spans.iter().enumerate() {
+            let fits = groups.last().is_some_and(|g| {
+                let first = &spans[g[0]];
+                let last = &spans[*g.last().unwrap()];
+                let last_end = last.a + last.secs(fps);
+                s.a >= last_end - 1e-3
+                    && s.a - last_end < 20.0
+                    && s.a + s.secs(fps) - first.a < 600.0
+            });
+            if fits {
+                groups.last_mut().unwrap().push(i);
+            } else {
+                groups.push(vec![i]);
+            }
+        }
+        let fade = |a: f64, n: u64| ((a * SR) as u64).min(n / 3);
+        let inputs = groups
+            .iter()
+            .map(|g| {
+                let first = &spans[g[0]];
+                let last = &spans[*g.last().unwrap()];
+                let ss = (first.a - 0.2).max(0.0);
+                let dur = last.a + last.secs(fps) - ss + 0.5;
+                let cuts = g
+                    .iter()
+                    .map(|&j| {
+                        let s = &spans[j];
+                        let n = bounds[j + 1] - bounds[j];
+                        let s0 = ((s.a - ss) * SR).round().max(0.0) as u64;
+                        let fin = if j == 0 {
+                            HEAD_FADE
+                        } else if spans[j - 1].part != s.part {
+                            PART_FADE
+                        } else {
+                            JOIN_FADE
+                        };
+                        let fout = if j + 1 == spans.len() {
+                            TAIL_FADE
+                        } else if spans[j + 1].part != s.part {
+                            PART_FADE
+                        } else {
+                            JOIN_FADE
+                        };
+                        (j, s0, n, fade(fin, n), fade(fout, n))
+                    })
+                    .collect();
+                AudioInput { ss, dur, cuts }
+            })
+            .collect();
+        Self {
+            inputs,
+            n_spans: spans.len(),
+            total_samples,
+        }
+    }
+
+    /// `-ss/-t/-i` args for every audio input.
+    fn input_args(&self, source: &Path) -> Vec<String> {
+        let mut v = Vec::new();
+        for i in &self.inputs {
+            v.extend([
+                "-ss".to_string(),
+                format!("{:.6}", i.ss),
+                "-t".into(),
+                format!("{:.6}", i.dur),
+                "-i".into(),
+                source.display().to_string(),
+            ]);
+        }
+        v
+    }
+
+    /// Filter chains from the audio inputs (numbered from `first`) to
+    /// `[cat]`: sample-count clock, exact per-span trims (padded if the
+    /// source runs short, so later spans never shift), short fades at every
+    /// join, then one concat.
+    fn graph(&self, first: usize) -> String {
+        if self.inputs.is_empty() {
+            return format!(
+                "anullsrc=r=48000:cl=stereo,atrim=end_sample={}[cat]",
+                self.total_samples
+            );
+        }
+        let mut g = String::new();
+        for (ii, inp) in self.inputs.iter().enumerate() {
+            g.push_str(&format!(
+                "[{}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=N/SR/TB,asplit={}",
+                first + ii,
+                inp.cuts.len()
+            ));
+            for c in &inp.cuts {
+                g.push_str(&format!("[g{}]", c.0));
+            }
+            g.push(';');
+            for &(j, s0, n, fi, fo) in &inp.cuts {
+                g.push_str(&format!(
+                    "[g{j}]atrim=start_sample={s0}:end_sample={},asetpts=PTS-STARTPTS,apad=whole_len={n},atrim=end_sample={n},afade=t=in:ss=0:ns={fi},afade=t=out:ss={}:ns={fo}[s{j}];",
+                    s0 + n,
+                    n - fo
+                ));
+            }
+        }
+        for j in 0..self.n_spans {
+            g.push_str(&format!("[s{j}]"));
+        }
+        g.push_str(&format!("concat=n={}:v=0:a=1[cat]", self.n_spans));
+        g
+    }
+
+    /// Final chain `[cat]` → `[a]`: gain, 48 kHz, exact total length.
+    fn finish(&self, loud: &Loudness) -> String {
+        format!(
+            "[cat]{}aresample=48000,apad=whole_len={n},atrim=end_sample={n}[a]",
+            loud.chain(),
+            n = self.total_samples
+        )
+    }
+}
+
+/// Gain decision from the measuring pass.
+#[derive(Debug, Clone)]
+enum Loudness {
+    /// Linear gain (dB) + limiter.
+    Linear(f64),
+    /// Measurement failed: classic single-pass loudnorm.
+    Dynamic,
+    /// No audio stream.
+    Silent,
+}
+
+const TARGET_LUFS: f64 = -14.0;
+/// Limiter ceiling (linear, ≈ -2 dBFS: headroom for AAC inter-sample peaks).
+const LIMIT: f64 = 0.794;
+
+impl Loudness {
+    fn chain(&self) -> String {
+        match self {
+            Loudness::Linear(g) => {
+                format!("volume={g:.2}dB,alimiter=limit={LIMIT}:attack=5:release=60:level=0,")
+            }
+            Loudness::Dynamic => "loudnorm=I=-14:TP=-1.5:LRA=11,".into(),
+            Loudness::Silent => String::new(),
+        }
+    }
+}
+
+/// Pass 1: integrated loudness of the assembled audio (exactly what the
+/// render will play, joins and fades included).
+fn measure_loudness(
+    ffmpeg: &Path,
+    source: &Path,
+    audio: &AudioPlan,
+    cancel: &CancelFlag,
+) -> anyhow::Result<Loudness> {
+    let child = crate::process::command(ffmpeg)
+        .args(["-nostdin", "-hide_banner", "-nostats"])
+        .args(audio.input_args(source))
+        .arg("-filter_complex")
+        .arg(format!(
+            "{};[cat]loudnorm=I={TARGET_LUFS}:TP=-1.5:LRA=11:print_format=json[m]",
+            audio.graph(0)
+        ))
+        .args(["-map", "[m]", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (status, err) = wait_cancellable(child, cancel)?;
+    if !status.success() {
+        anyhow::bail!("measure pass failed: {}", tail(&err, 400));
+    }
+    let (Some(a), Some(b)) = (err.rfind('{'), err.rfind('}')) else {
+        anyhow::bail!("no loudnorm report");
+    };
+    let v: serde_json::Value = serde_json::from_str(&err[a..=b])?;
+    let input_i: f64 = v
+        .get("input_i")
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("no input_i"))?;
+    if !input_i.is_finite() || input_i < -70.0 {
+        return Ok(Loudness::Linear(0.0)); // silence: leave it alone
+    }
+    let gain = (TARGET_LUFS - input_i).clamp(-20.0, 24.0);
+    tracing::info!("loudness {input_i:.1} LUFS -> gain {gain:+.1} dB");
+    Ok(Loudness::Linear(gain))
+}
+
+/// The render pass proper: decoder thread → compositor (this thread) →
+/// writer thread → encoder, on bounded queues.
+fn run(
+    job: &Job,
+    ffmpeg: &Path,
+    audio: &AudioPlan,
+    loud: &Loudness,
+    encoder: &str,
+    progress: Option<SharedPct>,
+    cancel: &CancelFlag,
+) -> anyhow::Result<()> {
+    let t_start = std::time::Instant::now();
+    let total = job.total_frames();
+    let dg = decode_geom(job.probe, job.fps);
+    let src_g = Geom { w: dg.w, h: dg.h };
+    let out_g = Geom { w: OUT_W, h: OUT_H };
+
+    // --- encoder ---------------------------------------------------------
+    let mut vchain = String::from(
+        "[0:v]setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
+    );
+    if let Some(ass) = job.ass {
+        vchain.push_str(&format!(
+            ",ass={}:fontsdir={}",
+            filter_escape(ass),
+            filter_escape(&fonts_dir())
+        ));
+    }
+    vchain.push_str("[v]");
+    let graph = format!("{vchain};{};{}", audio.graph(1), audio.finish(loud));
+    let mut enc_cmd = crate::process::command(ffmpeg);
+    enc_cmd
+        .args(["-hide_banner", "-v", "error", "-y"])
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg("-s")
+        .arg(format!("{OUT_W}x{OUT_H}"))
+        .arg("-framerate")
+        .arg(format!("{}/{}", job.fps.0, job.fps.1))
+        .args(["-i", "pipe:0"])
+        .args(audio.input_args(job.source))
+        .arg("-filter_complex")
+        .arg(&graph)
+        .args(["-map", "[v]", "-map", "[a]"])
+        .args(video_codec_args(encoder, job.threads, job.fps))
+        .args(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"])
+        .args(["-movflags", "+faststart"])
+        .arg(job.out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    tracing::info!(
+        "render {} ({:.1}s, {total} frames @ {}/{}, {encoder})",
+        job.label,
+        total as f64 / rate(job.fps),
+        job.fps.0,
+        job.fps.1
+    );
+    let mut enc = enc_cmd.spawn()?;
+    let enc_err = enc.stderr.take().map(drain);
+    let enc_in = enc
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("encoder stdin missing"))?;
+
+    // --- writer thread -----------------------------------------------------
+    let (wtx, wrx) = mpsc::sync_channel::<Vec<u8>>(3);
+    let (opool_tx, opool_rx) = mpsc::channel::<Vec<u8>>();
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        let mut enc_in = enc_in;
+        for buf in wrx {
+            enc_in.write_all(&buf)?;
+            let _ = opool_tx.send(buf);
+        }
+        enc_in.flush()?;
+        Ok(()) // dropping stdin = EOF for the encoder
+    });
+
+    // --- decoder thread ------------------------------------------------------
+    let (dtx, drx) = mpsc::sync_channel::<anyhow::Result<Vec<u8>>>(3);
+    let (ipool_tx, ipool_rx) = mpsc::channel::<Vec<u8>>();
+    let dec_spans: Vec<Span> = job.spans.to_vec();
+    let (dec_ff, dec_src) = (ffmpeg.to_path_buf(), job.source.to_path_buf());
+    let dec_vf = dg.vf.clone();
+    let dec_threads = (job.threads / 2).clamp(1, 8);
+    let fps = job.fps;
+    let decoder = std::thread::spawn(move || {
+        decode_spans(
+            &dec_ff,
+            &dec_src,
+            &dec_spans,
+            fps,
+            &dec_vf,
+            src_g,
+            dec_threads,
+            dtx,
+            ipool_rx,
+        )
+    });
+
+    // --- compose loop (this thread) ----------------------------------------
+    let mut comp = Compositor::new(dg.w, dg.h);
+    let base = crate::compose::base_rect(
+        job.probe.width.unwrap_or(dg.w) as f64,
+        job.probe.height.unwrap_or(dg.h) as f64,
+    );
+    let mut failure: Option<anyhow::Error> = None;
+    let mut last_pct = u8::MAX;
+    let mut compose_s = 0.0f64;
+    for i in 0..total {
+        if cancel.is_cancelled() {
+            failure = Some(anyhow::anyhow!("cancelled by user"));
+            break;
+        }
+        let frame = match drx.recv() {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                failure = Some(e);
+                break;
+            }
+            Err(_) => {
+                failure = Some(anyhow::anyhow!("decoder stopped at frame {i}/{total}"));
+                break;
+            }
+        };
+        let rect = job
+            .poses
+            .get(i)
+            .or(job.poses.last())
+            .map(|p| p.rect)
+            .unwrap_or(base);
+        let rect = Rect {
+            x: rect.x * dg.sx,
+            y: rect.y * dg.sy,
+            w: rect.w * dg.sx,
+            h: rect.h * dg.sy,
+        };
+        let flash = job.flash.get(i).copied().unwrap_or(0.0);
+        let t0 = std::time::Instant::now();
+        let composed = match comp.compose(&frame, rect, flash) {
+            Ok(c) => c,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        };
+        let mut ob = opool_rx
+            .try_recv()
+            .unwrap_or_else(|_| vec![0u8; out_g.frame_len()]);
+        ob.copy_from_slice(composed);
+        compose_s += t0.elapsed().as_secs_f64();
+        let _ = ipool_tx.send(frame);
+        if wtx.send(ob).is_err() {
+            failure = Some(anyhow::anyhow!("encoder stopped accepting frames"));
+            break;
+        }
+        if let Some(p) = progress.as_deref() {
+            let pct = ((i + 1) * 100 / total).min(99) as u8;
+            if pct != last_pct {
+                last_pct = pct;
+                p(pct);
+            }
+        }
+    }
+    // Unblock and settle every stage.
+    drop(drx);
+    drop(ipool_tx);
+    drop(wtx);
+    if failure.is_some() {
+        let _ = enc.kill();
+    }
+    let dec_res = decoder.join();
+    let wr_res = writer.join();
+    let status = enc.wait()?;
+    let enc_tail = enc_err
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    if let Some(e) = failure {
         if cancel.is_cancelled() {
             anyhow::bail!("cancelled by user");
         }
-        anyhow::bail!("ffmpeg produced no file.");
+        if !status.success() && !enc_tail.trim().is_empty() {
+            anyhow::bail!("{e:#}; encoder: {}", tail(&enc_tail, 600));
+        }
+        return Err(e);
     }
-    Ok(encoder)
-}
-
-/// Render one clip candidate to a captioned 9:16 MP4.
-pub fn render_clip(
-    source: &Path,
-    clip: &Clip,
-    words: &[Word],
-    chunks: &[Chunk],
-    src_w: u32,
-    src_h: u32,
-    gpu: bool,
-    out_mp4: &Path,
-    threads: usize,
-    progress: Option<crate::progress::SharedPct>,
-    cancel: &crate::progress::CancelFlag,
-) -> anyhow::Result<String> {
-    let slice: Vec<Word> = words_in(words, clip.start_s, clip.end_s);
-    if slice.is_empty() {
-        anyhow::bail!("No transcript words inside clip range.");
+    match dec_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!("decoder thread panicked"),
     }
-    render_timeline(
-        source,
-        &slice,
-        &clip.caption_style,
-        chunks,
-        src_w,
-        src_h,
-        gpu,
-        out_mp4,
-        threads,
-        "clip",
-        None,
-        progress,
-        cancel,
-    )
-}
-
-/// Render the FULL video with subtitles burned in.
-/// Same filter chain, no cuts, dialogue stamps unshifted.
-pub fn render_full(
-    source: &Path,
-    words: &[Word],
-    style: &str,
-    chunks: &[Chunk],
-    src_w: u32,
-    src_h: u32,
-    gpu: bool,
-    out_mp4: &Path,
-    threads: usize,
-    progress: Option<crate::progress::SharedPct>,
-    cancel: &crate::progress::CancelFlag,
-) -> anyhow::Result<String> {
-    render_timeline(
-        source, words, style, chunks, src_w, src_h, gpu, out_mp4, threads, "full", None, progress,
-        cancel,
-    )
-}
-
-#[cfg(test)]
-mod escape_tests {
-    use super::filter_escape;
-    use std::path::Path;
-
-    #[test]
-    fn drive_colons_and_commas_are_escaped() {
-        assert_eq!(
-            filter_escape(Path::new("C:/Users/me/a,b.ass")),
-            r"'C\:/Users/me/a\,b.ass'"
+    if let Ok(Err(e)) = wr_res {
+        anyhow::bail!(
+            "writing frames failed ({e}); encoder: {}",
+            tail(&enc_tail, 600)
         );
     }
-
-    #[test]
-    fn quotes_close_and_reopen_the_graph_quote() {
-        // Graph level: 'C\:/Users/O\' + \' + 'Brien/x.ass' → option level
-        // sees C\:/Users/O\'Brien/x.ass → C:/Users/O'Brien/x.ass.
-        assert_eq!(
-            filter_escape(Path::new("C:/Users/O'Brien/x.ass")),
-            r"'C\:/Users/O\'\''Brien/x.ass'"
-        );
+    if !status.success() {
+        anyhow::bail!("encoder failed (exit {status}): {}", tail(&enc_tail, 600));
     }
+    if !job.out.is_file() {
+        anyhow::bail!("encoder produced no file");
+    }
+    if let Some(p) = progress.as_deref() {
+        p(100);
+    }
+    let took = t_start.elapsed().as_secs_f64();
+    tracing::info!(
+        "render {} done: {:.1} fps ({:.1}s; compose {:.1} ms/frame)",
+        job.label,
+        total as f64 / took.max(1e-6),
+        took,
+        compose_s * 1000.0 / total.max(1) as f64
+    );
+    Ok(())
+}
+
+/// Decoder stage: one ffmpeg per span, frames streamed in output order.
+/// A span that decodes short (source ends early, damaged tail) is padded
+/// with its last frame so the frame count — and with it A/V sync — holds.
+#[allow(clippy::too_many_arguments)]
+fn decode_spans(
+    ffmpeg: &Path,
+    source: &Path,
+    spans: &[Span],
+    fps: (u32, u32),
+    vf: &str,
+    g: Geom,
+    threads: usize,
+    tx: mpsc::SyncSender<anyhow::Result<Vec<u8>>>,
+    pool: mpsc::Receiver<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let flen = g.frame_len();
+    let r = rate(fps);
+    let fresh =
+        |pool: &mpsc::Receiver<Vec<u8>>| pool.try_recv().unwrap_or_else(|_| vec![0u8; flen]);
+    for s in spans {
+        // Seek a quarter frame early: the span's first frame sits exactly
+        // on the grid and must not be dropped by float rounding.
+        let ss = (s.a - 0.25 / r).max(0.0);
+        let mut child = crate::process::command(ffmpeg)
+            .args(["-nostdin", "-hide_banner", "-v", "error"])
+            .arg("-threads")
+            .arg(threads.to_string())
+            .arg("-ss")
+            .arg(format!("{ss:.6}"))
+            .arg("-i")
+            .arg(source)
+            .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf])
+            .arg("-frames:v")
+            .arg(s.frames.to_string())
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let err = child.stderr.take().map(drain);
+        let mut out = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("decoder stdout missing"))?;
+        // Hold one frame back so a short read can repeat it.
+        let mut held: Option<Vec<u8>> = None;
+        let mut sent = 0usize;
+        let mut decoded = 0usize;
+        while decoded < s.frames {
+            let mut buf = fresh(&pool);
+            if read_full(&mut out, &mut buf)? < flen {
+                drop(buf);
+                break;
+            }
+            decoded += 1;
+            if let Some(h) = held.replace(buf) {
+                if tx.send(Ok(h)).is_err() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(()); // consumer stopped (cancel/failure)
+                }
+                sent += 1;
+            }
+        }
+        drop(out);
+        let status = child.wait()?;
+        let err = err
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        let last = match held {
+            Some(h) => h,
+            None => {
+                if !status.success() {
+                    let e = anyhow::anyhow!("decode at {:.2}s failed: {}", s.a, tail(&err, 400));
+                    let _ = tx.send(Err(anyhow::anyhow!("{e}")));
+                    return Err(e);
+                }
+                // Nothing decodable here: black.
+                let mut b = fresh(&pool);
+                b[..g.luma_len()].fill(16);
+                b[g.luma_len()..].fill(128);
+                b
+            }
+        };
+        if decoded < s.frames {
+            tracing::warn!(
+                "span at {:.2}s decoded {decoded}/{} frames: holding the last one",
+                s.a,
+                s.frames
+            );
+        }
+        while sent + 1 < s.frames {
+            let mut b = fresh(&pool);
+            b.copy_from_slice(&last);
+            if tx.send(Ok(b)).is_err() {
+                return Ok(());
+            }
+            sent += 1;
+        }
+        if tx.send(Ok(last)).is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Read until `buf` is full or EOF; returns bytes read.
+fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(got)
+}
+fn tail(s: &str, n: usize) -> String {
+    let t: Vec<char> = s.chars().rev().take(n).collect();
+    t.into_iter().rev().collect()
+}
+
+/// Wait for a child (cancel kills it), collecting stderr.
+fn wait_cancellable(
+    mut child: Child,
+    cancel: &CancelFlag,
+) -> anyhow::Result<(std::process::ExitStatus, String)> {
+    let err = child.stderr.take().map(drain);
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("cancelled by user");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let err = err
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    Ok((status, err))
+}
+
+/// Drain a pipe on a thread, keeping the last 16 KiB (a chatty ffmpeg must
+/// never block on a full stderr pipe — Windows pipes hold only 64 KiB).
+fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut keep: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    keep.extend_from_slice(&buf[..n]);
+                    let excess = keep.len().saturating_sub(16384);
+                    if excess > 0 {
+                        keep.drain(..excess);
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&keep).into_owned()
+    })
 }

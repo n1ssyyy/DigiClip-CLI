@@ -324,28 +324,6 @@ fn yunet_decode_matches_opencv_math() {
 }
 
 #[test]
-fn crop_schedule_shifts_and_formats() {
-    use digiclip_rs::framing::{CropPlan, TrackPoint};
-    use digiclip_rs::track::crop_commands;
-    let plan = CropPlan {
-        tracks: vec![
-            TrackPoint { t: 300.0, x: 100.0 },
-            TrackPoint { t: 300.5, x: 200.0 },
-            TrackPoint { t: 301.0, x: 300.0 },
-        ],
-    };
-    // Clip starting at 300s: times shift back, pre-clip points pin to 0.
-    let (initial, cmds) = crop_commands(&plan, 640.0, 300.0);
-    assert_eq!(initial, 100.0);
-    assert!(cmds.contains("0.000 crop x 100.0;"), "{cmds}");
-    assert!(cmds.contains("0.500 crop x 200.0;"), "{cmds}");
-    assert!(cmds.contains("1.000 crop x 300.0;"), "{cmds}");
-    // Clamping.
-    let (_, cmds2) = crop_commands(&plan, 150.0, 0.0);
-    assert!(cmds2.contains("x 150.0;"), "{cmds2}");
-}
-
-#[test]
 fn yunet_anchor_count_matches_model() {
     // Self-check of the grid math against the real model file when
     // present (vendored under models/ for hermetic tests). The total

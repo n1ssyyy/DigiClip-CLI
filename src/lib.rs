@@ -1,6 +1,9 @@
+pub mod audio;
 pub mod binaries;
+pub mod camera;
 pub mod captions;
 pub mod cli;
+pub mod compose;
 pub mod ffmpeg;
 pub mod framing;
 pub mod gpu;

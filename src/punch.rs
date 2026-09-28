@@ -1,43 +1,21 @@
 //! Emphasis punch-ins: loud words get a brief directed zoom.
 //!
-//! The pipeline scans clip audio once (ebur128 momentary loudness), maps
-//! peaks to words, and hands source-clock punch windows to `plan_tracks`,
-//! which eases them into the raw targets as zoom bumps — the whole
-//! existing path (glides, dolly, captions) rides along unchanged.
+//! The loudness series comes from the audio envelope the pipeline already
+//! built ([`crate::audio::Envelope::loudness`], 400 ms windows stamped at
+//! their center), peaks map to words, and the windows go to
+//! [`crate::camera::apply_punches`], which zooms around the speaker's face
+//! only while the camera is otherwise still.
 
 use crate::timeline::{tight, Keep};
 use crate::whisper::Word;
 
-/// Depth of the punch (window scale 1-depth at the peak): ~1.2x zoom.
-pub const PUNCH_DEPTH: f64 = 0.18;
-
-/// Parse ebur128 stderr lines into (t seconds, momentary LUFS).
-/// Expected form: `... t: 0.499938 ... M: -17.2 ...`.
-pub fn parse_ebur128(stderr: &str) -> Vec<(f64, f64)> {
-    let mut out = Vec::new();
-    for line in stderr.lines() {
-        let Some(ti) = line.find("t:") else { continue };
-        let Some(mi) = line.find("M:") else { continue };
-        let t: Option<f64> = line[ti + 2..]
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse().ok());
-        let m: Option<f64> = line[mi + 2..]
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse().ok());
-        if let (Some(t), Some(m)) = (t, m) {
-            if m.is_finite() && t.is_finite() {
-                out.push((t, m));
-            }
-        }
-    }
-    out
-}
+/// Minimum spacing between emphasis punches (s).
+pub const SPACING_S: f64 = 4.0;
 
 /// Pick emphasis peaks: 0.5s-smoothed local maxima (±0.3s) standing `db`
-/// above their ±1.5s median, greedy by height with 3s spacing.
-/// Returns (t, height) in time order.
+/// above their ±1.5s median, greedy by height with [`SPACING_S`] spacing
+/// (punches closer than that stop reading as emphasis and start reading
+/// as a nervous camera). Returns (t, height) in time order.
 pub fn peaks(m: &[(f64, f64)], db: f64) -> Vec<(f64, f64)> {
     if m.len() < 10 {
         return vec![];
@@ -75,7 +53,7 @@ pub fn peaks(m: &[(f64, f64)], db: f64) -> Vec<(f64, f64)> {
     cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let mut taken: Vec<(f64, f64)> = Vec::new();
     for c in cand {
-        if taken.iter().all(|t| (t.0 - c.0).abs() >= 3.0) {
+        if taken.iter().all(|t| (t.0 - c.0).abs() >= SPACING_S) {
             taken.push(c);
         }
     }
@@ -126,65 +104,6 @@ pub fn windows(
     out.into_iter().map(|(s, e, _)| (s, e)).collect()
 }
 
-/// Scan [a, b) of source audio, returning source-clock (t, momentary LUFS).
-/// One fast slice extract + one metering pass; any failure errors (caller
-/// treats punch as best-effort and continues without it).
-pub fn scan(
-    ffmpeg: &std::path::Path,
-    source: &std::path::Path,
-    a: f64,
-    b: f64,
-) -> anyhow::Result<Vec<(f64, f64)>> {
-    let len = (b - a).max(0.5);
-    let wav = std::env::temp_dir().join(format!(
-        "digiclip-punch-{}-{:.0}.wav",
-        std::process::id(),
-        a * 100.0
-    ));
-    let run = |args: &[String]| -> anyhow::Result<std::process::Output> {
-        Ok(crate::process::command(ffmpeg).args(args).output()?)
-    };
-    let s = |v: &dyn ToString| v.to_string();
-    run(&[
-        s(&"-y"),
-        s(&"-hide_banner"),
-        s(&"-loglevel"),
-        s(&"error"),
-        s(&"-ss"),
-        s(&a),
-        s(&"-t"),
-        s(&len),
-        s(&"-i"),
-        s(&source.display()),
-        s(&"-ac"),
-        s(&"1"),
-        s(&"-ar"),
-        s(&"16000"),
-        s(&"-c:a"),
-        s(&"pcm_s16le"),
-        s(&wav.display()),
-    ])?;
-    let metered = run(&[
-        s(&"-hide_banner"),
-        s(&"-i"),
-        s(&wav.display()),
-        s(&"-af"),
-        s(&"ebur128"),
-        s(&"-f"),
-        s(&"null"),
-        s(&"-"),
-    ])?;
-    let _ = std::fs::remove_file(&wav);
-    if !metered.status.success() {
-        anyhow::bail!("ebur128 meter failed");
-    }
-    let mut m = parse_ebur128(&String::from_utf8_lossy(&metered.stderr));
-    for (t, _) in m.iter_mut() {
-        *t += a; // slice offset -> source clock
-    }
-    Ok(m)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,14 +118,6 @@ mod tests {
                 conf: Some(0.9),
             })
             .collect()
-    }
-
-    #[test]
-    fn parses_ebur128_lines() {
-        let err = "[Parsed_ebur128_0 @ x] t: 0.499938  TARGET:-23 LUFS    M: -17.2 S:-120.7     I: -18.5 LUFS       LRA:\nnoise\n[Parsed_ebur128_0 @ x] t: 0.599938  TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS       LRA:";
-        let m = parse_ebur128(err);
-        assert_eq!(m.len(), 2);
-        assert!((m[0].0 - 0.499938).abs() < 1e-9 && (m[0].1 + 17.2).abs() < 1e-9);
     }
 
     #[test]

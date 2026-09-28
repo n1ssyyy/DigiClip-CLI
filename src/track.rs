@@ -1,15 +1,12 @@
 //! Speaker-aware face tracking (YuNet via ONNX Runtime).
 //!
-//! Offline, in-process: frames are piped from the provisioned ffmpeg,
-//! faces detected with YuNet (`yunet_2026may.onnx`, MIT, auto-downloaded
-//! once to the provision dir), the primary speaker tracked across samples,
-//! and the crop path rendered in a single ffmpeg pass via a per-frame
-//! `sendcmd` schedule (30Hz: `sendcmd` steps discretely, so frame-rate
-//! entries are what make the motion read as continuous).
-//!
-//! Camera model: sparse per-sample window targets (float, never rounded)
-//! feed [`smooth_path`]: continuous motion rides Catmull-Rom, speaker
-//! handoffs ride a cubic-bezier ease-in-out glide, dropouts hold position.
+//! Offline, in-process: frames stream from the provisioned ffmpeg (one
+//! frame in memory at a time), faces are detected with YuNet
+//! (`yunet_2026may.onnx`, MIT, auto-downloaded once to the provision dir)
+//! and the primary speaker is tracked across samples. The output is raw
+//! framing *evidence* per sample (float windows, never rounded, never
+//! lag-filtered) plus frame-exact shot cuts; [`crate::camera`] turns it
+//! into the camera path with the whole clip in view.
 //!
 //! Trust model (the camera only moves on evidence): the speaker is whoever's
 //! mouth moves; newcomers must win twice running and respect a 2.5s floor;
@@ -27,7 +24,6 @@
 
 use std::path::Path;
 
-use crate::framing::{CamPose, CropPlan, TrackPoint};
 use crate::whisper::Word;
 
 const STRIDES: [usize; 3] = [8, 16, 32];
@@ -277,12 +273,21 @@ impl Tracker {
     pub fn detect(&mut self, rgb: &[u8], w: usize, h: usize) -> anyhow::Result<Vec<Face>> {
         let (pad_w, pad_h) = padded_dims(w, h);
         // NCHW f32, RGB 0-255 (blobFromImage defaults: scale 1.0, swapRB).
-        let mut input = ndarray::Array4::<f32>::zeros((1, 3, pad_h as usize, pad_w as usize));
-        for y in 0..h {
-            for x in 0..w {
-                let src = (y * w + x) * 3;
-                for ch in 0..3 {
-                    input[[0, ch, y, x]] = rgb[src + ch] as f32;
+        let mut input = ndarray::Array4::<f32>::zeros((1, 3, pad_h, pad_w));
+        {
+            // Planar fill straight into the contiguous buffer (per-element
+            // 4-D indexing was a measurable slice of CPU tracking time).
+            let plane = pad_w * pad_h;
+            let buf = input
+                .as_slice_mut()
+                .ok_or_else(|| anyhow::anyhow!("non-contiguous input tensor"))?;
+            for y in 0..h {
+                let row = &rgb[y * w * 3..(y + 1) * w * 3];
+                let o = y * pad_w;
+                for (x, px) in row.chunks_exact(3).enumerate() {
+                    buf[o + x] = px[0] as f32;
+                    buf[plane + o + x] = px[1] as f32;
+                    buf[2 * plane + o + x] = px[2] as f32;
                 }
             }
         }
@@ -331,10 +336,124 @@ impl Tracker {
     }
 }
 
-/// Sample frames via ffmpeg: `fps` frames/sec, `width` px wide RGB24.
-/// With `seek = Some((start, dur))`, only that span is decoded (returns
-/// absolute timestamps). Used to track picked clip ranges instead of the
-/// whole source.
+/// Streaming frame sampler: ffmpeg decodes `fps` frames/sec as `width` x
+/// `height` RGB24 and this yields them one at a time (absolute timestamps
+/// when `seek = Some((start, dur))`). Memory stays at one frame no matter
+/// how long the span is: collecting a 10-minute range at 15 Hz used to
+/// hold ~3.5 GB of RGB.
+pub struct FrameReader {
+    child: std::process::Child,
+    out: std::process::ChildStdout,
+    frame_len: usize,
+    t0: f64,
+    fps: f64,
+    i: usize,
+    /// Expected frame count (progress denominators).
+    pub expected: usize,
+}
+
+impl FrameReader {
+    pub fn open(
+        ffmpeg: &Path,
+        source: &Path,
+        fps: u32,
+        width: u32,
+        height: u32,
+        seek: Option<(f64, f64)>,
+    ) -> anyhow::Result<Self> {
+        use std::process::Stdio;
+        let frame_len = width as usize * height as usize * 3;
+        if frame_len == 0 || fps == 0 {
+            anyhow::bail!("bad sample dims");
+        }
+        let mut cmd = crate::process::command(ffmpeg);
+        cmd.args(["-nostdin", "-hide_banner", "-v", "error"]);
+        let t0 = seek.map(|(s, _)| s).unwrap_or(0.0);
+        let mut expected = 0;
+        if let Some((s, d)) = seek {
+            let d = d.max(0.5);
+            cmd.arg("-ss")
+                .arg(format!("{s:.6}"))
+                .arg("-t")
+                .arg(format!("{d:.6}"));
+            expected = (d * fps as f64).ceil() as usize;
+        }
+        cmd.arg("-i").arg(source).args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-vf",
+            &format!("fps={fps},scale={width}:{height}:flags=bilinear"),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ]);
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let out = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("sampler stdout missing"))?;
+        Ok(Self {
+            child,
+            out,
+            frame_len,
+            t0,
+            fps: fps as f64,
+            i: 0,
+            expected,
+        })
+    }
+}
+
+impl Iterator for FrameReader {
+    type Item = anyhow::Result<(f64, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::io::Read;
+        let mut buf = vec![0u8; self.frame_len];
+        let mut got = 0;
+        while got < self.frame_len {
+            match self.out.read(&mut buf[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Some(Err(e.into())),
+            }
+        }
+        if got < self.frame_len {
+            // End of stream (a partial tail frame is dropped).
+            return match self.child.wait() {
+                Ok(s) if !s.success() && self.i == 0 => {
+                    Some(Err(anyhow::anyhow!("frame sampling failed ({s})")))
+                }
+                _ => None,
+            };
+        }
+        let t = self.t0 + self.i as f64 / self.fps;
+        self.i += 1;
+        Some(Ok((t, buf)))
+    }
+}
+
+impl Drop for FrameReader {
+    fn drop(&mut self) {
+        // Early exits (cancel, errors) must not leave ffmpeg running.
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+/// Collect sampled frames (small spans, benches and smoke tests; the
+/// tracker itself streams through [`FrameReader`]).
 pub fn sample_frames(
     ffmpeg: &Path,
     source: &Path,
@@ -343,46 +462,134 @@ pub fn sample_frames(
     sample_h: u32,
     seek: Option<(f64, f64)>,
 ) -> anyhow::Result<Vec<(f64, Vec<u8>)>> {
-    use std::process::Stdio;
-    let mut cmd = crate::process::command(ffmpeg);
-    cmd.arg("-hide_banner").arg("-v").arg("error");
-    let t0 = seek.map(|(s, _)| s).unwrap_or(0.0);
-    if let Some((s, d)) = seek {
-        cmd.arg("-ss")
-            .arg(s.to_string())
-            .arg("-t")
-            .arg(d.max(0.5).to_string());
-    }
-    cmd.arg("-i").arg(source.display().to_string());
-    let child = cmd
+    FrameReader::open(ffmpeg, source, fps, width, sample_h, seek)?.collect()
+}
+
+/// Verify and pin a candidate shot cut. The tracker samples at 8–15 Hz, so
+/// a hash jump only says "something changed between two samples" — a cut,
+/// or a whip pan / fast motion across a faceless shot. Decoding the sliver
+/// (plus ~0.25 s of context each side) at 60 Hz in 64x36 gray settles both:
+///
+/// - **Verify.** A cut is a one-frame spike in frame-to-frame change
+///   (the classic shot-boundary test, as in ffmpeg's `scene` score): its
+///   peak must stand well above the surrounding motion level, or the
+///   luma histogram must turn over. Sustained change (a pan) is not a cut.
+/// - **Pin.** The spike's frame lands the cut within ~1/60 s instead of up
+///   to 125 ms late.
+///
+/// Returns `None` when the candidate is motion, `Some(hi)` when the
+/// decode fails (trust the detector).
+pub fn refine_cut(ffmpeg: &Path, source: &Path, lo: f64, hi: f64) -> Option<f64> {
+    const R: f64 = 60.0;
+    const W: usize = 64;
+    const H: usize = 36;
+    const CTX: f64 = 0.25;
+    let start = (lo - CTX).max(0.0);
+    let dur = (hi - start + CTX).max(0.05);
+    let out = crate::process::command(ffmpeg)
+        .args(["-nostdin", "-hide_banner", "-v", "error"])
+        .arg("-ss")
+        .arg(format!("{start:.6}"))
+        .arg("-t")
+        .arg(format!("{dur:.6}"))
+        .arg("-i")
+        .arg(source)
         .args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
             "-vf",
-            &format!("fps={fps},scale={width}:{sample_h}"),
+            &format!("fps={R},scale={W}:{H}:flags=area,format=gray"),
             "-f",
             "rawvideo",
-            "-pix_fmt",
-            "rgb24",
             "pipe:1",
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        anyhow::bail!("frame sampling failed");
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(out) = out else { return Some(hi) };
+    let frames: Vec<&[u8]> = out.stdout.chunks_exact(W * H).collect();
+    if frames.len() < 2 {
+        return Some(hi);
     }
-    let frame_len = width as usize * sample_h as usize * 3;
-    if frame_len == 0 {
-        anyhow::bail!("bad sample dims");
+    let diffs: Vec<f64> = (1..frames.len())
+        .map(|i| mean_abs_diff(frames[i], frames[i - 1]))
+        .collect();
+    classify_cut(
+        &diffs,
+        |i| hist_turnover(frames[i], frames[i + 1]),
+        start,
+        R,
+        lo,
+        hi,
+    )
+}
+
+/// Mean absolute luma difference of two equal-size gray frames.
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+    let s: u64 = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as u64).sum();
+    s as f64 / a.len().max(1) as f64
+}
+
+/// L1 distance of 16-bin luma histograms (0 = same tonal content, 2 =
+/// disjoint). Motion within a shot keeps it low; a new scene turns it over.
+fn hist_turnover(a: &[u8], b: &[u8]) -> f64 {
+    let mut ha = [0f64; 16];
+    let mut hb = [0f64; 16];
+    for &v in a {
+        ha[(v >> 4) as usize] += 1.0;
     }
-    let mut frames = Vec::new();
-    for (i, chunk) in out.stdout.chunks(frame_len).enumerate() {
-        if chunk.len() < frame_len {
-            break;
+    for &v in b {
+        hb[(v >> 4) as usize] += 1.0;
+    }
+    let (na, nb) = (a.len().max(1) as f64, b.len().max(1) as f64);
+    ha.iter()
+        .zip(hb.iter())
+        .map(|(x, y)| (x / na - y / nb).abs())
+        .sum()
+}
+
+/// Cut test over a frame-difference profile (pure, unit-tested).
+/// `diffs[i]` is the change from frame i to i+1 of a decode starting at
+/// `start` at `r` fps; `hist(i)` is the histogram turnover of that pair.
+/// The peak inside [lo, hi] must be a real change (>= 6 levels) AND either
+/// a spike (>= 2.5x the median motion around it, duplicate frames from
+/// the 60 Hz resample ignored) or a histogram turnover (>= 0.6).
+pub fn classify_cut(
+    diffs: &[f64],
+    hist: impl Fn(usize) -> f64,
+    start: f64,
+    r: f64,
+    lo: f64,
+    hi: f64,
+) -> Option<f64> {
+    let t_of = |i: usize| start + (i + 1) as f64 / r;
+    let (mut best, mut bi) = (0.0f64, None);
+    for (i, &d) in diffs.iter().enumerate() {
+        let t = t_of(i);
+        if t >= lo - 0.5 / r && t <= hi + 0.5 / r && d > best {
+            best = d;
+            bi = Some(i);
         }
-        frames.push((t0 + i as f64 / fps as f64, chunk.to_vec()));
     }
-    Ok(frames)
+    let bi = bi?;
+    if best < 6.0 {
+        return None;
+    }
+    let mut around: Vec<f64> = diffs
+        .iter()
+        .enumerate()
+        .filter(|(i, &d)| i.abs_diff(bi) > 1 && d > 0.5)
+        .map(|(_, &d)| d)
+        .collect();
+    around.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let motion = around.get(around.len() / 2).copied().unwrap_or(0.0);
+    let spike = best >= 2.5 * motion;
+    if !(spike || hist(bi) >= 0.6) {
+        return None;
+    }
+    Some(t_of(bi).clamp(lo, hi))
 }
 
 /// A timeline segment: tracked close-up or wide fill.
@@ -402,101 +609,46 @@ pub struct Seg {
 pub struct Tracked {
     pub segments: Vec<Seg>,
     pub ever_seen: bool,
-    /// Raw per-sample targets (render smooths the whole clip once).
+    /// Raw per-sample framing evidence; the camera planner turns it into a
+    /// path (dead zones, holds, eased moves) once the whole clip is known.
     pub raw: Vec<RawTarget>,
+    /// Shot cuts pinned to the frame (source clock, sorted).
+    pub shots: Vec<f64>,
     /// Seconds held in two-shot (both talkers framed).
     pub group_secs: f64,
 }
 
-/// Butter-smooth reframing camera.
-///
-/// The old exponential follower looked choppy for three compounding reasons,
-/// all fixed here:
-/// - `sendcmd` steps the crop window discretely (zero interpolation), so the
-///   schedule must run at ~output frame rate ([`EMIT_HZ`]): 33ms sub-pixel
-///   steps read as continuous motion, 83ms steps read as stepping.
-/// - Rounding happens once, at emit time — never before smoothing (rounding
-///   first bakes quantization judder into the path).
-/// - Continuous motion rides Catmull-Rom through denoised targets, while
-///   discontinuities (speaker handoffs) ride a cubic-bezier ease-in-out
-///   glide ([`GLIDE_S`]): slow attack, fast middle, gentle landing.
-/// - Brief detector dropouts hold the last target instead of drifting home
-///   and gliding back (that drift-then-return was half the visible jerk).
-/// - Zoom (window w/h) is a first-class eased channel, not a chased
-///   side-effect: reframing moves ease *into* faces and regions.
-pub const EMIT_HZ: f64 = 30.0;
-/// Speaker-handoff glide duration (s) — scaled by move distance so big
-/// cross-frame moves get more time (constant peak velocity, like a real
-/// operator): `dur = clamp(0.5 + dist/600, 0.5, 1.25)`.
-pub const GLIDE_S: f64 = 0.7;
-/// Runs shorter than this are detector flap, not a speaker change: the
-/// handoff is absorbed (camera holds) instead of whipping over and back.
-/// Without this, rapid primary alternation compresses each bezier bridge
-/// into a tiny run and the camera visibly whips.
-pub const MIN_RUN_S: f64 = 0.4;
-/// Runs shorter than this that hand off AGAIN (A→B→C banter chains) are
-/// middle stops, not settled speakers: they collapse so the chain renders
-/// as ONE full glide A→C instead of stacked compressed whips. Genuine
-/// turns (each speaker holds the floor ≥0.7s) always survive, as do group
-/// boundaries and end-of-clip arrivals.
-pub const CHAIN_S: f64 = 0.7;
-/// Post-cut settle (s): after a hard shot cut the camera lands WIDE and
-/// holds while the challenger gate confirms the new shot's speaker, instead
-/// of snapping to the first (unconfirmed, usually wrong) pick and whipping
-/// to the correction a beat later. The first move in a new shot is ONE
-/// glide from the establishing wide to the settled speaker.
+/// Post-cut settle (s): after a shot cut the challenger gate needs a beat
+/// to confirm the new shot's speaker. Those samples are placeholders
+/// (`weak`), so the planner opens the new shot directly on the settled
+/// speaker instead of on a guess.
 pub const SETTLE_S: f64 = 0.4;
-/// Handoff trigger: a primary-target center jump beyond this fraction of the
-/// frame width between consecutive samples starts a bezier glide.
-/// Small enough that reacquires whip as glides, not chases (no human moves
-/// 64px+ per sample); flap is absorbed downstream by [`MIN_RUN_S`].
+/// A primary-target center jump beyond this fraction of the frame width
+/// between consecutive samples is a discrete framing change (handoff or
+/// reacquire), not motion.
 const CUT_FRAC: f64 = 0.10;
+/// Detection gaps shorter than this hold the framing instead of going
+/// wide: a wide shot must stay on screen long enough to read as a shot
+/// (a head turn or a hand over the face is not a reason to zoom out).
+pub const WIDE_MIN_S: f64 = 2.5;
+/// How far (fraction of frame width) the lone face may be from the lost
+/// primary and still count as the same person: jitter radius plus a
+/// walking pace for the time unseen, capped well below the spacing of two
+/// seated people so a real handoff is never mistaken for a reacquire.
+pub fn reacquire_frac(unseen_s: f64) -> f64 {
+    (0.08 + 0.25 * unseen_s.max(0.0)).min(0.2)
+}
 /// Pending-challenger match radius (fraction of frame width): box centers
 /// are stable under size jitter where IoU is not.
 const PENDING_FRAC: f64 = 0.08;
-/// Detection denoiser: soft EMA admits no visible lag but irons out box
-/// jitter (the butter comes from median + resample + bezier path). Kept
-/// responsive on purpose — attack latency is what reads as "laggy".
-const DENOISE_ALPHA: f64 = 0.6;
-
-/// Cubic-bezier easing (CSS-style): solve y for progress x with control
-/// points (x1,y1),(x2,y2). `ease_in_out` = (0.42, 0, 0.58, 1).
-pub fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    if x >= 1.0 {
-        return 1.0;
-    }
-    let cx = 3.0 * x1;
-    let bx = 3.0 * (x2 - x1) - cx;
-    let ax = 1.0 - cx - bx;
-    let cy = 3.0 * y1;
-    let by = 3.0 * (y2 - y1) - cy;
-    let ay = 1.0 - cy - by;
-    // Newton-Raphson on x(t), then sample y(t).
-    let mut t = x;
-    for _ in 0..5 {
-        let xt = ((ax * t + bx) * t + cx) * t - x;
-        let dx = (3.0 * ax * t + 2.0 * bx) * t + cx;
-        if dx.abs() < 1e-6 {
-            break;
-        }
-        t = (t - xt / dx).clamp(0.0, 1.0);
-    }
-    ((ay * t + by) * t + cy) * t
-}
-
-/// Standard ease-in-out: slow attack, fast middle, gentle landing.
-pub fn ease_in_out(u: f64) -> f64 {
-    cubic_bezier(0.42, 0.0, 0.58, 1.0, u)
-}
+/// Smallest source crop height the camera may zoom to (px). Output is
+/// 1920 tall, so this bounds upscaling at ~3.6x: low-res sources stay wide
+/// instead of turning to mush (a 360p source never zooms at all).
+pub const MIN_CROP_H: f64 = 540.0;
 
 /// One raw per-sample framing target (source px, f64 — never rounded).
-/// `cut` marks a speaker handoff: the path glides here on a bezier curve
-/// instead of chasing through intermediate frames. `hard` marks a shot
-/// change: the path SNAPS (no glide — panning across a hard cut implies a
-/// continuous space that isn't there).
+/// `cut` marks a discrete change (speaker handoff, group edge, reacquire);
+/// `hard` marks the first sample of a new shot.
 #[derive(Debug, Clone)]
 pub struct RawTarget {
     pub t: f64,
@@ -506,10 +658,17 @@ pub struct RawTarget {
     pub h: f64,
     pub cut: bool,
     pub hard: bool,
-    /// Faces detected at this sample (drives future two-shot logic).
+    /// Faces framed by this target (2+ = group shot).
     pub n_faces: usize,
     /// Picked primary center-x (NaN when no face).
     pub pick_cx: f64,
+    /// Subject anchor (face / group center, source px): punch-ins zoom
+    /// around it so the face keeps its place on screen.
+    pub ax: f64,
+    pub ay: f64,
+    /// Placeholder, not evidence (post-cut settle, nothing seen yet): the
+    /// planner fills it from real samples around it.
+    pub weak: bool,
 }
 
 /// Transcript gate: is anyone audibly speaking at `t` (word spans padded)?
@@ -520,9 +679,9 @@ pub fn speech_active(words: &[Word], t: f64) -> bool {
 }
 
 /// Desired 9:16 window for a face — (center-x, center-y, height-fraction) in
-/// source px → window geometry. Zoom stays generous (≤1.3x) and weak
-/// detections never earn more than 1.15x: the camera doesn't punch into
-/// faces it isn't sure about. Face rides ~40% from the window top.
+/// source px → window geometry. Zoom stays generous (≤1.3x), weak
+/// detections never earn more than 1.15x, and no zoom ever crops below
+/// [`MIN_CROP_H`] source rows. Face rides ~40% from the window top.
 pub fn window_for_face(
     cx: f64,
     cy: f64,
@@ -532,7 +691,8 @@ pub fn window_for_face(
     base_w: f64,
     score: f64,
 ) -> (f64, f64, f64, f64) {
-    let zmax = if score >= 0.65 { 1.3 } else { 1.15 };
+    let zmax: f64 = if score >= 0.65 { 1.3 } else { 1.15 };
+    let zmax = zmax.min((src_h / MIN_CROP_H).max(1.0));
     let z = (0.38 / frac.max(0.05)).clamp(1.0, zmax);
     let w = base_w / z;
     let h = src_h / z;
@@ -677,236 +837,12 @@ impl GroupState {
     }
 }
 
-/// Catmull-Rom sample of one channel at fractional position `pos`.
-fn cr_sample(vals: &[f64], pos: f64) -> f64 {
-    let n = vals.len();
-    if n == 0 {
-        return 0.0;
-    }
-    if n == 1 {
-        return vals[0];
-    }
-    let pos = pos.clamp(0.0, (n - 1) as f64);
-    let i = (pos.floor() as usize).min(n - 2);
-    let u = pos - i as f64;
-    let at = |k: isize| vals[k.clamp(0, n as isize - 1) as usize];
-    let (p0, p1, p2, p3) = (
-        at(i as isize - 1),
-        at(i as isize),
-        at(i as isize + 1),
-        at(i as isize + 2),
-    );
-    0.5 * ((2.0 * p1)
-        + (-p0 + p2) * u
-        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u * u
-        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u * u * u)
-}
-
-/// Turn sparse raw targets into a butter-smooth [`EMIT_HZ`] pose path.
-/// Pure (unit-tested): continuous runs ride Catmull-Rom, `cut` boundaries
-/// ride a [`GLIDE_S`] cubic-bezier glide, across all channels (x, y, zoom).
-pub fn smooth_path(targets: &[RawTarget], src_w: f64, src_h: f64) -> Vec<CamPose> {
-    if targets.is_empty() {
-        return Vec::new();
-    }
-    let single = |r: &RawTarget| {
-        snap_pose(
-            &CamPose {
-                t: r.t,
-                x: r.x,
-                y: r.y,
-                w: r.w,
-                h: r.h,
-            },
-            src_w,
-            src_h,
-        )
-    };
-    if targets.len() == 1 {
-        return vec![single(&targets[0])];
-    }
-    // Absorb excursions: after a cut, if the path returns to (near) the
-    // pre-cut framing quickly, the excursion was flap — hold the pre-cut
-    // framing through it instead of swinging over and back. Genuine
-    // handoffs never return, so they always survive. Processed
-    // left-to-right so chains collapse one blip at a time.
-    let n = targets.len();
-    let mut work: Vec<RawTarget> = targets.to_vec();
-    let mut s = 1;
-    while s < n {
-        if !work[s].cut || work[s].hard {
-            s += 1;
-            continue; // hard shot cuts are always kept, never absorbed
-        }
-        let x0 = work[s - 1].x;
-        let jump = (work[s].x - x0).abs();
-        let mut e = s + 1;
-        while e < n
-            && !work[e].hard
-            && (work[e].t - work[s].t) <= 1.5
-            && (work[e].x - x0).abs() >= (8.0f64).max(0.25 * jump)
-        {
-            e += 1;
-        }
-        let returned = e < n && (work[e].t - work[s].t) <= 1.5;
-        if jump > 1e-9 && returned && work[e].t - work[s].t < MIN_RUN_S {
-            work[s].cut = false;
-            for k in s..e {
-                work[k].x = work[s - 1].x;
-                work[k].y = work[s - 1].y;
-                work[k].w = work[s - 1].w;
-                work[k].h = work[s - 1].h;
-            }
-        }
-        s += 1;
-    }
-    // Collapse rapid handoff chains (see CHAIN_S): walk the cuts; when a
-    // non-hard single cut's run is shorter than CHAIN_S and the next
-    // boundary is another non-hard single cut, the middle stop was banter
-    // — hold the pre-chain framing through it. Left-to-right so A→B→C→D
-    // collapses iteratively and the settled speaker gets one full glide.
-    let mut c = 1;
-    while c < n {
-        if !work[c].cut || work[c].hard || work[c].n_faces > 1 {
-            c += 1;
-            continue;
-        }
-        let mut j = c + 1;
-        while j < n && !work[j].cut && !work[j].hard {
-            j += 1;
-        }
-        let run_end_t = if j < n { work[j].t } else { work[n - 1].t };
-        let next_is_single = j < n && !work[j].hard && work[j].n_faces <= 1;
-        if next_is_single && run_end_t - work[c].t < CHAIN_S {
-            work[c].cut = false;
-            for k in c..j {
-                work[k].x = work[c - 1].x;
-                work[k].y = work[c - 1].y;
-                work[k].w = work[c - 1].w;
-                work[k].h = work[c - 1].h;
-            }
-        }
-        c += 1;
-    }
-    let targets = &work;
-    // Split into continuous runs at cuts (the first run never bridges).
-    // Hard shot cuts split too, but never bridge (see below).
-    let mut runs: Vec<&[RawTarget]> = Vec::new();
-    let mut run_hard: Vec<bool> = vec![false];
-    let mut start = 0;
-    for i in 1..targets.len() {
-        if targets[i].cut || targets[i].hard {
-            runs.push(&targets[start..i]);
-            run_hard.push(targets[i].hard);
-            start = i;
-        }
-    }
-    runs.push(&targets[start..]);
-
-    let dt = EMIT_HZ.recip();
-    let mut out: Vec<CamPose> = Vec::new();
-    for (ri, run) in runs.iter().enumerate() {
-        let t0 = run[0].t;
-        let t1 = run[run.len() - 1].t;
-        let xs: Vec<f64> = run.iter().map(|r| r.x).collect();
-        let ys: Vec<f64> = run.iter().map(|r| r.y).collect();
-        let ws: Vec<f64> = run.iter().map(|r| r.w).collect();
-        let hs: Vec<f64> = run.iter().map(|r| r.h).collect();
-        let span = (t1 - t0).max(1e-9);
-        // Exact (float) channel values at any time in this run.
-        let at = |t: f64| -> (f64, f64, f64, f64) {
-            let p = ((t - t0) / span * (run.len() - 1) as f64).clamp(0.0, (run.len() - 1) as f64);
-            (
-                cr_sample(&xs, p),
-                cr_sample(&ys, p),
-                cr_sample(&ws, p).max(2.0),
-                cr_sample(&hs, p).max(2.0),
-            )
-        };
-        // Full-rate resample of this run on its own grid.
-        let mut grid: Vec<f64> = Vec::new();
-        if t1 <= t0 {
-            grid.push(t0);
-        } else {
-            let n = ((t1 - t0) / dt).round() as usize;
-            for k in 0..=n {
-                grid.push(t0 + k as f64 * dt);
-            }
-            if *grid.last().unwrap() < t1 - 1e-9 {
-                grid.push(t1);
-            }
-        }
-        if ri == 0 || run_hard[ri] {
-            // First run, or a fresh shot: trim any tail at/after the
-            // boundary, then append resampled with NO bridge (snap, not pan:
-            // gliding across a hard cut implies continuity that isn't there).
-            out.retain(|p| p.t < t0 - 1e-9);
-            for &t in &grid {
-                let (x, y, w, h) = at(t);
-                out.push(snap_pose(&CamPose { t, x, y, w, h }, src_w, src_h));
-            }
-            continue;
-        }
-        // Bezier glide: bridge from the previous run's tail into this run.
-        // Trim any tail at/after the cut, then ease (tc, t_end] on the
-        // cubic curve and resume the run's own samples after t_end.
-        let tc = t0;
-        out.retain(|p| p.t < tc - 1e-9);
-        let p0 = out.last().cloned().unwrap_or_else(|| single(&run[0]));
-        // Big moves get more time (constant peak velocity); never shorter
-        // than a flap (absorption guarantees real runs exceed it).
-        let (eex, _, eew, _) = at(t1);
-        let dist = ((eex + eew / 2.0) - (p0.x + p0.w / 2.0)).abs();
-        let dur = (0.5 + dist / 600.0).clamp(0.5, 1.25);
-        let t_end = (tc + dur).min(t1);
-        if t_end > tc + 1e-9 {
-            let (ex, ey, ew, eh) = at(t_end);
-            // Directed zoom: closeup-to-closeup handoffs arrive with a
-            // push-in — a sine bump over the ease (zero at both ends, so
-            // the seam is seamless and the landing exact). Moves that
-            // change framing class (wide<->track dollies) ride straight —
-            // the dolly itself is the move there.
-            let base_w = src_h * 9.0 / 16.0;
-            let push = ew < base_w * 0.95 && p0.w < base_w * 0.95 && ew > p0.w * 0.5;
-            let aw = if push {
-                (ew * 1.3).min(base_w) - ew
-            } else {
-                0.0
-            };
-            let ah = if push {
-                (eh * 1.3).min(src_h) - eh
-            } else {
-                0.0
-            };
-            let (cx0, cx1) = (p0.x + p0.w / 2.0, ex + ew / 2.0);
-            let span = (t_end - tc).max(1e-9);
-            let mut t = tc + dt;
-            while t < t_end - 1e-9 {
-                let u = (t - tc) / span;
-                let e = ease_in_out(u);
-                let bump = (std::f64::consts::PI * u).sin();
-                let w = p0.w + (ew - p0.w) * e + aw * bump;
-                let h = p0.h + (eh - p0.h) * e + ah * bump;
-                let cx = cx0 + (cx1 - cx0) * e;
-                let x = (cx - w / 2.0).clamp(0.0, (src_w - w).max(0.0));
-                let y = (p0.y + (ey - p0.y) * e).clamp(0.0, (src_h - h).max(0.0));
-                out.push(snap_pose(&CamPose { t, x, y, w, h }, src_w, src_h));
-                t += dt;
-            }
-        }
-        for &t in &grid {
-            if t >= t_end - 1e-9 {
-                let (x, y, w, h) = at(t);
-                out.push(snap_pose(&CamPose { t, x, y, w, h }, src_w, src_h));
-            }
-        }
-    }
-    out
-}
-
 /// Track the primary speaker and segment the timeline.
-/// Returns smoothed states + Track/Wide segments (short wides <1.5s are
-/// absorbed so the framing never strobes).
+/// Returns raw per-sample framing evidence, frame-exact shot cuts and
+/// Track/Wide segments (short wides <WIDE_MIN_S are absorbed so the framing
+/// never strobes). Smoothing is the camera planner's job, offline, with
+/// the whole clip in view — nothing here filters with lag.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_tracks(
     tracker: &mut Tracker,
     ffmpeg: &Path,
@@ -916,27 +852,20 @@ pub fn plan_tracks(
     duration: f64,
     range: Option<(f64, f64)>,
     words: &[Word],
-    // Forced jump-cut times (source clock, sorted): tighten/merge
-    // boundaries inside the tracked range. They snap exactly like shot
-    // cuts, but identity persists (same scene).
-    cuts: &[f64],
-    // Emphasis punch windows (source clock): brief eased zoom bumps.
-    punches: &[(f64, f64)],
     // Serve hooks (`None` on the CLI): per-frame progress + cancel.
     progress: Option<crate::progress::SharedPct>,
     cancel: &crate::progress::CancelFlag,
 ) -> anyhow::Result<Tracked> {
     // Sample as fast as practical: DirectML does 15fps comfortably, CPU
     // YuNet + pipe decode ~8fps. 480px-wide samples (vs 320) resolve small
-    // faces with far less box jitter; detections stay sparse (cheap) and the
-    // camera path resamples to EMIT_HZ (30Hz) with bezier handoff glides.
+    // faces with far less box jitter; the planner densifies to the frame.
     let fps: u32 = if tracker.gpu { 15 } else { 8 };
     let sample_w: u32 = 480;
     let sample_h: u32 =
         ((src_h as f64 * sample_w as f64 / src_w as f64).round() as u32).max(2) & !1;
     // Track only the requested span (picked clip ranges, not the source).
     let (r0, r1) = range.unwrap_or((0.0, duration));
-    let frames = sample_frames(
+    let frames = FrameReader::open(
         ffmpeg,
         source,
         fps,
@@ -962,23 +891,26 @@ pub fn plan_tracks(
     let mut last_switch_t = f64::NEG_INFINITY;
     // Last hard shot cut (drives the post-cut settle window).
     let mut last_shot_t = f64::NEG_INFINITY;
-    // Next forced jump cut to fire.
-    let mut cut_idx = 0;
+    // Frame-exact shot cuts (source clock).
+    let mut shots: Vec<f64> = Vec::new();
+    let mut prev_t = r0;
     // Previous sample (pixels + kept boxes) for temporal confirm + mouth.
     let mut prev_rgb: Option<Vec<u8>> = None;
     let mut prev_kept: Vec<Face> = Vec::new();
+    // Previous sample's raw detections: a consistent low-confidence run
+    // confirms itself (a dropout must not break the chain for good).
+    let mut prev_raw_faces: Vec<Face> = Vec::new();
+    // When the primary identity was last actually matched.
+    let mut primary_t = f64::NEG_INFINITY;
     // Previous frame hash for shot-cut detection.
     let mut prev_hash: Option<u64> = None;
     let mut raw: Vec<RawTarget> = Vec::new();
     let mut seen: Vec<(f64, bool)> = Vec::new();
     let mut ever_seen = false;
     let mut group_samples = 0u32;
-    // Denoiser state + last pushed target (dropouts hold it).
-    let mut ema: Option<(f64, f64, f64, f64)> = None;
+    // Last pushed target + anchor (silence and dropouts hold them).
     let mut prev_raw: Option<(f64, f64, f64, f64)> = None;
-    // Median-3 spike rejector over raw windows (lone box jumps never reach
-    // the path). Cleared across handoffs and gaps so reacquires stay snappy.
-    let mut med: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(5);
+    let mut prev_anchor: Option<(f64, f64)> = None;
     // Previous members (incumbency for span hysteresis).
     let mut prev_members: Vec<Face> = Vec::new();
     // Group state (shared framing while a talking crew holds together).
@@ -986,14 +918,16 @@ pub fn plan_tracks(
     // Speech memory (samples): refreshed while either top face talks.
     let mut speech_live = 0u32;
 
-    let n_frames = frames.len();
+    let n_frames = frames.expected.max(1);
     let every = (n_frames / 25).max(1);
-    for (fi, (t, rgb)) in frames.iter().enumerate() {
+    for (fi, item) in frames.enumerate() {
+        let (t_now, rgb_now) = item?;
+        let (t, rgb) = (&t_now, &rgb_now);
         cancel.check()?;
         // Serve progress (throttled: ~25 updates per range).
         if let Some(p) = progress.as_deref() {
             if fi % every == 0 || fi + 1 == n_frames {
-                p(((fi + 1) as f64 / n_frames.max(1) as f64 * 100.0) as u8);
+                p((((fi + 1) as f64 / n_frames as f64 * 100.0) as u8).min(99));
             }
         }
         // Stale identity after 2s unseen: re-pick fresh (avoids latching
@@ -1017,7 +951,8 @@ pub fn plan_tracks(
         // hallucinations, mouth motion scores who is talking — both need
         // the pixels. Only survivors scale up to source coords.
         let sample_faces = tracker.detect(rgb, sample_w as usize, sample_h as usize)?;
-        let kept: Vec<Face> = confirm(sample_faces, &prev_kept);
+        let kept: Vec<Face> = confirm(sample_faces.clone(), &prev_raw_faces);
+        prev_raw_faces = sample_faces;
         let motions: Vec<f64> = match &prev_rgb {
             Some(prev) => kept
                 .iter()
@@ -1032,21 +967,24 @@ pub fn plan_tracks(
                 .collect(),
             None => vec![0.0; kept.len()],
         };
-        // A hash jump is only a cut when the faces turn over too.
-        let shot = hash_cut && !faces_overlap(&kept, &prev_kept);
-        if shot {
+        // A hash jump is only a cut when the faces turn over too, and the
+        // frame-exact check sees a spike (not a pan across a faceless shot).
+        let cut_at = if hash_cut && !faces_overlap(&kept, &prev_kept) {
+            refine_cut(ffmpeg, source, prev_t, *t)
+        } else {
+            None
+        };
+        let shot = cut_at.is_some();
+        if let Some(c) = cut_at {
             primary = None;
             pending = None;
             group_state = GroupState::default();
             speech_live = 0;
             last_switch_t = f64::NEG_INFINITY;
             last_shot_t = *t;
-            ema = None;
-            med.clear();
+            shots.push(c);
         }
-        // Forced jump cut: same snap, no identity reset (med/EMA reset via
-        // `cut` below; the settle window stays dark — no wide flash).
-        let forced = cut_idx < cuts.len() && *t >= cuts[cut_idx] - 1e-9;
+        prev_t = *t;
         prev_rgb = Some(rgb.clone());
         prev_kept = kept.clone();
         let faces: Vec<Face> = kept
@@ -1130,6 +1068,7 @@ pub fn plan_tracks(
         // Breaking a fresh 2.5s lock takes SUSTAINED winning (~0.75s of
         // consecutive wins, not 4 lucky samples): overlapping banter no
         // longer whips A→B→C in under a second.
+        let n_det = faces.len();
         let contender: Option<Face> = if faces.is_empty() {
             None
         } else if let Some(prev) = &primary {
@@ -1152,6 +1091,8 @@ pub fn plan_tracks(
                 })
                 .map(|(_, f)| f)
         };
+        // `follow`: the pick is the primary itself, moved (not a handoff).
+        let mut follow = false;
         let pick: Option<Face> = match (&primary, contender) {
             (_, None) => {
                 pending = None;
@@ -1161,8 +1102,18 @@ pub fn plan_tracks(
                 pending = None;
                 c
             }
-            (Some(prev), Some(c)) if iou(&c, prev) >= 0.2 => {
+            // Same person: overlapping, or the only face in frame found
+            // again within walking distance of where the primary was lost
+            // (a presenter who walked through a detector dropout is not a
+            // new speaker — no handoff, no cut).
+            (Some(prev), Some(c))
+                if iou(&c, prev) >= 0.2
+                    || (n_det == 1
+                        && (c.cx() - prev.cx()).abs()
+                            <= reacquire_frac(*t - primary_t) * src_wf) =>
+            {
                 pending = None;
+                follow = true;
                 Some(c)
             }
             (Some(prev), Some(c)) => match &pending {
@@ -1199,142 +1150,92 @@ pub fn plan_tracks(
             last_seen_t = *t;
         }
         // Retain identity through gaps (the 2s stale-reset expires it), but
-        // never reframe on silence: frozen samples keep the old identity.
+        // never hand off on silence: frozen samples keep the old identity.
+        // The same person moving is followed through pauses (a presenter
+        // walks while thinking) — only switching waits for speech.
         // Wiping on every faceless sample would defeat the challenger gate
         // and let teleport detections take over after any dropout.
-        if !frozen && pick.is_some() {
+        let silent_follow = frozen && follow && !group_now;
+        if (!frozen || silent_follow) && pick.is_some() {
+            // A pending challenger means the pick is the stale primary.
+            if pending.is_none() {
+                primary_t = *t;
+            }
             primary = pick;
         }
         // Raw window target (float, unrounded). Silence holds the last
-        // target; a talking group shares one window; dropouts hold too —
-        // no drift home, no return glide, no zoom on quiet faces.
-        // `grouped` is true only when THIS target frames the group (not
-        // merely when faces are present) — it drives the n_faces flag.
-        // Post-cut settle (SETTLE_S): land wide, confirm behind it, glide
-        // once to the settled speaker — never snap to an unconfirmed pick.
+        // target unless the primary itself moved; a talking group shares
+        // one window; dropouts hold too — no drift home, no zoom on quiet
+        // faces. `grouped` is true only when THIS target frames the group —
+        // it drives the n_faces flag.
+        // Post-cut settle (SETTLE_S) and anything before the first sighting
+        // are placeholders: the planner opens on the settled speaker.
         let settling = *t - last_shot_t < SETTLE_S;
-        let (gx, gy, gw, gh, grouped) = if settling {
-            (center, 0.0, crop_w, src_hf, false)
-        } else if frozen {
+        let hold = || {
             let (hx, hy, hw, hh) = prev_raw.unwrap_or((center, 0.0, crop_w, src_hf));
-            (hx, hy, hw, hh, false)
+            (hx, hy, hw, hh, false, prev_raw.is_none())
+        };
+        let (gx, gy, gw, gh, grouped, weak) = if settling {
+            (center, 0.0, crop_w, src_hf, false, true)
+        } else if frozen && !silent_follow {
+            hold()
         } else if group_now {
             match group_candidate {
-                Some((dx, dy, dw, dh)) => (dx, dy, dw, dh, true),
-                None => {
-                    let (hx, hy, hw, hh) = prev_raw.unwrap_or((center, 0.0, crop_w, src_hf));
-                    (hx, hy, hw, hh, false)
-                }
+                Some((dx, dy, dw, dh)) => (dx, dy, dw, dh, true, false),
+                None => hold(),
             }
         } else {
             match face {
                 Some((cx, cy, frac)) => {
                     let (wx, wy, ww, wh) =
                         window_for_face(cx, cy, frac, src_wf, src_hf, crop_w, pick_score);
-                    (wx, wy, ww, wh, false)
+                    (wx, wy, ww, wh, false, false)
                 }
-                None => {
-                    let (hx, hy, hw, hh) = prev_raw.unwrap_or((center, 0.0, crop_w, src_hf));
-                    (hx, hy, hw, hh, false)
-                }
+                None => hold(),
+            }
+        };
+        // Punch anchor: the face (or the group's eye line) this frames.
+        let (ax, ay) = if weak {
+            (gx + gw / 2.0, gy + gh * 0.4)
+        } else if grouped {
+            (gx + gw / 2.0, gy + gh * 0.4)
+        } else {
+            match face {
+                Some((cx, cy, _)) if !frozen || silent_follow => (cx, cy),
+                _ => prev_anchor.unwrap_or((gx + gw / 2.0, gy + gh * 0.4)),
             }
         };
         // Speaker handoff (or group enter/exit): the desired window jumps.
-        // A shot change always cuts hard (snap, never glide).
         let ncx = gx + gw / 2.0;
         let cut = shot
-            || forced
             || group_edge
-            || match (prev_raw, has_face) {
-                (Some((px, _, pw, _)), true) => (ncx - (px + pw / 2.0)).abs() > cut_dist,
-                _ => false,
-            };
-        // Median-3 first: lone spikes die here, settled motion passes through
-        // (median-5's extra ~130ms of attack lag read as "laggy"; the 2-win
-        // challenger gate already rejects single-sample teleports).
-        if cut || !has_face {
-            med.clear();
+            || !follow
+                && match (prev_raw, has_face) {
+                    (Some((px, _, pw, _)), true) => (ncx - (px + pw / 2.0)).abs() > cut_dist,
+                    _ => false,
+                };
+        if !weak {
+            prev_raw = Some((gx, gy, gw, gh));
+            prev_anchor = Some((ax, ay));
         }
-        med.push((gx, gy, gw, gh));
-        if med.len() > 3 {
-            med.remove(0);
-        }
-        let median = |get: fn(&(f64, f64, f64, f64)) -> f64| -> f64 {
-            let mut v: Vec<f64> = med.iter().map(get).collect();
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            v[v.len() / 2]
-        };
-        let (mx, my, mw, mh) = (
-            median(|q| q.0),
-            median(|q| q.1),
-            median(|q| q.2),
-            median(|q| q.3),
-        );
-        // Soft EMA after it (reset across handoffs so the glide starts clean).
-        let (fx, fy, fw, fh) = match (ema, cut) {
-            (Some((ex, ey, ew, eh)), false) => (
-                DENOISE_ALPHA * mx + (1.0 - DENOISE_ALPHA) * ex,
-                DENOISE_ALPHA * my + (1.0 - DENOISE_ALPHA) * ey,
-                DENOISE_ALPHA * mw + (1.0 - DENOISE_ALPHA) * ew,
-                DENOISE_ALPHA * mh + (1.0 - DENOISE_ALPHA) * eh,
-            ),
-            _ => (mx, my, mw, mh),
-        };
-        ema = Some((fx, fy, fw, fh));
-        prev_raw = Some((fx, fy, fw, fh));
         raw.push(RawTarget {
             t: *t,
-            x: fx,
-            y: fy,
-            w: fw,
-            h: fh,
+            x: gx,
+            y: gy,
+            w: gw,
+            h: gh,
             cut,
-            hard: shot || forced,
+            hard: shot,
             n_faces: if grouped { n_group } else { 1 },
             pick_cx,
+            ax,
+            ay,
+            weak,
         });
         seen.push((*t, has_face));
-        if forced {
-            cut_idx += 1;
-        }
     }
     if raw.is_empty() {
         seen.push((r0, false));
-    }
-
-    // Emphasis punch-ins: ease a brief zoom bump over each window. The
-    // bump is C1-smooth (raised cosine, zero slope at both ends) so the
-    // resample carries it as butter, not steps. Groups and cut
-    // neighborhoods (±0.8s) are exempt — never punch a crowd or a cut.
-    if !punches.is_empty() && !raw.is_empty() {
-        let cut_ts: Vec<f64> = raw
-            .iter()
-            .filter(|r| r.cut || r.hard)
-            .map(|r| r.t)
-            .collect();
-        for (p0, p1) in punches {
-            let mut n = 0u32;
-            for r in raw.iter_mut() {
-                if r.n_faces > 1 {
-                    continue;
-                }
-                if cut_ts.iter().any(|c| (c - r.t).abs() < 0.8) {
-                    continue;
-                }
-                if r.t >= *p0 && r.t <= *p1 && *p1 > *p0 {
-                    let u = (r.t - p0) / (p1 - p0);
-                    let bump = (std::f64::consts::PI * u).sin().powi(2);
-                    let k = 1.0 - crate::punch::PUNCH_DEPTH * bump;
-                    let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
-                    r.w = (r.w * k).max(2.0);
-                    r.h = (r.h * k).max(2.0);
-                    r.x = cx - r.w / 2.0;
-                    r.y = cy - r.h / 2.0;
-                    n += 1;
-                }
-            }
-            tracing::info!("punch applied {p0:.1}s-{p1:.1}s ({n} samples)");
-        }
     }
 
     let end = r1.max(raw.last().map(|s| s.t).unwrap_or(r1));
@@ -1345,6 +1246,7 @@ pub fn plan_tracks(
         segments: merged,
         ever_seen,
         raw,
+        shots,
         group_secs,
     })
 }
@@ -1396,7 +1298,8 @@ pub fn build_segments(seen: &[(f64, bool)], end: f64) -> Vec<Seg> {
     // Absorb short wides.
     let mut merged: Vec<Seg> = Vec::new();
     for seg in segments {
-        let short_wide = seg.kind == SegKind::Wide && seg.t1 - seg.t0 < 1.5 && !merged.is_empty();
+        let short_wide =
+            seg.kind == SegKind::Wide && seg.t1 - seg.t0 < WIDE_MIN_S && !merged.is_empty();
         if short_wide {
             if let Some(prev) = merged.last_mut() {
                 prev.t1 = seg.t1;
@@ -1413,7 +1316,10 @@ pub fn build_segments(seen: &[(f64, bool)], end: f64) -> Vec<Seg> {
         merged.push(seg);
     }
     // A leading short wide has no Track to join — drop it into the next.
-    if merged.len() > 1 && merged[0].kind == SegKind::Wide && merged[0].t1 - merged[0].t0 < 1.5 {
+    if merged.len() > 1
+        && merged[0].kind == SegKind::Wide
+        && merged[0].t1 - merged[0].t0 < WIDE_MIN_S
+    {
         let t1 = merged[0].t1;
         merged.remove(0);
         merged[0].t0 = merged[0].t0.min(t1);
@@ -1422,390 +1328,9 @@ pub fn build_segments(seen: &[(f64, bool)], end: f64) -> Vec<Seg> {
     merged
 }
 
-/// Resample a window-left series to `out_hz` with Catmull-Rom interpolation.
-/// Detections stay sparse (cheap) while the rendered camera moves every
-/// frame — like a face filter, not a slideshow. Clamped to >=0 (upper
-/// clamp happens against max_x at emit time).
-pub fn resample(states: &[TrackPoint], out_hz: f64) -> Vec<TrackPoint> {
-    if states.len() < 2 || out_hz <= 0.0 {
-        return states.to_vec();
-    }
-    let t0 = states[0].t;
-    let t1 = states[states.len() - 1].t;
-    if t1 <= t0 {
-        return states.to_vec();
-    }
-    let n = ((t1 - t0) * out_hz).round() as usize + 1;
-    let at = |i: isize| -> f64 { states[i.clamp(0, states.len() as isize - 1) as usize].x };
-    let mut out = Vec::with_capacity(n.min(8192));
-    // Locate the segment by index (states are uniform at sample fps).
-    let dt = (t1 - t0) / (states.len() - 1) as f64;
-    for k in 0..n {
-        let t = t0 + k as f64 / out_hz;
-        let pos = ((t - t0) / dt).clamp(0.0, (states.len() - 1) as f64);
-        let i = (pos.floor() as usize).min(states.len() - 2);
-        let u = pos - i as f64;
-        let (p0, p1, p2, p3) = (
-            at(i as isize - 1),
-            at(i as isize),
-            at(i as isize + 1),
-            at(i as isize + 2),
-        );
-        // Catmull-Rom, then clamp (avoids overshoot past frame edges).
-        let x = 0.5
-            * ((2.0 * p1)
-                + (-p0 + p2) * u
-                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u * u
-                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u * u * u);
-        out.push(TrackPoint { t, x: x.max(0.0) });
-        if out.len() >= 8192 {
-            break;
-        }
-    }
-    out
-}
-///
-/// Returns `(initial_x, commands)` where `commands` is the file body:
-/// one `{t} crop x {x};` line per track point. `offset` shifts plan times
-/// (clip renders seek with `-ss`, which resets frame timestamps to 0, so
-/// clip-absolute times must be shifted back by the clip start).
-/// Points shifted below 0 collapse onto `t=0` in file order.
-pub fn crop_commands(plan: &CropPlan, max_x: f64, offset: f64) -> (f64, String) {
-    if plan.tracks.is_empty() {
-        return (max_x / 2.0, String::new());
-    }
-    // Sparse plans (external files, low sample rates) are upsampled to a
-    // 30Hz schedule so the camera moves every frame instead of stepping.
-    // Dense native plans pass through untouched.
-    let native_hz = if plan.tracks.len() > 1 {
-        let span = (plan.tracks[plan.tracks.len() - 1].t - plan.tracks[0].t).max(1e-6);
-        (plan.tracks.len() - 1) as f64 / span
-    } else {
-        0.0
-    };
-    let pts: Vec<TrackPoint> = if native_hz < EMIT_HZ - 0.1 {
-        resample(&plan.tracks, EMIT_HZ)
-    } else {
-        plan.tracks.clone()
-    };
-    // Bound absurd schedules (10min+ full-video renders).
-    let pts: Vec<TrackPoint> = if pts.len() > 16384 {
-        pts.into_iter().step_by(2).collect()
-    } else {
-        pts
-    };
-    let mut lines = String::with_capacity(pts.len() * 24);
-    let mut initial_x = pts[0].x.clamp(0.0, max_x);
-    for p in &pts {
-        let t = (p.t - offset).max(0.0);
-        let x = p.x.clamp(0.0, max_x);
-        if p.t - offset <= 0.0 {
-            initial_x = x;
-        }
-        lines.push_str(&format!("{t:.3} crop x {x:.1};\n"));
-    }
-    (initial_x, lines)
-}
-
-/// Catmull-Rom resample of poses to `out_hz` (x, y, w, h channels).
-/// Sparse detections become a filter-smooth schedule.
-pub fn resample_poses(poses: &[CamPose], out_hz: f64) -> Vec<CamPose> {
-    if poses.len() < 2 || out_hz <= 0.0 {
-        return poses.to_vec();
-    }
-    let t0 = poses[0].t;
-    let t1 = poses[poses.len() - 1].t;
-    if t1 <= t0 {
-        return poses.to_vec();
-    }
-    let n = ((t1 - t0) * out_hz).round() as usize + 1;
-    let dt = (t1 - t0) / (poses.len() - 1) as f64;
-    let chan = |get: fn(&CamPose) -> f64, pos: f64| -> f64 {
-        let i = (pos.floor() as usize).min(poses.len() - 2);
-        let u = pos - i as f64;
-        let at = |k: isize| -> f64 { get(&poses[k.clamp(0, poses.len() as isize - 1) as usize]) };
-        let (p0, p1, p2, p3) = (
-            at(i as isize - 1),
-            at(i as isize),
-            at(i as isize + 1),
-            at(i as isize + 2),
-        );
-        0.5 * ((2.0 * p1)
-            + (-p0 + p2) * u
-            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u * u
-            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u * u * u)
-    };
-    let mut out = Vec::with_capacity(n.min(8192));
-    for k in 0..n {
-        let t = t0 + k as f64 / out_hz;
-        let pos = ((t - t0) / dt).clamp(0.0, (poses.len() - 1) as f64);
-        out.push(CamPose {
-            t,
-            x: chan(|p| p.x, pos).max(0.0),
-            y: chan(|p| p.y, pos).max(0.0),
-            w: chan(|p| p.w, pos).max(2.0),
-            h: chan(|p| p.h, pos).max(2.0),
-        });
-        if out.len() >= 8192 {
-            break;
-        }
-    }
-    out
-}
-
-/// Snap a pose to encoder-safe ints (even w/h) within the frame.
-pub fn snap_pose(p: &CamPose, src_w: f64, src_h: f64) -> CamPose {
-    let w = ((p.w / 2.0).round() * 2.0).clamp(2.0, src_w);
-    let h = ((p.h / 2.0).round() * 2.0).clamp(2.0, src_h);
-    CamPose {
-        t: p.t,
-        x: p.x.round().clamp(0.0, (src_w - w).max(0.0)),
-        y: p.y.round().clamp(0.0, (src_h - h).max(0.0)),
-        w,
-        h,
-    }
-}
-
-/// Build a full-geometry `sendcmd` schedule from poses.
-/// Returns `(initial_pose, commands)`; `offset` shifts times (clip seeks
-/// reset frame timestamps to 0). Sparse series ride Catmull-Rom up to
-/// 30Hz; near-duplicate timestamps are dropped (sendcmd steps discretely,
-/// so sub-frame dups would only add stepping noise).
-pub fn pose_commands(poses: &[CamPose], src_w: f64, src_h: f64, offset: f64) -> (CamPose, String) {
-    let base = CamPose {
-        t: 0.0,
-        x: (src_w - src_h * 9.0 / 16.0).max(0.0) / 2.0,
-        y: 0.0,
-        w: src_h * 9.0 / 16.0,
-        h: src_h,
-    };
-    if poses.is_empty() {
-        return (snap_pose(&base, src_w, src_h), String::new());
-    }
-    let native_hz = if poses.len() > 1 {
-        let span = (poses[poses.len() - 1].t - poses[0].t).max(1e-6);
-        (poses.len() - 1) as f64 / span
-    } else {
-        0.0
-    };
-    let mut pts: Vec<CamPose> = if native_hz < EMIT_HZ - 0.1 {
-        resample_poses(poses, EMIT_HZ)
-    } else {
-        poses.to_vec()
-    };
-    if pts.len() > 16384 {
-        pts = pts.into_iter().step_by(2).collect();
-    }
-    let mut lines = String::with_capacity(pts.len() * 72);
-    let mut initial = snap_pose(&pts[0], src_w, src_h);
-    let mut last_t = f64::NEG_INFINITY;
-    for p in &pts {
-        let t = (p.t - offset).max(0.0);
-        if t - last_t < 0.005 && last_t > f64::NEG_INFINITY / 2.0 {
-            continue; // sub-frame dup: sendcmd would step twice, not glide
-        }
-        last_t = t;
-        let q = snap_pose(p, src_w, src_h);
-        if p.t - offset <= 0.0 {
-            initial = q.clone();
-        }
-        lines.push_str(&format!(
-            "{t:.3} crop x {};{t:.3} crop y {};{t:.3} crop w {};{t:.3} crop h {};\n",
-            q.x as i64, q.y as i64, q.w as i64, q.h as i64
-        ));
-    }
-    (initial, lines)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn raw_run(x0: f64, x1: f64, n: usize, dt: f64, cut_at: Option<usize>) -> Vec<RawTarget> {
-        (0..n)
-            .map(|i| {
-                let u = if n > 1 {
-                    i as f64 / (n - 1) as f64
-                } else {
-                    0.0
-                };
-                RawTarget {
-                    t: i as f64 * dt,
-                    x: x0 + (x1 - x0) * u,
-                    y: 10.0,
-                    w: 150.0,
-                    h: 260.0,
-                    cut: cut_at == Some(i),
-                    hard: false,
-                    n_faces: 1,
-                    pick_cx: x0 + (x1 - x0) * u,
-                }
-            })
-            .collect()
-    }
-
-    #[test]
-    fn bezier_ease_has_slow_attack_fast_middle_gentle_landing() {
-        assert_eq!(ease_in_out(0.0), 0.0);
-        assert_eq!(ease_in_out(1.0), 1.0);
-        let (mut prev, mut monotonic) = (0.0, true);
-        for k in 1..=20 {
-            let v = ease_in_out(k as f64 / 20.0);
-            monotonic &= v >= prev;
-            prev = v;
-        }
-        assert!(monotonic, "ease must be monotonic");
-        let attack = ease_in_out(0.1) - ease_in_out(0.0);
-        let middle = ease_in_out(0.5) - ease_in_out(0.4);
-        let landing = ease_in_out(1.0) - ease_in_out(0.9);
-        assert!(attack < middle, "slow attack: {attack} vs {middle}");
-        assert!(landing < middle, "gentle landing: {landing} vs {middle}");
-        // Identity control points reproduce the line.
-        assert!((cubic_bezier(0.0, 0.0, 1.0, 1.0, 0.37) - 0.37).abs() < 1e-6);
-    }
-
-    #[test]
-    fn continuous_run_is_butter_smooth() {
-        // 200px pan over 1s at 15Hz samples, no cuts.
-        let path = smooth_path(&raw_run(100.0, 300.0, 16, 1.0 / 15.0, None), 640.0, 360.0);
-        assert!(
-            (path.len() as f64 - 30.0).abs() <= 2.0,
-            "30Hz emit, got {}",
-            path.len()
-        );
-        let mut max_step = 0.0f64;
-        for w in path.windows(2) {
-            assert!(w[1].t > w[0].t, "times must stay monotonic");
-            max_step = max_step.max((w[1].x - w[0].x).abs());
-        }
-        // 200px/s eased ≈ 6.7px/frame; anything near a 12Hz-style 17px+ jump fails.
-        assert!(max_step < 12.0, "per-frame step too big: {max_step}");
-        assert!(
-            (path.last().unwrap().x - 300.0).abs() < 3.0,
-            "must land on target"
-        );
-    }
-
-    #[test]
-    fn handoff_glides_on_bezier_without_jumps() {
-        // Static left, then a hard cut to the right (speaker change).
-        // Run B is long enough for the full distance-scaled glide.
-        let mut tg = raw_run(100.0, 100.0, 6, 1.0 / 15.0, None);
-        let mut right = raw_run(450.0, 450.0, 18, 1.0 / 15.0, Some(0));
-        for r in &mut right {
-            r.t += 6.0 / 15.0;
-        }
-        tg.extend(right);
-        let path = smooth_path(&tg, 640.0, 360.0);
-        let mut max_step = 0.0f64;
-        for w in path.windows(2) {
-            assert!(w[1].t > w[0].t, "times must stay monotonic");
-            max_step = max_step.max((w[1].x - w[0].x).abs());
-        }
-        // 350px over a 0.7s eased glide peaks ~27px/frame — a step/chase
-        // follower would jump 100px+ in a single frame here.
-        assert!(max_step < 45.0, "handoff must glide, max step {max_step}");
-        // Slow attack: no jumps anywhere in the first 0.2s of the glide
-        // (the push-in widens first, so the crossing point isn't the metric).
-        let tc = 6.0 / 15.0;
-        for wn in path.windows(2) {
-            if wn[0].t >= tc - 1e-9 && wn[1].t <= tc + 0.2 + 1e-9 {
-                assert!(
-                    (wn[1].x - wn[0].x).abs() < 8.0,
-                    "slow attack step at t={}: {} -> {}",
-                    wn[1].t,
-                    wn[0].x,
-                    wn[1].x
-                );
-            }
-        }
-        assert!(
-            (path.last().unwrap().x - 450.0).abs() < 3.0,
-            "must land on new speaker"
-        );
-    }
-
-    #[test]
-    fn rapid_chain_collapses_to_single_glide() {
-        // A→B→C inside 0.55s (banter, never returning): B is a middle stop,
-        // not a settled speaker — the camera holds A, then rides ONE full
-        // glide to C. No stacked compressed whips.
-        let mk = |t: f64, x: f64, cut: bool| RawTarget {
-            t,
-            x,
-            y: 10.0,
-            w: 150.0,
-            h: 260.0,
-            cut,
-            hard: false,
-            n_faces: 1,
-            pick_cx: x + 75.0,
-        };
-        let tg = vec![
-            mk(0.0, 80.0, false),
-            mk(0.15, 80.0, false),
-            mk(0.30, 360.0, true), // B: 0.25s stop, hands off again
-            mk(0.45, 360.0, false),
-            mk(0.55, 420.0, true), // C: settles (keeps going, no return)
-            mk(0.80, 420.0, false),
-            mk(1.10, 420.0, false),
-            mk(1.50, 420.0, false),
-            mk(2.00, 420.0, false),
-        ];
-        let path = smooth_path(&tg, 640.0, 360.0);
-        // B's span holds A: nothing moves before C's cut.
-        for p in path.iter().filter(|p| p.t < 0.5) {
-            assert!(
-                (p.x - 80.0).abs() < 3.0,
-                "banter stop leaked at t={}: x={}",
-                p.t,
-                p.x
-            );
-        }
-        let mut max_step = 0.0f64;
-        for w in path.windows(2) {
-            assert!(w[1].t > w[0].t, "times must stay monotonic");
-            max_step = max_step.max((w[1].x - w[0].x).abs());
-        }
-        assert!(
-            max_step < 45.0,
-            "chain must glide once, max step {max_step}"
-        );
-        assert!(
-            (path.last().unwrap().x - 420.0).abs() < 3.0,
-            "must land on settled speaker"
-        );
-    }
-
-    #[test]
-    fn zoom_channel_eases_with_position() {
-        let mut tg: Vec<RawTarget> = (0..16)
-            .map(|i| RawTarget {
-                t: i as f64 / 15.0,
-                x: 200.0,
-                y: 10.0,
-                w: 200.0 - i as f64 * 5.0, // punch in over the run
-                h: 360.0 - i as f64 * 9.0,
-                cut: false,
-                hard: false,
-                n_faces: 1,
-                pick_cx: 320.0,
-            })
-            .collect();
-        let _ = &mut tg;
-        let path = smooth_path(&tg, 640.0, 360.0);
-        let mut prev_w = path[0].w;
-        for p in &path[1..] {
-            assert!(
-                p.w <= prev_w + 1e-9,
-                "zoom must ease monotonically in, {} -> {}",
-                prev_w,
-                p.w
-            );
-            prev_w = p.w;
-        }
-        assert!(path.last().unwrap().w < path[0].w, "must punch in overall");
-    }
 
     #[test]
     fn cluster_members_wants_close_confident_crews() {
@@ -1964,17 +1489,24 @@ mod tests {
 
     #[test]
     fn face_zoom_stays_generous() {
-        // Small confident face: bounded punch, never a postage stamp.
-        let (.., w, h) = window_for_face(320.0, 180.0, 0.15, 640.0, 360.0, 202.5, 0.9);
-        assert!(202.5 / w <= 1.3 + 1e-9, "z={}", 202.5 / w);
-        assert!(w >= 150.0, "no more postage stamps: w={w}");
-        let _ = h;
-        // Same face, weak detection: stays wider (no punch on doubt).
-        let (.., weak_w, _) = window_for_face(320.0, 180.0, 0.15, 640.0, 360.0, 202.5, 0.5);
+        // 1080p source, small confident face: bounded zoom, never a
+        // postage stamp.
+        let base = 1080.0 * 9.0 / 16.0;
+        let (.., w, h) = window_for_face(960.0, 540.0, 0.15, 1920.0, 1080.0, base, 0.9);
+        assert!(base / w <= 1.3 + 1e-9, "z={}", base / w);
+        assert!(h >= MIN_CROP_H, "resolution floor: h={h}");
+        // Same face, weak detection: stays wider (no zoom on doubt).
+        let (.., weak_w, _) = window_for_face(960.0, 540.0, 0.15, 1920.0, 1080.0, base, 0.5);
         assert!(weak_w > w, "doubt stays wide: {weak_w} vs {w}");
         // Big face: no zoom at all.
-        let (.., w2, _) = window_for_face(320.0, 180.0, 0.6, 640.0, 360.0, 202.5, 0.9);
-        assert!((w2 - 202.5).abs() < 1e-9);
+        let (.., w2, _) = window_for_face(960.0, 540.0, 0.6, 1920.0, 1080.0, base, 0.9);
+        assert!((w2 - base).abs() < 1e-9);
+        // Low-res source: zooming would only magnify mush, so it never does.
+        let (.., w3, h3) = window_for_face(320.0, 180.0, 0.15, 640.0, 360.0, 202.5, 0.9);
+        assert!((w3 - 202.5).abs() < 1e-9 && (h3 - 360.0).abs() < 1e-9);
+        // 720p: some zoom, capped by the floor.
+        let (.., h4) = window_for_face(640.0, 360.0, 0.15, 1280.0, 720.0, 405.0, 0.9);
+        assert!(h4 >= MIN_CROP_H - 1e-9 && h4 < 720.0, "h={h4}");
     }
 
     #[test]
@@ -1998,15 +1530,6 @@ mod tests {
         assert!(!speech_active(&words, 2.6)); // real silence: camera holds
         assert!(!speech_active(&words, 0.3));
         assert!(!speech_active(&[], 1.2));
-    }
-
-    #[test]
-    fn hold_targets_stay_put() {
-        let tg = raw_run(250.0, 250.0, 10, 1.0 / 15.0, None);
-        let path = smooth_path(&tg, 640.0, 360.0);
-        for p in &path {
-            assert!((p.x - 250.0).abs() < 3.0, "holds must not wander: {}", p.x);
-        }
     }
 
     #[test]
@@ -2085,79 +1608,6 @@ mod tests {
     }
 
     #[test]
-    fn handoff_arrives_with_push_in() {
-        // Closeup-to-closeup cut: bridge must start wider, end exact.
-        let mut tg = raw_run(100.0, 100.0, 6, 1.0 / 15.0, None);
-        for r in &mut tg {
-            r.w = 140.0;
-            r.h = 248.0;
-        }
-        let mut right = raw_run(450.0, 450.0, 14, 1.0 / 15.0, Some(0));
-        for r in &mut right {
-            r.t += 6.0 / 15.0;
-            r.w = 140.0;
-            r.h = 248.0;
-        }
-        tg.extend(right);
-        let path = smooth_path(&tg, 640.0, 360.0);
-        let cut_idx = path.iter().position(|p| p.x > 105.0).unwrap();
-        // Early bridge frames are punched OUT (wider than destination).
-        assert!(
-            path[cut_idx].w > 140.0,
-            "push-in must start wide, got {}",
-            path[cut_idx].w
-        );
-        let last = path.last().unwrap();
-        assert!(
-            (last.x - 450.0).abs() < 3.0 && (last.w - 140.0).abs() < 3.0,
-            "must land exact"
-        );
-        let mut mono = true;
-        for wn in path.windows(2) {
-            if wn[1].t < wn[0].t {
-                mono = false;
-            }
-        }
-        assert!(mono, "times must stay monotonic");
-    }
-
-    #[test]
-    fn micro_handoff_flap_is_absorbed_not_whipped() {
-        // A holds 1s, B blips for 0.2s (3 samples), A resumes: flap.
-        let mut tg = raw_run(100.0, 100.0, 16, 1.0 / 15.0, None);
-        let mut blip = raw_run(450.0, 450.0, 3, 1.0 / 15.0, Some(0));
-        for r in &mut blip {
-            r.t += 16.0 / 15.0;
-        }
-        let t_end = blip.last().unwrap().t;
-        tg.extend(blip);
-        for i in 0..16 {
-            tg.push(RawTarget {
-                t: t_end + (i + 1) as f64 / 15.0,
-                x: 100.0,
-                y: 10.0,
-                w: 150.0,
-                h: 260.0,
-                cut: false,
-                hard: false,
-                n_faces: 1,
-                pick_cx: 100.0,
-            });
-        }
-        let path = smooth_path(&tg, 640.0, 360.0);
-        let mut max_dev = 0.0f64;
-        let mut max_step = 0.0f64;
-        for (i, p) in path.iter().enumerate() {
-            max_dev = max_dev.max((p.x - 100.0).abs());
-            if i > 0 {
-                max_step = max_step.max((p.x - path[i - 1].x).abs());
-            }
-        }
-        assert!(max_dev < 25.0, "flap must not swing the camera: {max_dev}");
-        assert!(max_step < 12.0, "no whipping steps: {max_step}");
-    }
-
-    #[test]
     fn segments_absorb_flicker_and_short_wides() {
         // 4Hz samples: faces, 2-frame dropout, faces, 3s gap, faces.
         let mut seen = Vec::new();
@@ -2179,6 +1629,47 @@ mod tests {
         assert_eq!(segs[1].kind, SegKind::Wide);
         assert!((segs[1].t1 - segs[1].t0 - 3.0).abs() < 0.6, "{segs:?}");
         assert_eq!(segs[2].kind, SegKind::Track);
+    }
+
+    #[test]
+    fn cut_check_separates_cuts_from_pans() {
+        // 60 Hz resample of 30 fps: every other diff is a duplicate (0).
+        let r = 60.0;
+        let profile = |motion: f64, peak_at: usize, peak: f64| -> Vec<f64> {
+            (0..40)
+                .map(|i| {
+                    if i == peak_at {
+                        peak
+                    } else if i % 2 == 0 {
+                        motion
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        };
+        // Candidate window: frames 15..25 of a decode starting at t=0.
+        let (lo, hi) = (15.0 / r, 25.0 / r);
+        // A cut in a calm shot: pinned to the spike frame.
+        let d = profile(2.0, 20, 40.0);
+        let t = classify_cut(&d, |_| 0.1, 0.0, r, lo, hi).expect("cut");
+        assert!((t - 21.0 / r).abs() < 1e-9, "{t}");
+        // A whip pan: big but sustained change, same tonal content.
+        let d = profile(28.0, 20, 32.0);
+        assert!(classify_cut(&d, |_| 0.2, 0.0, r, lo, hi).is_none());
+        // A cut between two busy shots: no spike, but the scene turns over.
+        assert!(classify_cut(&d, |i| if i == 20 { 0.9 } else { 0.2 }, 0.0, r, lo, hi).is_some());
+        // Too small to be anything.
+        let d = profile(0.5, 20, 4.0);
+        assert!(classify_cut(&d, |_| 0.0, 0.0, r, lo, hi).is_none());
+    }
+
+    #[test]
+    fn reacquire_radius_is_bounded() {
+        assert!((reacquire_frac(0.0) - 0.08).abs() < 1e-9);
+        assert!(reacquire_frac(0.3) > 0.12);
+        // Never wide enough to mistake the other side of a table.
+        assert!((reacquire_frac(5.0) - 0.2).abs() < 1e-9);
     }
 
     #[test]
@@ -2245,45 +1736,5 @@ mod tests {
         // Empty either side: no continuity to protect.
         assert!(!faces_overlap(&[], &[a.clone()]));
         assert!(!faces_overlap(&[c], &[]));
-    }
-
-    #[test]
-    fn hard_cut_snaps_instead_of_gliding() {
-        // Static left, HARD cut, static right: no eased samples between —
-        // the path jumps (times stay monotonic, values snap).
-        let mut tg = raw_run(100.0, 100.0, 6, 1.0 / 15.0, None);
-        let mut right = raw_run(450.0, 450.0, 14, 1.0 / 15.0, None);
-        for r in &mut right {
-            r.t += 6.0 / 15.0;
-        }
-        right[0].cut = true;
-        right[0].hard = true;
-        tg.extend(right);
-        let path = smooth_path(&tg, 640.0, 360.0);
-        let mut snapped = false;
-        for wn in path.windows(2) {
-            assert!(wn[1].t > wn[0].t, "times must stay monotonic");
-            if (wn[1].x - wn[0].x).abs() > 100.0 {
-                snapped = true; // the cut itself, unbridged
-            }
-        }
-        assert!(snapped, "hard cut must snap, not glide");
-        assert!((path.last().unwrap().x - 450.0).abs() < 3.0);
-        // Same setup with a soft cut glides instead (no big single step).
-        let mut tg2 = raw_run(100.0, 100.0, 6, 1.0 / 15.0, None);
-        let mut right2 = raw_run(450.0, 450.0, 18, 1.0 / 15.0, Some(0));
-        for r in &mut right2 {
-            r.t += 6.0 / 15.0;
-        }
-        tg2.extend(right2);
-        let path2 = smooth_path(&tg2, 640.0, 360.0);
-        for wn in path2.windows(2) {
-            assert!(
-                (wn[1].x - wn[0].x).abs() < 45.0,
-                "soft cut must glide: {} -> {}",
-                wn[0].x,
-                wn[1].x
-            );
-        }
     }
 }

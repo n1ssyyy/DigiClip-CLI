@@ -170,17 +170,44 @@ impl Validator {
             }
         }
         if e - s < self.min_s {
-            // Try to grow to min.
-            e = (s + self.min_s).min(duration);
+            // Grow to min — landing on a word end, never mid-word.
+            let want = s + self.min_s;
+            e = words
+                .iter()
+                .map(|w| w.e)
+                .filter(|&x| x >= want - 1e-9)
+                .fold(f64::INFINITY, f64::min)
+                .min(duration);
             if e - s < self.min_s {
                 s = (e - self.min_s).max(0.0);
             }
-            if e - s < self.min_s {
+            if e - s < self.min_s - 1e-9 {
                 return None;
             }
         }
         if e - s > self.max_s {
-            e = s + self.max_s;
+            // Trim to max on the last word end that fits (a sentence end
+            // within the last 5 s if there is one), never mid-word.
+            let cap = s + self.max_s;
+            let fits = |w: &&Word| w.e <= cap + 1e-9 && w.e > s;
+            let sentence = words
+                .iter()
+                .filter(fits)
+                .filter(|w| ends_sentence(&w.w) && w.e >= cap - 5.0)
+                .map(|w| w.e)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let word = words
+                .iter()
+                .filter(fits)
+                .map(|w| w.e)
+                .fold(f64::NEG_INFINITY, f64::max);
+            e = if sentence.is_finite() {
+                sentence
+            } else if word.is_finite() && word - s >= self.min_s {
+                word
+            } else {
+                cap
+            };
         }
         let hashtags: Vec<String> = c
             .hashtags

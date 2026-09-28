@@ -52,16 +52,23 @@ digiclip podcast.mp4
 
 - 🎙️ **Transcribes offline.** whisper.cpp is compiled right in — word-level timing, no Python, no upload. Got a GPU? Plug in the Vulkan sidecar.
 - 🎯 **Picks like an editor.** An [OpenRouter](https://openrouter.ai) model of your choice ranks every moment for hook and payoff; a built-in scorer covers you offline.
-- 🎥 **Tracks the speaker.** YuNet face tracking keeps whoever's talking in frame and glides between speakers.
-- ✂️ **Tightens the edit.** Dead air goes, filler words optionally too, loud lines get a punch-in zoom — every cut logged in `cut_plan.json`.
+- 🎥 **Frames like a camera operator.** YuNet face tracking plus an offline camera planner: the shot locks off while the speaker stays put, follows a walking presenter in one smooth move, cuts (never whip-pans) between speakers, and lands every reframe on the source's own shot cuts.
+- ✂️ **Tightens the edit.** Dead air goes, filler words optionally too; every cut is placed in the quietest instant near the word edge, frame-aligned, with click-free audio joins. Loud lines get a punch-in zoom anchored on the face — every cut logged in `cut_plan.json`.
 - 💬 **Eight caption styles.** Karaoke, Hormozi, neon, beast and friends, burned in with libass.
-- 🚀 **Renders in parallel.** Clips encode side by side on NVENC or VideoToolbox when you have them, libx264 when you don't.
+- 🚀 **Renders in parallel, in sync.** A streaming decode → compose → encode pipeline, clips side by side on NVENC or VideoToolbox (libx264 fallback). A/V sync is exact by construction and loudness lands on −14 LUFS with a −1 dBTP ceiling.
 - 🔒 **Stays local.** Your video never leaves the disk; only clip scoring optionally calls OpenRouter.
 
 ```mermaid
 flowchart LR
     V(["Video"]) --> A["Extract audio"] --> T["Transcribe"] --> P["Pick clips"] --> F["Track speaker"] --> R["Render 9:16"] --> O(["Clips"])
 ```
+
+### How the engine works
+
+- **Cuts.** Clip and keep edges snap to word boundaries, then into the quietest nearby instant (a short lead-in before the first word, a natural tail after the last), then onto the output frame grid. Audio is cut by exact sample counts on the same grid, with short fades at every join, so video and audio can't drift apart however many jump cuts a clip has.
+- **Tracking.** Faces are sampled at 8–15 Hz. Shot cuts are verified (a one-frame spike, not a pan) and pinned to the exact frame. A speaker who walks or drops out of detection for a moment stays the same person, and the camera switches only between different people who are talking.
+- **Camera.** The whole clip is planned before the first frame renders. The camera holds inside a dead zone, cuts on shot changes, speaker switches and layout changes, glides (smootherstep) for everything else, and follows continuous motion with zero-phase smoothing. Zoom never goes past the source resolution, so low-res input stays sharp.
+- **Render.** One ffmpeg decode per keep feeds a Rust compositor (crop, scale, blur fill), which feeds one encoder with captions burned in. The audio uses two-pass loudness and a limiter.
 
 ## 📥 Get it
 
@@ -116,6 +123,8 @@ cargo test              # unit + integration tests
 ```
 
 CI builds and tests on Windows, Linux and macOS; tag `v*` and the three binaries publish themselves.
+
+`cargo run --release --example render_smoke` renders synthetic flash/click clips through the real engine and measures A/V sync across off-grid jump cuts. `DIGICLIP_CAMERA_DUMP=<dir>` writes each clip's framing targets, camera path and shot cuts as CSV for inspection.
 
 ## 🩺 Something off?
 
