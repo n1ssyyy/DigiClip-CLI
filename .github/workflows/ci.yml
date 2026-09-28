@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           ffmpeg -hide_banner -version | head -1
-          ffmpeg -hide_banner -filters | grep -E '^ ... (ass|subtitles) '
+          ffmpeg -hide_banner -filters | grep -E '^ [A-Z.]+ +(ass|subtitles) '
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
