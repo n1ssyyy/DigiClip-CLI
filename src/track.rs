@@ -650,6 +650,13 @@ const CUT_FRAC: f64 = 0.10;
 /// wide: a wide shot must stay on screen long enough to read as a shot
 /// (a head turn or a hand over the face is not a reason to zoom out).
 pub const WIDE_MIN_S: f64 = 2.5;
+/// A faceless stretch with a source shot cut (or the clip's edge) at both
+/// ends is a cutaway — b-roll, a screen, the room — not a lost face: it
+/// goes wide after this long, and the cuts hide the layout change.
+pub const WIDE_CUT_MIN_S: f64 = 1.0;
+/// A face/no-face flip this close to a shot cut belongs to the cut (the
+/// detector confirms a new face a sample or two late).
+const CUT_SNAP_S: f64 = 0.35;
 /// How far (fraction of frame width) the lone face may be from the lost
 /// primary and still count as the same person: jitter radius plus a
 /// walking pace for the time unseen, capped well below the spacing of two
@@ -754,6 +761,11 @@ pub fn window_for_face(
 /// dither can't strobe the group on and off.
 const CLUSTER_SPAN_FRAC: f64 = 0.75;
 const CLUSTER_KEEP_FRAC: f64 = 0.9;
+/// People in one conversation sit at about the same distance from the
+/// camera: a member's face must be at least this fraction of the biggest
+/// face's height. Tiny faces (a video playing on a TV behind the speaker,
+/// the back row) never form a group of their own and steal the frame.
+const GROUP_MIN_REL: f64 = 0.5;
 
 /// Cluster members, rank-ordered: walk down score+motion rank, admit anyone
 /// confident and distinct while the running span stays within budget. No
@@ -772,8 +784,9 @@ pub fn cluster_members<'a>(
     let mut members: Vec<(&Face, f64)> = Vec::new();
     let mut x1 = f64::INFINITY;
     let mut x2 = f64::NEG_INFINITY;
+    let biggest = scored.iter().map(|(f, _)| f.h).fold(0.0, f64::max);
     for &(f, m) in scored {
-        if f.score < 0.6 {
+        if f.score < 0.6 || f.h < GROUP_MIN_REL * biggest {
             continue;
         }
         if !members
@@ -1153,7 +1166,14 @@ pub fn plan_tracks(
             pending = None;
             contender.map(|i| faces[i].clone())
         } else {
-            let challenger = contender.filter(|&c| Some(c) != matched && !frozen);
+            // A face far smaller than the speaker (the TV behind them, the
+            // back row) is someone else's shot, never a handoff.
+            let big_enough = |c: usize| {
+                primary
+                    .as_ref()
+                    .is_none_or(|p| faces[c].h >= GROUP_MIN_REL * p.h)
+            };
+            let challenger = contender.filter(|&c| Some(c) != matched && !frozen && big_enough(c));
             let won = match challenger {
                 None => {
                     pending = None;
@@ -1279,7 +1299,7 @@ pub fn plan_tracks(
     }
 
     let end = r1.max(raw.last().map(|s| s.t).unwrap_or(r1));
-    let merged = build_segments(&seen, end);
+    let merged = build_segments(&seen, end, &shots);
     let group_secs = group_samples as f64 / fps as f64;
 
     Ok(Tracked {
@@ -1291,9 +1311,11 @@ pub fn plan_tracks(
     })
 }
 
-/// Build Track/Wide segments from per-sample face flags.
-/// Pure (unit-tested): hysteresis via majority vote, short wides absorbed.
-pub fn build_segments(seen: &[(f64, bool)], end: f64) -> Vec<Seg> {
+/// Build Track/Wide segments from per-sample face flags and the source
+/// shot cuts. Pure (unit-tested): hysteresis via majority vote, flips
+/// moved onto nearby cuts, short wides absorbed (cutaways between cuts
+/// may be shorter than mid-shot dropouts).
+pub fn build_segments(seen: &[(f64, bool)], end: f64, shots: &[f64]) -> Vec<Seg> {
     if seen.is_empty() {
         return vec![Seg {
             t0: 0.0,
@@ -1335,11 +1357,46 @@ pub fn build_segments(seen: &[(f64, bool)], end: f64) -> Vec<Seg> {
         }
     }
     flush(&mut segments, run_start, end, run_face);
+    // Flips near a shot cut land on it: the layout changes with the
+    // picture. The range's own edges are edits too.
+    let n = segments.len();
+    let mut on_cut = vec![false; n + 1];
+    on_cut[0] = true;
+    on_cut[n] = true;
+    for i in 1..n {
+        let t = segments[i].t0;
+        let near = shots
+            .iter()
+            .copied()
+            .filter(|&c| (c - t).abs() <= CUT_SNAP_S)
+            .filter(|&c| c > segments[i - 1].t0 && c < segments[i].t1)
+            .min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()));
+        if let Some(c) = near {
+            segments[i - 1].t1 = c;
+            segments[i].t0 = c;
+            on_cut[i] = true;
+        }
+    }
+    // Segment times are absolute; the first one opens at 0 for coverage,
+    // so its length counts from the first sample.
+    let first_t = seen[0].0;
+    let keep: Vec<bool> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            let min = if on_cut[i] && on_cut[i + 1] {
+                WIDE_CUT_MIN_S
+            } else {
+                WIDE_MIN_S
+            };
+            seg.kind == SegKind::Wide && seg.t1 - seg.t0.max(first_t) >= min
+        })
+        .collect();
     // Absorb short wides.
     let mut merged: Vec<Seg> = Vec::new();
-    for seg in segments {
-        let short_wide =
-            seg.kind == SegKind::Wide && seg.t1 - seg.t0 < WIDE_MIN_S && !merged.is_empty();
+    let mut kept: Vec<bool> = Vec::new();
+    for (seg, k) in segments.into_iter().zip(keep) {
+        let short_wide = seg.kind == SegKind::Wide && !k && !merged.is_empty();
         if short_wide {
             if let Some(prev) = merged.last_mut() {
                 prev.t1 = seg.t1;
@@ -1347,19 +1404,18 @@ pub fn build_segments(seen: &[(f64, bool)], end: f64) -> Vec<Seg> {
             }
         }
         // Merge same-kind neighbors.
-        if let Some(prev) = merged.last_mut() {
+        if let (Some(prev), Some(pk)) = (merged.last_mut(), kept.last_mut()) {
             if prev.kind == seg.kind {
                 prev.t1 = seg.t1;
+                *pk |= k;
                 continue;
             }
         }
         merged.push(seg);
+        kept.push(k);
     }
     // A leading short wide has no Track to join — drop it into the next.
-    if merged.len() > 1
-        && merged[0].kind == SegKind::Wide
-        && merged[0].t1 - merged[0].t0 < WIDE_MIN_S
-    {
+    if merged.len() > 1 && merged[0].kind == SegKind::Wide && !kept[0] {
         let t1 = merged[0].t1;
         merged.remove(0);
         merged[0].t0 = merged[0].t0.min(t1);
@@ -1432,6 +1488,27 @@ mod tests {
         };
         let small = mk(450.0, 50.0, 0.9);
         assert!(cluster_members(&[(&big, 0.5), (&small, 0.5)], base_w, &[]).is_empty());
+        // Two tiny faces on a TV behind a speaker: close together and
+        // "talking" (it's a video), but a quarter of the speaker's size.
+        let speaker = Face {
+            x: 100.0,
+            y: 60.0,
+            w: 60.0,
+            h: 80.0,
+            score: 0.9,
+        };
+        let tv = |x: f64| Face {
+            x,
+            y: 40.0,
+            w: 14.0,
+            h: 20.0,
+            score: 0.66,
+        };
+        let (t1, t2) = (tv(560.0), tv(600.0));
+        assert!(
+            cluster_members(&[(&t1, 0.9), (&t2, 0.9), (&speaker, 0.3)], base_w, &[]).is_empty(),
+            "screen faces never form a group"
+        );
     }
 
     #[test]
@@ -1684,13 +1761,45 @@ mod tests {
         for i in 52..72 {
             seen.push((i as f64 * 0.25, true));
         }
-        let segs = build_segments(&seen, 18.0);
+        let segs = build_segments(&seen, 18.0, &[]);
         // 0.5s dropout absorbed; 3s gap survives as one Wide.
         assert_eq!(segs.len(), 3, "{segs:?}");
         assert_eq!(segs[0].kind, SegKind::Track);
         assert_eq!(segs[1].kind, SegKind::Wide);
         assert!((segs[1].t1 - segs[1].t0 - 3.0).abs() < 0.6, "{segs:?}");
         assert_eq!(segs[2].kind, SegKind::Track);
+    }
+
+    #[test]
+    fn cutaways_between_shot_cuts_go_wide_sooner() {
+        // 15 Hz samples from 60s: speaker, a 1.4s faceless cutaway that
+        // the detector notices a sample late (cut at 63.0), speaker again
+        // (cut at 64.4).
+        let at = |i: usize| 60.0 + i as f64 / 15.0;
+        let seen: Vec<(f64, bool)> = (0..90)
+            .map(|i| {
+                let t = at(i);
+                (t, !(63.07..64.45).contains(&t))
+            })
+            .collect();
+        let segs = build_segments(&seen, 66.0, &[63.0, 64.4]);
+        assert_eq!(segs.len(), 3, "{segs:?}");
+        assert_eq!(segs[1].kind, SegKind::Wide);
+        // Both flips moved onto the cuts.
+        assert!((segs[1].t0 - 63.0).abs() < 1e-9 && (segs[1].t1 - 64.4).abs() < 1e-9);
+        // The same gap mid-shot (no cuts) is a lost face: it holds.
+        let segs = build_segments(&seen, 66.0, &[]);
+        assert_eq!(segs.len(), 1, "{segs:?}");
+        assert_eq!(segs[0].kind, SegKind::Track);
+        // A clip opening on 1.2s of b-roll (cut at 61.2) opens wide, even
+        // though segment times are absolute.
+        let seen: Vec<(f64, bool)> = (0..60).map(|i| (at(i), at(i) >= 61.2)).collect();
+        let segs = build_segments(&seen, 64.0, &[61.2]);
+        assert_eq!(segs[0].kind, SegKind::Wide, "{segs:?}");
+        assert!((segs[0].t1 - 61.2).abs() < 1e-9);
+        // …but a slow first detection with no cut is not b-roll.
+        let segs = build_segments(&seen, 64.0, &[]);
+        assert_eq!(segs.len(), 1, "{segs:?}");
     }
 
     #[test]
