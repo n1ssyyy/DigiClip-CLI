@@ -241,6 +241,13 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
 
+    /// Captions in another language (ISO code: de, fr, sq, ...). The
+    /// transcript is translated through OpenRouter (needs a key; without
+    /// one, or on failure, captions stay in the spoken language). Clip
+    /// picking and cuts always use the spoken words.
+    #[arg(long)]
+    pub subs_lang: Option<String>,
+
     /// Re-render exact clips instead of picking: a JSON list of
     /// `{rank, start_s, end_s, title?, style?, fixes?: [{s, w}]}` (clips
     /// mode). Only those ranks render, over their existing files. `fixes`

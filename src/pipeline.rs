@@ -951,6 +951,15 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             .unwrap_or_else(|_| "google/gemini-2.5-flash".into())
     });
 
+    // --subs-lang: captions in another language. Picking and cuts stay on
+    // the spoken words; everything drawn on screen uses these.
+    let cap_words = match crate::translate::target_code(args.subs_lang.as_deref()) {
+        Some(l) if !args.dry_run => {
+            crate::translate::for_captions(&ocfg, &tr, &l, &out, cancel).await
+        }
+        _ => None,
+    };
+
     let pc = PlanCtx {
         args,
         ffmpeg: &ffmpeg,
@@ -958,7 +967,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
         probe: &probe,
         fps,
         gpu_on,
-        words: &tr.words,
+        words: cap_words.as_deref().unwrap_or(&tr.words),
         env: env.as_ref(),
         ocfg: &ocfg,
         vision_model: &vision_model,
@@ -1070,6 +1079,29 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             emit.stage(Stage::Render, Some(100));
             if emit.active() {
                 let _ = crate::ffmpeg::poster(&mp4, &out.join("full-poster.jpg"));
+            }
+            // Upload kit: summary + YouTube chapters (spoken language).
+            if args.kit {
+                emit.stage(Stage::Kit, None);
+                let o = crate::chapters::outline(&ocfg, &tr.words, dur).await;
+                if !o.chapters.is_empty() {
+                    std::fs::write(
+                        out.join("chapters.txt"),
+                        crate::chapters::chapters_txt(&o.chapters),
+                    )?;
+                }
+                let title = pseudo.title.clone().unwrap_or_default();
+                std::fs::write(
+                    out.join("full-upload.txt"),
+                    crate::chapters::kit_text(&title, &o),
+                )?;
+                tracing::info!(
+                    "upload kit: {} chapter(s), summary from {}",
+                    o.chapters.len(),
+                    o.source
+                );
+                artifact.kit = Some("full-upload.txt".into());
+                emit.stage(Stage::Kit, Some(100));
             }
             emit.emit(JobEvent::ClipDone {
                 clip: artifact.clone(),

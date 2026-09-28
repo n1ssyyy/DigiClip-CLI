@@ -190,9 +190,9 @@ fn extract_json_candidates(text: &str) -> Option<Vec<RawClip>> {
     None
 }
 
-/// Analyze via OpenRouter. Returns Err on transport/4xx/5xx — caller falls
-/// back to the heuristic scorer (except auth errors, which are reported).
-pub async fn analyze(cfg: &Config, system: &str, user: &str) -> anyhow::Result<AnalyzeResult> {
+/// POST one chat completion: 3 attempts on transport errors, 429 and 5xx;
+/// auth and other 4xx fail at once. Returns the parsed response.
+async fn post(cfg: &Config, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
     let key = cfg.key.clone().ok_or_else(|| {
         anyhow::anyhow!("OPENROUTER_API_KEY is not set — use the heuristic scorer.")
     })?;
@@ -200,17 +200,6 @@ pub async fn analyze(cfg: &Config, system: &str, user: &str) -> anyhow::Result<A
         .timeout(std::time::Duration::from_secs(cfg.timeout_s))
         .build()?;
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "model": cfg.model,
-        "temperature": 0.3,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "tools": [tool_schema()],
-        "tool_choice": {"type": "function", "function": {"name": "submit_clips"}},
-    });
-
     let mut last_err = String::new();
     for attempt in 1..=3 {
         let resp = client
@@ -218,7 +207,7 @@ pub async fn analyze(cfg: &Config, system: &str, user: &str) -> anyhow::Result<A
             .header("Authorization", format!("Bearer {key}"))
             .header("HTTP-Referer", "https://digiclip.app")
             .header("X-Title", "DigiClip")
-            .json(&body)
+            .json(body)
             .send()
             .await;
         let resp = match resp {
@@ -251,8 +240,28 @@ pub async fn analyze(cfg: &Config, system: &str, user: &str) -> anyhow::Result<A
             }
             anyhow::bail!("{last_err}");
         }
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("OpenRouter returned non-JSON: {e}"))?;
+        return serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("OpenRouter returned non-JSON: {e}"));
+    }
+    anyhow::bail!("OpenRouter failed after retries: {last_err}")
+}
+
+/// Analyze via OpenRouter. Returns Err on transport/4xx/5xx — caller falls
+/// back to the heuristic scorer (except auth errors, which are reported).
+pub async fn analyze(cfg: &Config, system: &str, user: &str) -> anyhow::Result<AnalyzeResult> {
+    let body = serde_json::json!({
+        "model": cfg.model,
+        "temperature": 0.3,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "tools": [tool_schema()],
+        "tool_choice": {"type": "function", "function": {"name": "submit_clips"}},
+    });
+    // A reply with neither a tool call nor content is retried.
+    for _ in 0..2 {
+        let v = post(cfg, &body).await?;
         // Tool call first.
         if let Some(args_s) = v
             .pointer("/choices/0/message/tool_calls/0/function/arguments")
@@ -303,9 +312,58 @@ pub async fn analyze(cfg: &Config, system: &str, user: &str) -> anyhow::Result<A
                 content.chars().take(300).collect::<String>()
             );
         }
-        last_err = "OpenRouter response had no tool call and no content".into();
+        tracing::warn!("OpenRouter response had no tool call and no content");
     }
-    anyhow::bail!("OpenRouter failed after retries: {last_err}")
+    anyhow::bail!("OpenRouter response had no tool call and no content")
+}
+
+/// First JSON object in a model reply: bare, fenced, or embedded in prose.
+pub fn json_object(text: &str) -> Option<serde_json::Value> {
+    let text = text.trim();
+    if let Ok(v @ serde_json::Value::Object(_)) = serde_json::from_str(text) {
+        return Some(v);
+    }
+    for block in text.split("```").skip(1).step_by(2) {
+        let block = block.trim().trim_start_matches("json").trim();
+        if let Ok(v @ serde_json::Value::Object(_)) = serde_json::from_str(block) {
+            return Some(v);
+        }
+    }
+    let (a, b) = (text.find('{')?, text.rfind('}')?);
+    if a < b {
+        if let Ok(v @ serde_json::Value::Object(_)) = serde_json::from_str(&text[a..=b]) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// One plain chat turn whose reply must be a JSON object (translation,
+/// chapters). Errors when the reply has none.
+pub async fn chat_json(
+    cfg: &Config,
+    system: &str,
+    user: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let body = serde_json::json!({
+        "model": cfg.model,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    });
+    let v = post(cfg, &body).await?;
+    let content = v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default();
+    json_object(content).ok_or_else(|| {
+        anyhow::anyhow!(
+            "LLM reply had no JSON object: {}",
+            content.chars().take(200).collect::<String>()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -342,6 +400,23 @@ mod tests {
         let out = normalize_scores(vec![scored(85, 70, 64, 91)]);
         let s = out[0].scores.clone().unwrap();
         assert_eq!((s.hook, s.retention, s.value, s.share), (85, 70, 64, 91));
+    }
+
+    #[test]
+    fn json_objects_are_found_in_replies() {
+        assert_eq!(json_object(r#"{"a":1}"#).unwrap()["a"], 1);
+        let fenced = "Sure!
+```json
+{\"lines\": [\"x\"]}
+```
+Done.";
+        assert_eq!(json_object(fenced).unwrap()["lines"][0], "x");
+        assert_eq!(
+            json_object(r#"Here: {"a": {"b": 2}} ok"#).unwrap()["a"]["b"],
+            2
+        );
+        assert!(json_object("no json here").is_none());
+        assert!(json_object("[1, 2]").is_none());
     }
 
     #[test]
