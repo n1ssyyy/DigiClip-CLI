@@ -284,7 +284,7 @@ impl Tracker {
             for y in 0..h {
                 let row = &rgb[y * w * 3..(y + 1) * w * 3];
                 let o = y * pad_w;
-                for (x, px) in row.chunks_exact(3).enumerate() {
+                for (x, px) in row.as_chunks::<3>().0.iter().enumerate() {
                     buf[o + x] = px[0] as f32;
                     buf[plane + o + x] = px[1] as f32;
                     buf[2 * plane + o + x] = px[2] as f32;
@@ -509,7 +509,13 @@ pub fn refine_cut(ffmpeg: &Path, source: &Path, lo: f64, hi: f64) -> Option<f64>
         .stderr(std::process::Stdio::null())
         .output();
     let Ok(out) = out else { return Some(hi) };
-    let frames: Vec<&[u8]> = out.stdout.chunks_exact(W * H).collect();
+    let frames: Vec<&[u8]> = out
+        .stdout
+        .as_chunks::<{ W * H }>()
+        .0
+        .iter()
+        .map(|f| &f[..])
+        .collect();
     if frames.len() < 2 {
         return Some(hi);
     }
