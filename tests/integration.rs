@@ -191,7 +191,7 @@ fn vulkan_device_parsing_and_name_matching() {
 fn prompt_stamps_and_truncation() {
     assert_eq!(prompt::stamp(65.0), "01:05");
     let words = test_words();
-    let sys = prompt::system(3, 15, 90);
+    let sys = prompt::system(3, 15, 90, None);
     assert!(sys.contains("submit_clips"));
     let u = prompt::user(&words, &[], 30.0, 200);
     assert!(u.contains("Video duration: 30s"));

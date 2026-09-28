@@ -641,10 +641,32 @@ pub fn reacquire_frac(unseen_s: f64) -> f64 {
 /// Pending-challenger match radius (fraction of frame width): box centers
 /// are stable under size jitter where IoU is not.
 const PENDING_FRAC: f64 = 0.08;
-/// Smallest source crop height the camera may zoom to (px). Output is
-/// 1920 tall, so this bounds upscaling at ~3.6x: low-res sources stay wide
-/// instead of turning to mush (a 360p source never zooms at all).
-pub const MIN_CROP_H: f64 = 540.0;
+/// Unzoomed window for the output canvas, in source px: the largest
+/// canvas-aspect rect in the source (`x`, `y` centered), plus the fewest
+/// source rows a zoom may shrink to (bounded upscaling — see
+/// [`crate::compose::Canvas::min_crop_h`]; a 360p source on a 9:16 canvas
+/// never zooms at all).
+#[derive(Debug, Clone, Copy)]
+pub struct Base {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub min_h: f64,
+}
+
+impl Base {
+    pub fn new(src_w: f64, src_h: f64, canvas: crate::compose::Canvas) -> Self {
+        let r = canvas.base_rect(src_w, src_h);
+        Base {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+            min_h: canvas.min_crop_h(),
+        }
+    }
+}
 
 /// One raw per-sample framing target (source px, f64 — never rounded).
 /// `cut` marks a discrete change (speaker handoff, group edge, reacquire);
@@ -678,24 +700,25 @@ pub fn speech_active(words: &[Word], t: f64) -> bool {
     words.iter().any(|w| t > w.s - 0.4 && t < w.e + 0.4)
 }
 
-/// Desired 9:16 window for a face — (center-x, center-y, height-fraction) in
-/// source px → window geometry. Zoom stays generous (≤1.3x), weak
-/// detections never earn more than 1.15x, and no zoom ever crops below
-/// [`MIN_CROP_H`] source rows. Face rides ~40% from the window top.
+/// Desired canvas-aspect window for a face — (center-x, center-y,
+/// height-fraction) in source px → window geometry. Zoom stays generous
+/// (≤1.3x), weak detections never earn more than 1.15x, and no zoom ever
+/// crops below the base's `min_h` source rows. Face rides ~40% from the
+/// window top.
 pub fn window_for_face(
     cx: f64,
     cy: f64,
     frac: f64,
     src_w: f64,
     src_h: f64,
-    base_w: f64,
+    base: Base,
     score: f64,
 ) -> (f64, f64, f64, f64) {
     let zmax: f64 = if score >= 0.65 { 1.3 } else { 1.15 };
-    let zmax = zmax.min((src_h / MIN_CROP_H).max(1.0));
+    let zmax = zmax.min((base.h / base.min_h).max(1.0));
     let z = (0.38 / frac.max(0.05)).clamp(1.0, zmax);
-    let w = base_w / z;
-    let h = src_h / z;
+    let w = base.w / z;
+    let h = base.h / z;
     let x = (cx - w / 2.0).clamp(0.0, (src_w - w).max(0.0));
     let y = (cy - h * 0.4).clamp(0.0, (src_h - h).max(0.0));
     (x, y, w, h)
@@ -758,16 +781,17 @@ pub fn cluster_members<'a>(
     }
 }
 
-/// Group window for 2+ simultaneous talkers: the base (widest) 9:16 window
-/// over the whole span — or `None` when they don't fit, in which case the
-/// camera stays on the primary speaker. Never half-frames anyone: if
-/// edge-clamping would cut a member out, `None`. Pure (unit-tested).
+/// Group window for 2+ simultaneous talkers: the base (widest) canvas
+/// window over the whole span — or `None` when they don't fit, in which
+/// case the camera stays on the primary speaker. Never half-frames anyone:
+/// if edge-clamping would cut a member out, `None`. Pure (unit-tested).
 pub fn group_window(
     faces: &[&Face],
     src_w: f64,
     src_h: f64,
-    base_w: f64,
+    base: Base,
 ) -> Option<(f64, f64, f64, f64)> {
+    let base_w = base.w;
     if faces.len() < 2 {
         return None;
     }
@@ -790,7 +814,7 @@ pub fn group_window(
         x2 = src_w;
     }
     let w = base_w.min(src_w);
-    let h = (w * 16.0 / 9.0).min(src_h);
+    let h = base.h.min(src_h);
     let x = ((x1 + x2) / 2.0 - w / 2.0).clamp(0.0, (src_w - w).max(0.0));
     // Every member must survive inside (with 1px tolerance).
     for f in faces {
@@ -852,6 +876,7 @@ pub fn plan_tracks(
     duration: f64,
     range: Option<(f64, f64)>,
     words: &[Word],
+    canvas: crate::compose::Canvas,
     // Serve hooks (`None` on the CLI): per-frame progress + cancel.
     progress: Option<crate::progress::SharedPct>,
     cancel: &crate::progress::CancelFlag,
@@ -875,9 +900,9 @@ pub fn plan_tracks(
     )?;
     let sx = src_w as f64 / sample_w as f64;
 
-    let crop_w = src_h as f64 * 9.0 / 16.0;
-    let center = (src_w as f64 - crop_w).max(0.0) / 2.0;
     let (src_wf, src_hf) = (src_w as f64, src_h as f64);
+    let base = Base::new(src_wf, src_hf, canvas);
+    let crop_w = base.w;
     let cut_dist = CUT_FRAC * src_wf;
 
     let mut primary: Option<Face> = None;
@@ -1028,7 +1053,7 @@ pub fn plan_tracks(
         let group_candidate: Option<(f64, f64, f64, f64)> = if members.len() >= 2 && speech_live > 0
         {
             let fs: Vec<&Face> = members.iter().map(|(f, _)| *f).collect();
-            let w = group_window(&fs, src_wf, src_hf, crop_w);
+            let w = group_window(&fs, src_wf, src_hf, base);
             if w.is_some() {
                 let mut s = format!(
                     "group t={:.2} n={}:",
@@ -1172,11 +1197,11 @@ pub fn plan_tracks(
         // are placeholders: the planner opens on the settled speaker.
         let settling = *t - last_shot_t < SETTLE_S;
         let hold = || {
-            let (hx, hy, hw, hh) = prev_raw.unwrap_or((center, 0.0, crop_w, src_hf));
+            let (hx, hy, hw, hh) = prev_raw.unwrap_or((base.x, base.y, base.w, base.h));
             (hx, hy, hw, hh, false, prev_raw.is_none())
         };
         let (gx, gy, gw, gh, grouped, weak) = if settling {
-            (center, 0.0, crop_w, src_hf, false, true)
+            (base.x, base.y, base.w, base.h, false, true)
         } else if frozen && !silent_follow {
             hold()
         } else if group_now {
@@ -1188,7 +1213,7 @@ pub fn plan_tracks(
             match face {
                 Some((cx, cy, frac)) => {
                     let (wx, wy, ww, wh) =
-                        window_for_face(cx, cy, frac, src_wf, src_hf, crop_w, pick_score);
+                        window_for_face(cx, cy, frac, src_wf, src_hf, base, pick_score);
                     (wx, wy, ww, wh, false, false)
                 }
                 None => hold(),
@@ -1331,6 +1356,7 @@ pub fn build_segments(seen: &[(f64, bool)], end: f64) -> Vec<Seg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compose::Canvas;
 
     #[test]
     fn cluster_members_wants_close_confident_crews() {
@@ -1437,7 +1463,8 @@ mod tests {
     fn group_window_frames_crews_that_fit() {
         let src_w = 640.0;
         let src_h = 360.0;
-        let base_w = 202.5;
+        let base = Base::new(src_w, src_h, Canvas::TALL);
+        let base_w = base.w;
         let f = |x: f64, w: f64| Face {
             x,
             y: 100.0,
@@ -1447,25 +1474,25 @@ mod tests {
         };
         // Pair: shared base window, both inside.
         let (a, b) = (f(220.0, 60.0), f(300.0, 60.0));
-        let (x, _y, w, h) = group_window(&[&a, &b], src_w, src_h, base_w).expect("must fit");
+        let (x, _y, w, h) = group_window(&[&a, &b], src_w, src_h, base).expect("must fit");
         assert!((w - base_w).abs() < 1e-9 && (h - src_h).abs() < 1e-9);
         assert!(x <= 220.0 && x + w >= 360.0, "both faces inside: x={x}");
         // Trio: same deal.
         let (g, h2, i) = (f(230.0, 40.0), f(280.0, 40.0), f(330.0, 40.0));
-        let (x3, _, _, _) = group_window(&[&g, &h2, &i], src_w, src_h, base_w).expect("trio fits");
+        let (x3, _, _, _) = group_window(&[&g, &h2, &i], src_w, src_h, base).expect("trio fits");
         assert!(x3 <= 230.0 && x3 + base_w >= 370.0, "trio inside: x={x3}");
         // Spread crew: no shared window (camera stays on primary).
         let far = f(500.0, 60.0);
-        assert!(group_window(&[&a, &far], src_w, src_h, base_w).is_none());
+        assert!(group_window(&[&a, &far], src_w, src_h, base).is_none());
         // Pair at the right edge: the window may overhang the frame (the
         // renderer clamps), but both members must survive inside it.
         let (c, d) = (f(520.0, 50.0), f(580.0, 40.0));
         // NOTE: c faces have different h here; containment is x-only.
-        if let Some((x2, _, w2, _)) = group_window(&[&c, &d], src_w, src_h, base_w) {
+        if let Some((x2, _, w2, _)) = group_window(&[&c, &d], src_w, src_h, base) {
             assert!(c.x >= x2 - 1.0 && d.x + d.w <= x2 + w2 + 1.0);
         }
         // Single face: never a group.
-        assert!(group_window(&[&a], src_w, src_h, base_w).is_none());
+        assert!(group_window(&[&a], src_w, src_h, base).is_none());
     }
 
     #[test]
@@ -1491,22 +1518,42 @@ mod tests {
     fn face_zoom_stays_generous() {
         // 1080p source, small confident face: bounded zoom, never a
         // postage stamp.
-        let base = 1080.0 * 9.0 / 16.0;
-        let (.., w, h) = window_for_face(960.0, 540.0, 0.15, 1920.0, 1080.0, base, 0.9);
-        assert!(base / w <= 1.3 + 1e-9, "z={}", base / w);
-        assert!(h >= MIN_CROP_H, "resolution floor: h={h}");
+        let b = Base::new(1920.0, 1080.0, Canvas::TALL);
+        let (.., w, h) = window_for_face(960.0, 540.0, 0.15, 1920.0, 1080.0, b, 0.9);
+        assert!(b.w / w <= 1.3 + 1e-9, "z={}", b.w / w);
+        assert!(h >= b.min_h, "resolution floor: h={h}");
         // Same face, weak detection: stays wider (no zoom on doubt).
-        let (.., weak_w, _) = window_for_face(960.0, 540.0, 0.15, 1920.0, 1080.0, base, 0.5);
+        let (.., weak_w, _) = window_for_face(960.0, 540.0, 0.15, 1920.0, 1080.0, b, 0.5);
         assert!(weak_w > w, "doubt stays wide: {weak_w} vs {w}");
         // Big face: no zoom at all.
-        let (.., w2, _) = window_for_face(960.0, 540.0, 0.6, 1920.0, 1080.0, base, 0.9);
-        assert!((w2 - base).abs() < 1e-9);
+        let (.., w2, _) = window_for_face(960.0, 540.0, 0.6, 1920.0, 1080.0, b, 0.9);
+        assert!((w2 - b.w).abs() < 1e-9);
         // Low-res source: zooming would only magnify mush, so it never does.
-        let (.., w3, h3) = window_for_face(320.0, 180.0, 0.15, 640.0, 360.0, 202.5, 0.9);
+        let lo = Base::new(640.0, 360.0, Canvas::TALL);
+        let (.., w3, h3) = window_for_face(320.0, 180.0, 0.15, 640.0, 360.0, lo, 0.9);
         assert!((w3 - 202.5).abs() < 1e-9 && (h3 - 360.0).abs() < 1e-9);
         // 720p: some zoom, capped by the floor.
-        let (.., h4) = window_for_face(640.0, 360.0, 0.15, 1280.0, 720.0, 405.0, 0.9);
-        assert!(h4 >= MIN_CROP_H - 1e-9 && h4 < 720.0, "h={h4}");
+        let mid = Base::new(1280.0, 720.0, Canvas::TALL);
+        let (.., h4) = window_for_face(640.0, 360.0, 0.15, 1280.0, 720.0, mid, 0.9);
+        assert!(h4 >= mid.min_h - 1e-9 && h4 < 720.0, "h={h4}");
+    }
+
+    #[test]
+    fn windows_follow_the_canvas_aspect() {
+        // Square and 16:9 canvases on a 1080p source: every face window
+        // keeps the canvas aspect (no letterbox), and the floor scales
+        // with the smaller output (1080 rows -> 304 source rows).
+        for canvas in [Canvas::SQUARE, Canvas::WIDE, Canvas::PORTRAIT] {
+            let b = Base::new(1920.0, 1080.0, canvas);
+            assert!((b.w / b.h - canvas.aspect()).abs() < 1e-9);
+            let (_, _, w, h) = window_for_face(700.0, 400.0, 0.12, 1920.0, 1080.0, b, 0.9);
+            assert!((w / h - canvas.aspect()).abs() < 1e-9, "{canvas:?}");
+            assert!(h >= b.min_h - 1e-9);
+        }
+        assert!((Canvas::SQUARE.min_crop_h() - 303.75).abs() < 1e-9);
+        // Vertical phone source on a 16:9 canvas: width-bound, centered.
+        let v = Base::new(1080.0, 1920.0, Canvas::WIDE);
+        assert!((v.w - 1080.0).abs() < 1e-9 && (v.y - (1920.0 - 607.5) / 2.0).abs() < 1e-9);
     }
 
     #[test]

@@ -98,6 +98,28 @@ pub struct JobOptions {
     pub framing: Option<String>,
     #[serde(default)]
     pub threads: Option<usize>,
+    /// `9:16` (default), `4:5`, `1:1`, `16:9`.
+    #[serde(default)]
+    pub aspect: Option<String>,
+    /// Absent = off, `""` = each clip's title, text = that text.
+    #[serde(default)]
+    pub headline: Option<String>,
+    /// Progress bar color `#RRGGBB` (absent = off).
+    #[serde(default)]
+    pub progress_bar: Option<String>,
+    /// Logo image path + corner (`tl`/`tr`/`bl`/`br`).
+    #[serde(default)]
+    pub logo: Option<String>,
+    #[serde(default)]
+    pub logo_pos: Option<String>,
+    /// Background music path + level (dB relative to speech).
+    #[serde(default)]
+    pub music: Option<String>,
+    #[serde(default)]
+    pub music_db: Option<f64>,
+    /// Topic to steer clip picking toward.
+    #[serde(default)]
+    pub focus: Option<String>,
 }
 
 /// Persisted server settings (secrets stay server-side; the UI only ever
@@ -666,6 +688,39 @@ fn args_for(
     );
     if let Some(v) = o.threads {
         flag(&mut argv, "--threads", v.to_string());
+    }
+    if let Some(v) = o.aspect.as_ref().filter(|v| !v.trim().is_empty()) {
+        flag(&mut argv, "--aspect", v.clone());
+    }
+    // `""` = on with the default (clip title / brand yellow).
+    if let Some(v) = &o.headline {
+        if v.trim().is_empty() {
+            argv.push("--headline".into());
+        } else {
+            flag(&mut argv, "--headline", v.clone());
+        }
+    }
+    if let Some(v) = &o.progress_bar {
+        if v.trim().is_empty() {
+            argv.push("--progress-bar".into());
+        } else {
+            flag(&mut argv, "--progress-bar", v.clone());
+        }
+    }
+    if let Some(v) = o.logo.as_ref().filter(|v| !v.is_empty()) {
+        flag(&mut argv, "--logo", v.clone());
+        if let Some(p) = o.logo_pos.as_ref().filter(|p| !p.trim().is_empty()) {
+            flag(&mut argv, "--logo-pos", p.trim().to_ascii_lowercase());
+        }
+    }
+    if let Some(v) = o.music.as_ref().filter(|v| !v.is_empty()) {
+        flag(&mut argv, "--music", v.clone());
+        if let Some(db) = o.music_db {
+            flag(&mut argv, "--music-db", db.to_string());
+        }
+    }
+    if let Some(v) = o.focus.as_ref().filter(|v| !v.trim().is_empty()) {
+        flag(&mut argv, "--focus", v.clone());
     }
     let args = Args::try_parse_from(&argv).map_err(|e| anyhow::anyhow!("bad options: {e}"))?;
     Ok(args)
@@ -1665,6 +1720,47 @@ mod tests {
         assert!(a.merge.is_none());
         assert!(a.kit && a.punch && a.gpu);
         assert!(a.openrouter_key.is_none());
+    }
+
+    #[test]
+    fn creator_options_reach_args() {
+        let (src, out, o, s) = opts();
+        // Off by default: 9:16, no overlays.
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.canvas(), crate::compose::Canvas::TALL);
+        assert!(a.headline.is_none() && a.progress_bar.is_none());
+        assert!(a.logo.is_none() && a.music.is_none() && a.focus.is_none());
+        // Empty strings mean "on, default".
+        let (_, _, mut o, _) = opts();
+        o.aspect = Some("1:1".into());
+        o.headline = Some(String::new());
+        o.progress_bar = Some(String::new());
+        o.logo = Some("C:/brand/logo.png".into());
+        o.logo_pos = Some("bl".into());
+        o.music = Some("C:/brand/bed.mp3".into());
+        o.music_db = Some(-12.5);
+        o.focus = Some("pricing".into());
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.canvas(), crate::compose::Canvas::SQUARE);
+        assert_eq!(a.headline.as_deref(), Some(""));
+        assert_eq!(a.progress_bar.as_deref(), Some("#FFD400"));
+        assert_eq!(a.logo_pos, "bl");
+        assert_eq!(a.music_db, -12.5);
+        assert_eq!(a.focus.as_deref(), Some("pricing"));
+        // Explicit values pass through.
+        o.headline = Some("Big news".into());
+        o.progress_bar = Some("00e5ff".into());
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.headline.as_deref(), Some("Big news"));
+        assert_eq!(a.progress_bar.as_deref(), Some("#00E5FF"));
+        // Empty = default; a bad value is a clear error, not a silent default.
+        o.aspect = Some(String::new());
+        o.logo_pos = Some(" ".into());
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.canvas(), crate::compose::Canvas::TALL);
+        assert_eq!(a.logo_pos, "tr");
+        o.aspect = Some("3:1".into());
+        assert!(args_for(&src, &out, &o, &s).is_err());
     }
 
     #[test]
