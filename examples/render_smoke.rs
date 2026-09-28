@@ -176,7 +176,9 @@ fn main() {
         "decode luma",
     );
     let flashes: Vec<f64> = luma
-        .chunks_exact(32 * 18)
+        .as_chunks::<{ 32 * 18 }>()
+        .0
+        .iter()
         .enumerate()
         .filter(|(_, f)| f.iter().map(|&v| v as u32).sum::<u32>() / (32 * 18) > 128)
         .map(|(i, _)| i as f64 / 30.0)
@@ -199,8 +201,10 @@ fn main() {
         "decode audio",
     );
     let samples: Vec<i16> = pcm
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| i16::from_le_bytes(b))
         .collect();
     let mut clicks = Vec::new();
     let mut quiet = 0usize;
