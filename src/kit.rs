@@ -146,6 +146,12 @@ const QUESTION_OPEN: &[&str] = &[
 ];
 /// Tails that make a "question" a tag on a statement ("…, right?").
 const TAG_TAIL: &[&str] = &["right", "okay", "ok", "yeah", "huh", "no", "correct", "yes"];
+/// Last words that mean the transcript cut the thought off ("Who is
+/// actually had?"): a sentence never really ends on these.
+const DANGLING_TAIL: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "because", "my", "your", "our", "their", "had", "been",
+    "being",
+];
 
 /// A sentence as a standalone headline: `(score, text)`, or `None` when
 /// it doesn't read well on its own. `t` = when it starts (s into the clip).
@@ -167,6 +173,7 @@ fn headline_candidate(sentence: &str, t: f64) -> Option<(f64, String)> {
     }
     let lower: Vec<String> = ws.iter().map(|w| clean(w)).collect();
     if DANGLING_OPEN.contains(&lower[0].as_str())
+        || DANGLING_TAIL.contains(&lower[lower.len() - 1].as_str())
         || lower
             .iter()
             .any(|w| matches!(w.as_str(), "um" | "uh" | "uhm" | "mm" | "hmm"))
@@ -350,6 +357,9 @@ mod tests {
         assert_eq!(headline_for("Raise your hand, right?", &[]), None);
         // Too short to say anything (a transcription gap, usually).
         assert_eq!(headline_for("Who here before?", &[]), None);
+        // Cut off mid-thought.
+        assert_eq!(headline_for("Who is actually had?", &[]), None);
+        assert_eq!(headline_for("I went out and bought the.", &[]), None);
         assert_eq!(
             headline_for("Here's not using more than $20 version?", &[]),
             None
