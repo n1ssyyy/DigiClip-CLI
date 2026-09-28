@@ -128,10 +128,13 @@ pub struct JobOptions {
 /// Persisted server settings (secrets stay server-side; the UI only ever
 /// sees `key_set`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Settings {
     openrouter_key: Option<String>,
     openrouter_model: Option<String>,
     stt_model: String,
+    /// Spoken language for transcription: a whisper code or `auto`.
+    stt_lang: String,
     gpu: bool,
     clips_count: usize,
     caption_default: String,
@@ -145,6 +148,7 @@ impl Default for Settings {
             openrouter_key: None,
             openrouter_model: None,
             stt_model: "base.en".into(),
+            stt_lang: "en".into(),
             gpu: true,
             clips_count: 3,
             caption_default: "karaoke".into(),
@@ -159,6 +163,7 @@ struct SettingsPublic {
     key_set: bool,
     openrouter_model: Option<String>,
     stt_model: String,
+    stt_lang: String,
     gpu: bool,
     clips_count: usize,
     caption_default: String,
@@ -172,6 +177,7 @@ impl Settings {
             key_set: self.openrouter_key.as_ref().is_some_and(|k| !k.is_empty()),
             openrouter_model: self.openrouter_model.clone(),
             stt_model: self.stt_model.clone(),
+            stt_lang: self.stt_lang.clone(),
             gpu: self.gpu,
             clips_count: self.clips_count,
             caption_default: self.caption_default.clone(),
@@ -494,6 +500,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A transcription language whisper takes: `auto` or a 2-3 letter code
+/// (`en`, `es`, `haw`…). Anything else is dropped.
+fn valid_lang(v: &str) -> Option<String> {
+    let v = v.trim().to_ascii_lowercase();
+    (v == "auto" || (2..=3).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_lowercase()))
+        .then_some(v)
+}
+
 fn jobs_root() -> PathBuf {
     crate::provision::root().join("jobs")
 }
@@ -669,7 +683,10 @@ fn args_for(
     flag(
         &mut argv,
         "--lang",
-        o.lang.clone().unwrap_or_else(|| "en".into()),
+        o.lang
+            .as_deref()
+            .and_then(valid_lang)
+            .unwrap_or_else(|| s.stt_lang.clone()),
     );
     flag(
         &mut argv,
@@ -1208,6 +1225,11 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                     s.stt_model = v.to_string();
                 }
             }
+            if let Some(v) = patch.get("stt_lang").and_then(|v| v.as_str()) {
+                if let Some(l) = valid_lang(v) {
+                    s.stt_lang = l;
+                }
+            }
             if let Some(v) = patch.get("gpu").and_then(|v| v.as_bool()) {
                 s.gpu = v;
             }
@@ -1739,6 +1761,29 @@ mod tests {
         assert_eq!(args_for(&src, &out, &o, &s).unwrap().caption_anim, "words");
         o.caption_anim = Some("bogus".into());
         assert_eq!(args_for(&src, &out, &o, &s).unwrap().caption_anim, "pop");
+    }
+
+    #[test]
+    fn transcription_language_reaches_args() {
+        let (src, out, mut o, mut s) = opts();
+        assert_eq!(args_for(&src, &out, &o, &s).unwrap().lang, "en");
+        s.stt_lang = "auto".into();
+        assert_eq!(args_for(&src, &out, &o, &s).unwrap().lang, "auto");
+        o.lang = Some("ES".into());
+        assert_eq!(args_for(&src, &out, &o, &s).unwrap().lang, "es");
+        o.lang = Some("-m evil".into());
+        assert_eq!(args_for(&src, &out, &o, &s).unwrap().lang, "auto");
+    }
+
+    #[test]
+    fn old_settings_files_keep_their_values() {
+        // A settings.json written before a field existed still loads.
+        let s: Settings =
+            serde_json::from_str(r#"{"stt_model":"large-v3-turbo","gpu":false}"#).unwrap();
+        assert_eq!(s.stt_model, "large-v3-turbo");
+        assert!(!s.gpu);
+        assert_eq!(s.stt_lang, "en");
+        assert_eq!(s.clips_count, 3);
     }
 
     #[test]

@@ -124,6 +124,7 @@ digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked un
 | `OPENROUTER_API_KEY` / `--openrouter-key` | — | Unlocks LLM clip picking (without it, the offline scorer runs). |
 | `OPENROUTER_MODEL` / `--openrouter-model` | `nvidia/nemotron-3-ultra-550b-a55b:free` | Scoring model. |
 | `--model` | `base.en` | Whisper model: `tiny.en`, `base.en`, `large-v3-turbo(-q5_0)`, `large-v3`. |
+| `--lang` | `en` | Spoken language (`es`, `de`, `ja`…) or `auto` to detect it. Needs a multilingual model; `.en` models always transcribe English. Serve setting: `stt_lang`. |
 | `--gpu` | `true` | GPU everything: NVENC / VideoToolbox renders, DirectML tracking, Vulkan STT. |
 | `--style` | `karaoke` | `tiktok` · `karaoke` · `hormozi` · `minimal` · `beast` · `neon` · `highlight` · `ghost` |
 | `DIGICLIP_RENDER_JOBS` | auto | How many clips render at once. |

@@ -126,10 +126,18 @@ pub fn transcribe_embedded(wav: &Path, opts: &SttOptions) -> anyhow::Result<Tran
         }
     }
 
+    // `auto` reports what whisper actually detected.
+    let language = if opts.lang == "auto" {
+        whisper_rs::get_lang_str(state.full_lang_id_from_state())
+            .unwrap_or("auto")
+            .to_string()
+    } else {
+        opts.lang.clone()
+    };
     Ok(Transcription {
         words,
         segments,
-        language: opts.lang.clone(),
+        language,
         model: opts.model.clone(),
     })
 }
