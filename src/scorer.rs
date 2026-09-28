@@ -200,9 +200,7 @@ pub fn propose(words: &[Word], count: usize, ctx: &Heuristic) -> Vec<RawClip> {
         let mut a = sent.start;
         let mut b = sent.end;
         while b - a < want && (a > 0 || b < words.len()) {
-            if a > 0 {
-                a -= 1;
-            }
+            a = a.saturating_sub(1);
             if b - a >= want || b >= words.len() {
                 break;
             }

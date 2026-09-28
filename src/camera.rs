@@ -599,18 +599,18 @@ fn plan_shot(
             .map(|n| n.at)
             .unwrap_or(len);
         let end = (m.start + m.dur).min(len).min(cap);
-        for k in m.start..end {
+        for (k, p) in path.iter_mut().enumerate().take(end).skip(m.start) {
             let u = (k + 1 - m.start) as f64 / m.dur as f64;
-            path[k] = from.lerp(&to, smootherstep(u));
+            *p = from.lerp(&to, smootherstep(u));
         }
         // The move's own tail belongs to the new hold.
         let next = moves.get(i + 1).map(|n| n.start).unwrap_or(len);
-        for k in end..next.min(len) {
-            path[k] = to;
+        for p in path.iter_mut().take(next.min(len)).skip(end) {
+            *p = to;
         }
         // Framing class flips mid-glide (a dolly lands as its target kind).
-        for k in m.start..end.min(len) {
-            kinds[k] = merged[i + 1].3;
+        for kd in kinds.iter_mut().take(end.min(len)).skip(m.start) {
+            *kd = merged[i + 1].3;
         }
     }
     // --- 5. continuous follow ----------------------------------------------------

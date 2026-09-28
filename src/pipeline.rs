@@ -12,7 +12,7 @@
 //! - clips mode: `clip-01-9x16.mp4` (tag follows `--aspect`) + `clip-01.ass/srt`, `clips.json`
 //! - full mode: `full-9x16.mp4` + `full.ass/srt`
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::audio::Envelope;
 use crate::camera::{self, Kind, Pose, Target};
@@ -155,11 +155,6 @@ fn out_dir_for(input: &std::path::Path, out_dir: &Option<PathBuf>) -> PathBuf {
     parent.join(format!("{stem}-digiclip"))
 }
 
-/// Resolve framing to a tracked timeline over `[a, b)`. Smart runs the
-/// YuNet tracker (session created once, reused); any failure degrades to
-/// center (None) with a warning (never fatal). Tracking only picked ranges
-/// keeps it fast on long sources.
-#[allow(clippy::too_many_arguments)]
 /// Smart candidates: LLM scoring with heuristic fallback.
 async fn pick_smart(
     ocfg: &crate::openrouter::Config,
@@ -320,9 +315,14 @@ fn punch_windows(
     w
 }
 
+/// Resolve framing to a tracked timeline over `[a, b)`. Smart runs the
+/// YuNet tracker (session created once, reused); any failure degrades to
+/// center (None) with a warning (never fatal). Tracking only picked ranges
+/// keeps it fast on long sources.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_timeline(
     args: &Args,
-    ffmpeg: &PathBuf,
+    ffmpeg: &Path,
     tracker: &mut Option<crate::track::Tracker>,
     gpu_on: bool,
     src_w: u32,
@@ -1013,7 +1013,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             });
             println!("done: {} (encoder {enc})", mp4.display());
             tracing::info!("TOTAL took {:.1}s", t_total.elapsed().as_secs_f64());
-            return Ok(vec![artifact]);
+            Ok(vec![artifact])
         }
         Mode::Clips => {
             // --- clip picking FIRST (transcript only) -----------------------
@@ -1507,7 +1507,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             emit.stage(Stage::Render, Some(100));
             println!("done: {} clip(s) in {}", jobs.len(), out.display());
             tracing::info!("TOTAL took {:.1}s", t_total.elapsed().as_secs_f64());
-            return Ok(report);
+            Ok(report)
         }
     }
 }
@@ -1889,14 +1889,19 @@ async fn plan_render(
         flash = vec![0.0f32; total_frames];
         let d = ((0.15 * r).round() as usize).max(1);
         for &b in &part_frame0[1..parts.len()] {
-            for k in b.saturating_sub(d)..(b + d).min(total_frames) {
+            let span = flash
+                .iter_mut()
+                .enumerate()
+                .take((b + d).min(total_frames))
+                .skip(b.saturating_sub(d));
+            for (k, f) in span {
                 let u = if k < b {
                     (k + 1 + d - b) as f32 / d as f32
                 } else {
                     1.0 - (k - b) as f32 / d as f32
                 };
                 let u = u.clamp(0.0, 1.0);
-                flash[k] = flash[k].max(u * u * (3.0 - 2.0 * u));
+                *f = f.max(u * u * (3.0 - 2.0 * u));
             }
         }
     }
@@ -2097,7 +2102,7 @@ fn exact_fit(
             .map(|w| w.e)
             .fold(f64::INFINITY, f64::min)
             .min(duration);
-        if !(clip.end_s > clip.start_s) {
+        if clip.end_s.partial_cmp(&clip.start_s) != Some(std::cmp::Ordering::Greater) {
             clip.end_s = t;
         }
         plan = tighten(clip.start_s, clip.end_s, words, cfg);

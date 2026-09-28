@@ -104,6 +104,7 @@ pub struct ClipArtifact {
 /// percent repeats); the CLI ignores them.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum JobEvent {
     /// A stage started (`pct: None`) or reported progress.
     Stage {
@@ -211,11 +212,7 @@ impl Emitter {
         let id = id.to_string();
         let last = std::sync::Mutex::new(None::<u64>);
         Some(Box::new(move |done: u64, total: u64| {
-            let pct = if total > 0 {
-                done.saturating_mul(100) / total
-            } else {
-                0
-            };
+            let pct = done.saturating_mul(100).checked_div(total).unwrap_or(0);
             let mut l = match last.lock() {
                 Ok(l) => l,
                 Err(_) => return,

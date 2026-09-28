@@ -125,6 +125,7 @@ impl Default for TightenCfg {
 /// - Light: pauses longer than pause_above shrink to pause_keep (kept at
 ///   the gap head, a natural beat). Never deletes words.
 /// - Punchy: light + filler words go (padded 80ms), merged with pauses.
+///
 /// Guards: keeps <0.4s absorb (no strobing slivers); if the plan would
 /// remove >60% or leave <4s, it relaxes a level (punchy->light->off).
 pub fn tighten(start: f64, end: f64, words: &[Word], cfg: &TightenCfg) -> CutPlan {

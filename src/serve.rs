@@ -353,6 +353,7 @@ struct ClientMsg {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     Hello,
     JobStart {
@@ -393,6 +394,7 @@ enum Cmd {
 /// One server frame: a correlated `res` or an async `ev`.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 enum ServerMsg {
     Res {
         id: u64,
@@ -1260,11 +1262,8 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 let fwd = tokio::spawn(async move {
                     while let Some(ev) = rx.recv().await {
                         if let JobEvent::ModelsProgress { done, total, .. } = ev {
-                            let pct = if total > 0 {
-                                (done.saturating_mul(100) / total) as u8
-                            } else {
-                                0
-                            };
+                            let pct =
+                                done.saturating_mul(100).checked_div(total).unwrap_or(0) as u8;
                             {
                                 let mut runs = st3.model_runs.lock().await;
                                 if let Some(r) = runs.get_mut(&mid3) {
@@ -1658,7 +1657,7 @@ pub async fn run_serve(
     token: Option<String>,
     data_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let data_dir = data_dir.unwrap_or_else(|| crate::provision::root());
+    let data_dir = data_dir.unwrap_or_else(crate::provision::root);
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(jobs_root())?;
     let token = token.filter(|t| !t.is_empty()).unwrap_or_else(|| {
