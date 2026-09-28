@@ -213,6 +213,22 @@ pub struct Args {
     #[arg(long)]
     pub openrouter_model: Option<String>,
 
+    /// System One model that judges clip candidates (hook, stands alone,
+    /// finished thought, payoff, shareable; focus and caption look):
+    /// `jev` (TypeSafe AI, needs --jev-key), `laya` (local, English,
+    /// ~1.6 GB downloaded once), `auto` (Jev with a key, else Laya when
+    /// downloaded) or `off`.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub decider: crate::decide::Pick,
+
+    /// TypeSafe Jev API key (or set JEV_API_KEY).
+    #[arg(long)]
+    pub jev_key: Option<String>,
+
+    /// Jev model (default `jev-latest`).
+    #[arg(long)]
+    pub jev_model: Option<String>,
+
     /// Framing for 9:16 renders: `center` (static center-crop),
     /// `plan` (load a per-second crop plan JSON via --crop-plan), or
     /// `smart` (YuNet face tracker, auto-downloaded once, offline after).

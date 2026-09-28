@@ -101,6 +101,10 @@ pub struct JobOptions {
     /// Two-person layout: "auto" | "single" | "split".
     #[serde(default)]
     pub layout: Option<String>,
+    /// System One judge: "auto" | "jev" | "laya" | "off" (absent = the
+    /// settings default).
+    #[serde(default)]
+    pub decider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -151,6 +155,10 @@ struct Settings {
     caption_default: String,
     tighten: String,
     punch: bool,
+    /// TypeSafe Jev key (System One judging); never leaves the server.
+    jev_key: Option<String>,
+    /// Default System One judge: "auto" | "jev" | "laya" | "off".
+    decider: String,
     /// Watch folder: new videos dropped here start jobs with
     /// `watch_options`.
     watch_dir: Option<String>,
@@ -179,6 +187,8 @@ impl Default for Settings {
             caption_default: "karaoke".into(),
             tighten: "light".into(),
             punch: true,
+            jev_key: None,
+            decider: "auto".into(),
             watch_dir: None,
             watch_on: false,
             watch_options: JobOptions::default(),
@@ -198,6 +208,8 @@ struct SettingsPublic {
     caption_default: String,
     tighten: String,
     punch: bool,
+    jev_key_set: bool,
+    decider: String,
     watch_dir: Option<String>,
     watch_on: bool,
     watch_options: JobOptions,
@@ -216,6 +228,8 @@ impl Settings {
             caption_default: self.caption_default.clone(),
             tighten: self.tighten.clone(),
             punch: self.punch,
+            jev_key_set: self.jev_key.as_ref().is_some_and(|k| !k.is_empty()),
+            decider: self.decider.clone(),
             watch_dir: self.watch_dir.clone(),
             watch_on: self.watch_on,
             watch_options: self.watch_options.clone(),
@@ -381,6 +395,8 @@ impl LiveJob {
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct ModelState {
+    /// "stt" (whisper) or "decider" (Laya).
+    kind: &'static str,
     size_mb: u64,
     downloaded: bool,
     downloading: bool,
@@ -466,10 +482,14 @@ enum Cmd {
         patch: serde_json::Value,
     },
     ModelsState,
+    /// `model`, not `id`: a param named `id` would overwrite the frame id
+    /// when the client spreads params into the frame.
     ModelsDownload {
+        #[serde(rename = "model")]
         id: String,
     },
     ModelsDelete {
+        #[serde(rename = "model")]
         id: String,
     },
     HealthGet,
@@ -608,6 +628,9 @@ struct ModelRun {
     error: Option<String>,
 }
 
+/// Model id of the Laya bundle in the model list.
+const LAYA: &str = "laya";
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -621,6 +644,12 @@ fn valid_lang(v: &str) -> Option<String> {
     let v = v.trim().to_ascii_lowercase();
     (v == "auto" || (2..=3).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_lowercase()))
         .then_some(v)
+}
+
+/// A `--decider` value, or none.
+fn valid_decider(v: &str) -> Option<String> {
+    let v = v.trim().to_ascii_lowercase();
+    matches!(v.as_str(), "auto" | "jev" | "laya" | "off").then_some(v)
 }
 
 fn jobs_root() -> PathBuf {
@@ -665,6 +694,7 @@ impl AppState {
             out.insert(
                 id.to_string(),
                 ModelState {
+                    kind: "stt",
                     size_mb: meta.size_mb,
                     downloaded: crate::models::is_downloaded(id),
                     downloading: run.is_some_and(|r| r.downloading),
@@ -673,6 +703,18 @@ impl AppState {
                 },
             );
         }
+        let run = runs.get(LAYA);
+        out.insert(
+            LAYA.to_string(),
+            ModelState {
+                kind: "decider",
+                size_mb: crate::decide::laya::SIZE_MB,
+                downloaded: crate::decide::laya::is_ready(),
+                downloading: run.is_some_and(|r| r.downloading),
+                progress: run.and_then(|r| r.progress),
+                error: run.and_then(|r| r.error.clone()),
+            },
+        );
         out
     }
 
@@ -818,6 +860,18 @@ fn args_for(
     if let Some(m) = s.openrouter_model.clone().filter(|m| !m.is_empty()) {
         flag(&mut argv, "--openrouter-model", m);
     }
+    if let Some(k) = s.jev_key.clone().filter(|k| !k.is_empty()) {
+        flag(&mut argv, "--jev-key", k);
+    }
+    flag(
+        &mut argv,
+        "--decider",
+        o.decider
+            .as_deref()
+            .and_then(valid_decider)
+            .or_else(|| valid_decider(&s.decider))
+            .unwrap_or_else(|| "auto".into()),
+    );
     flag(
         &mut argv,
         "--framing",
@@ -1436,6 +1490,20 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             if let Some(v) = patch.get("openrouter_model").and_then(|v| v.as_str()) {
                 s.openrouter_model = Some(v.to_string());
             }
+            match patch.get("jev_key") {
+                Some(serde_json::Value::String(v)) if !v.trim().is_empty() => {
+                    s.jev_key = Some(v.trim().to_string())
+                }
+                Some(serde_json::Value::Null) => s.jev_key = None,
+                _ => {}
+            }
+            if let Some(v) = patch
+                .get("decider")
+                .and_then(|v| v.as_str())
+                .and_then(valid_decider)
+            {
+                s.decider = v;
+            }
             if let Some(v) = patch.get("stt_model").and_then(|v| v.as_str()) {
                 if crate::models::meta(v).is_ok() {
                     s.stt_model = v.to_string();
@@ -1500,7 +1568,7 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             vec![ok(id, Some(serde_json::json!({ "models": models })))]
         }
         Cmd::ModelsDownload { id: mid } => {
-            if crate::models::meta(&mid).is_err() {
+            if mid != LAYA && crate::models::meta(&mid).is_err() {
                 return vec![err(id, format!("unknown model [{mid}]"))];
             }
             {
@@ -1529,7 +1597,15 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<JobEvent>();
                 let emit = Emitter::new(tx);
                 let hook = emit.byte_hook(&mid);
-                let dl = crate::models::download_with(&mid, hook.as_deref());
+                let dl = async {
+                    if mid == LAYA {
+                        crate::decide::laya::download(hook.map(Arc::from))
+                            .await
+                            .map(|_| PathBuf::new())
+                    } else {
+                        crate::models::download_with(&mid, hook.as_deref()).await
+                    }
+                };
                 // Forward byte progress while downloading.
                 let st3 = st2.clone();
                 let mid3 = mid.clone();
@@ -1603,7 +1679,7 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             vec![ok(id, None)]
         }
         Cmd::ModelsDelete { id: mid } => {
-            if crate::models::meta(&mid).is_err() {
+            if mid != LAYA && crate::models::meta(&mid).is_err() {
                 return vec![err(id, format!("unknown model [{mid}]"))];
             }
             {
@@ -1612,9 +1688,15 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                     return vec![err(id, "download in progress")];
                 }
             }
-            match crate::models::file_for(&mid) {
-                Ok(p) => {
-                    let _ = std::fs::remove_file(&p);
+            let gone = if mid == LAYA {
+                crate::decide::laya::remove().map_err(anyhow::Error::from)
+            } else {
+                crate::models::file_for(&mid).map(|p| {
+                    let _ = std::fs::remove_file(p);
+                })
+            };
+            match gone {
+                Ok(()) => {
                     let runs = st.model_runs.lock().await;
                     let models = st.models_state(&runs);
                     let _ = st.bus.send(ServerMsg::Ev {
@@ -2488,6 +2570,26 @@ mod tests {
     }
 
     #[test]
+    fn decider_follows_settings_then_job() {
+        use crate::decide::Pick;
+        let (src, out, mut o, mut s) = opts();
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.decider, Pick::Auto);
+        assert!(a.jev_key.is_none());
+        s.jev_key = Some("jev-test-key".into());
+        s.decider = "laya".into();
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.decider, Pick::Laya);
+        assert_eq!(a.jev_key.as_deref(), Some("jev-test-key"));
+        o.decider = Some("off".into());
+        assert_eq!(args_for(&src, &out, &o, &s).unwrap().decider, Pick::Off);
+        // Junk falls back to the settings default.
+        o.decider = Some("gpt".into());
+        assert_eq!(args_for(&src, &out, &o, &s).unwrap().decider, Pick::Laya);
+        assert!(s.public().jev_key_set);
+    }
+
+    #[test]
     fn clip_edit_frames_parse() {
         let m: ClientMsg = serde_json::from_str(
             r#"{"id":3,"cmd":"clip_edit","job":"job-1","rank":2,"end_s":41.5,
@@ -2515,6 +2617,17 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(m.cmd, Cmd::ClipAdd { .. }));
+    }
+
+    #[test]
+    fn model_frames_keep_their_frame_id() {
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"id":5,"cmd":"models_download","model":"laya"}"#).unwrap();
+        assert_eq!(m.id, 5);
+        assert!(matches!(m.cmd, Cmd::ModelsDownload { ref id } if id == "laya"));
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"id":6,"cmd":"models_delete","model":"base.en"}"#).unwrap();
+        assert!(matches!(m.cmd, Cmd::ModelsDelete { ref id } if id == "base.en"));
     }
 
     #[test]

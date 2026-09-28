@@ -275,7 +275,11 @@ pub fn hashtags_for(clip: &Clip, words: &[Word]) -> Vec<String> {
 pub fn body_for(clip: &Clip, words: &[Word]) -> String {
     let title = title_for(clip, words);
     let mut desc = clip.hook_line.trim().to_string();
-    if !clip.why_it_works.trim().is_empty() {
+    // Picker notes (heuristic placeholder, System One scorecards) are for
+    // the app's "why this clip", not for viewers.
+    let why = clip.why_it_works.trim();
+    let note = why.starts_with("Offline heuristic") || why.contains("Judged by ");
+    if !why.is_empty() && !note {
         if !desc.is_empty() {
             desc.push(' ');
         }
@@ -324,6 +328,18 @@ mod tests {
             caption_style: "karaoke".into(),
             source: "t".into(),
         }
+    }
+
+    #[test]
+    fn picker_notes_stay_out_of_the_upload_text() {
+        let words = tw("Why is this airplane so fast today.");
+        let mut c = clip();
+        c.why_it_works = "Strong opening hook (90%). Judged by laya.".into();
+        assert!(!body_for(&c, &words).contains("Judged by"));
+        c.why_it_works = "Offline heuristic pick (no LLM key set).".into();
+        assert!(!body_for(&c, &words).contains("Offline"));
+        c.why_it_works = "A contrarian take people argue about.".into();
+        assert!(body_for(&c, &words).contains("contrarian take"));
     }
 
     #[test]
