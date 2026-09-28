@@ -355,6 +355,8 @@ pub struct Look {
     pub logo: Option<Logo>,
     /// Background music and its bed level (dB relative to the speech).
     pub music: Option<(PathBuf, f64)>,
+    /// Caption motion.
+    pub anim: crate::captions::ass::Anim,
 }
 
 /// Everything one render needs.
@@ -715,6 +717,7 @@ fn measure_loudness(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
+    crate::process::gentle(&child);
     let (status, err) = wait_cancellable(child, cancel)?;
     if !status.success() {
         anyhow::bail!("measure pass failed: {}", tail(&err, 400));
@@ -825,6 +828,7 @@ fn run(
         job.fps.1
     );
     let mut enc = enc_cmd.spawn()?;
+    crate::process::gentle(&enc);
     let enc_err = enc.stderr.take().map(drain);
     let enc_in = enc
         .stdin
@@ -1046,6 +1050,7 @@ fn decode_spans(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        crate::process::gentle(&child);
         let err = child.stderr.take().map(drain);
         let mut out = child
             .stdout

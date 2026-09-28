@@ -5,27 +5,24 @@
 //! is planned offline like an editor would, not chased like a live
 //! follower:
 //!
-//! 1. **Dense desired signal.** Targets (8–15 Hz detections) become a
-//!    per-frame signal: linear between samples, stepped at framing changes,
-//!    placeholders (dropouts, silence holds, post-cut settles) filled from
-//!    the nearest real evidence, then median-filtered to kill spikes.
-//! 2. **Holds (dead zone).** The camera locks off and stays put while the
-//!    subject moves inside a dead zone around the framing. Only a
-//!    *sustained* exit (or a confirmed handoff) starts a new hold, whose
-//!    pose is the median of everything it covers. A locked camera is the
-//!    most professional shot there is; it also means detection noise can
-//!    never become camera shake.
-//! 3. **Moves.** Between holds the camera either *cuts* or *glides*:
-//!    - reframes near an edit jump-cut snap onto the cut (the edit hides
-//!      them);
-//!    - speaker switches between people who don't share a frame cut on the
-//!      new speaker's first word (no whip-pan across the table);
-//!    - layout changes (close-up <-> letterboxed wide) cut too;
-//!    - everything else glides on a smootherstep ease (zero velocity and
-//!      acceleration at both ends) timed by distance, and starts slightly
-//!      *before* the need (offline anticipation instead of lag).
-//! 4. A light zero-phase smoothing rounds chained moves; shot cuts and
-//!    snaps are never smoothed across.
+//! 1. **Evidence.** Real sightings only: placeholders (dropouts, post-cut
+//!    settles) carry no information and are bridged, never copied.
+//!    Speaker handoffs are moved back to the new speaker's first word.
+//! 2. **Dense desired signal.** Linear between sightings, stepped at
+//!    framing changes, median-filtered against spikes, with a confidence
+//!    weight that fades inside long gaps.
+//! 3. **Snaps.** Some moves are cuts, not pans: switches between people
+//!    who don't share a frame (landing on the first word), layout changes
+//!    (close-up <-> letterboxed wide), and any reframe near an edit
+//!    jump-cut (the edit hides it). Framings that would only blink on
+//!    screen before a cut are skipped.
+//! 4. **Path.** Between snaps each channel (pan, tilt, zoom) is the
+//!    smoothest path that keeps the subject inside a dead band around the
+//!    framing ([`solve_band`]): detection jitter and fidgeting cost
+//!    nothing so the camera stays locked off; a subject that walks is
+//!    followed by one continuous, eased move that starts early and lands
+//!    softly — never stop-and-go. A stiff safe band caps how far a fast
+//!    subject may lead the camera.
 //!
 //! Emphasis punch-ins are a separate layer ([`apply_punches`]): a fast
 //! eased zoom anchored on the speaker's face (the face stays put on
@@ -74,71 +71,70 @@ pub struct Pose {
     pub kind: Kind,
 }
 
-/// Planner tuning. Dead zones are fractions of the current window.
+/// Planner tuning. Bands are fractions of the current window.
 #[derive(Debug, Clone)]
 pub struct CamCfg {
-    /// Horizontal dead zone (fraction of window width).
-    pub dz_x: f64,
-    /// Vertical dead zone (fraction of window height).
-    pub dz_y: f64,
-    /// Zoom dead zone (|ln size ratio|).
-    pub dz_z: f64,
-    /// A drift must stay outside the dead zone this long to reframe (s).
-    pub persist_s: f64,
-    /// Lookahead used to pick a new hold's provisional pose (s).
-    pub look_s: f64,
+    /// Dead band: the subject moving within ±band of the framing costs
+    /// nothing, so detection jitter and fidgeting never move the camera
+    /// (x: fraction of window width, y: of window height).
+    pub band_x: f64,
+    pub band_y: f64,
+    /// Zoom dead band (|ln size ratio|).
+    pub band_z: f64,
+    /// Safe band: the camera may trail a fast subject, but never by more
+    /// than this (a stiff constraint, not a preference).
+    pub safe_x: f64,
+    pub safe_y: f64,
+    /// Response time (s): the shortest period the camera reproduces for
+    /// pans, tilts and zooms. Longer reads calmer; shorter follows tighter.
+    pub pan_s: f64,
+    pub tilt_s: f64,
+    pub zoom_s: f64,
+    /// Response time of the punch anchor (the face the zoom holds still).
+    pub anchor_s: f64,
     /// Spike-killing median window on the desired signal (s).
     pub median_s: f64,
-    /// Handoffs this far apart (fraction of window width) cut, not glide.
+    /// Handoffs this far apart (fraction of window width) cut, not pan.
     pub switch_cut_frac: f64,
     /// Changes between a crop and the letterboxed wide cut instead of
     /// morphing (a layout change, like a multicam edit — not a zoom).
     pub layout_cut: bool,
     /// Reframes within this distance of an edit jump-cut snap onto it (s).
     pub jump_win_s: f64,
-    /// Glide duration = clamp(base + per * distance, min, max) (s).
+    /// Handoff cuts snap to an utterance onset within this lookback (s).
+    pub onset_back_s: f64,
+    /// Handoff glide duration = clamp(base + per * distance, min, max) (s).
     pub glide_base_s: f64,
     pub glide_per_s: f64,
     pub glide_min_s: f64,
     pub glide_max_s: f64,
-    /// Handoff moves start this long before the new speaker's onset (s).
-    pub lead_s: f64,
-    /// Zero-phase smoothing sigma applied to the final path (s).
-    pub smooth_s: f64,
-    /// Handoff cuts snap to an utterance onset within this lookback (s).
-    pub onset_back_s: f64,
-    /// Drift reframes closer together than this chain into one continuous
-    /// follow (a walking presenter) instead of stop-and-go moves (s).
-    pub track_hold_s: f64,
-    /// Smoothing sigma of that continuous follow (s).
-    pub track_sigma_s: f64,
+    /// A framing must be on screen at least this long, or it is skipped
+    /// (a blink of a framing right before a cut reads as a glitch) (s).
+    pub min_show_s: f64,
 }
 
 impl Default for CamCfg {
     fn default() -> Self {
-        // Dead zones follow AutoFlip's static-by-default bias (hold while
-        // the subject stays within ~±12% of the window); switches farther
-        // than half a window cut rather than whip-pan; glides are
-        // smootherstep over 0.45–1.0 s by distance.
         Self {
-            dz_x: 0.12,
-            dz_y: 0.08,
-            dz_z: 0.12,
-            persist_s: 0.45,
-            look_s: 0.8,
-            median_s: 0.33,
+            band_x: 0.05,
+            band_y: 0.04,
+            band_z: 0.06,
+            safe_x: 0.2,
+            safe_y: 0.14,
+            pan_s: 1.3,
+            tilt_s: 1.8,
+            zoom_s: 2.6,
+            anchor_s: 0.35,
+            median_s: 0.5,
             switch_cut_frac: 0.5,
             layout_cut: true,
             jump_win_s: 0.5,
-            glide_base_s: 0.4,
-            glide_per_s: 0.5,
-            glide_min_s: 0.45,
-            glide_max_s: 1.0,
-            lead_s: 0.1,
-            smooth_s: 0.08,
             onset_back_s: 1.2,
-            track_hold_s: 1.6,
-            track_sigma_s: 0.4,
+            glide_base_s: 0.5,
+            glide_per_s: 0.6,
+            glide_min_s: 0.6,
+            glide_max_s: 1.2,
+            min_show_s: 0.8,
         }
     }
 }
@@ -160,7 +156,7 @@ pub struct PlanInput<'a> {
     pub canvas: crate::compose::Canvas,
 }
 
-/// Channel vector: center x/y, ln width, ln height.
+/// Channel vector: center x/y, ln width, ln height, punch anchor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Ch {
     cx: f64,
@@ -196,13 +192,13 @@ impl Ch {
             ay: l(self.ay, o.ay),
         }
     }
-    /// Dead-zone-normalized deviation of `o` from this framing (>1 = out).
+    /// Band-normalized deviation of `o` from this framing (>1 = outside).
     fn dev(&self, o: &Ch, cfg: &CamCfg) -> f64 {
         let (w, h) = (self.lw.exp(), self.lh.exp());
-        ((o.cx - self.cx).abs() / (cfg.dz_x * w))
-            .max((o.cy - self.cy).abs() / (cfg.dz_y * h))
-            .max((o.lw - self.lw).abs() / cfg.dz_z)
-            .max((o.lh - self.lh).abs() / cfg.dz_z)
+        ((o.cx - self.cx).abs() / (cfg.band_x * w))
+            .max((o.cy - self.cy).abs() / (cfg.band_y * h))
+            .max((o.lw - self.lw).abs() / cfg.band_z)
+            .max((o.lh - self.lh).abs() / cfg.band_z)
     }
     /// Move distance in "screens" (drives glide time).
     fn dist(&self, o: &Ch) -> f64 {
@@ -212,6 +208,19 @@ impl Ch {
             .max((o.cy - self.cy).abs() / h)
             .max((o.lw - self.lw).abs() / 0.35)
             .max((o.lh - self.lh).abs() / 0.35)
+    }
+    fn get(&self, i: usize) -> f64 {
+        [self.cx, self.cy, self.lw, self.lh, self.ax, self.ay][i]
+    }
+    fn set(&mut self, i: usize, v: f64) {
+        match i {
+            0 => self.cx = v,
+            1 => self.cy = v,
+            2 => self.lw = v,
+            3 => self.lh = v,
+            4 => self.ax = v,
+            _ => self.ay = v,
+        }
     }
 }
 
@@ -313,6 +322,15 @@ pub fn plan(inp: &PlanInput, cfg: &CamCfg) -> Vec<Pose> {
     out
 }
 
+/// One piece of framing evidence on the shot's clock.
+#[derive(Clone, Copy)]
+struct Ev {
+    t: f64,
+    ch: Ch,
+    kind: Kind,
+    cut: bool,
+}
+
 /// Plan frames `[f0, f1)` of one shot. None when it has no targets.
 #[allow(clippy::too_many_arguments)]
 fn plan_shot(
@@ -328,9 +346,11 @@ fn plan_shot(
         return None;
     }
     let len = f1 - f0;
-    // --- 1. dense desired signal ------------------------------------------
-    // Strong samples only; weak ones (placeholders) are filled from
-    // neighbors. A shot made only of placeholders still uses them.
+    let local = |f: usize| f.checked_sub(f0).filter(|&k| k < len);
+    // --- 1. evidence ---------------------------------------------------------
+    // Real sightings only; placeholders (dropouts, post-cut settle) carry
+    // no information, the solver bridges them. A shot made only of
+    // placeholders still uses them.
     let strong: Vec<&Target> = {
         let s: Vec<&Target> = tg.iter().copied().filter(|t| !t.weak).collect();
         if s.is_empty() {
@@ -339,32 +359,108 @@ fn plan_shot(
             s
         }
     };
-    let kind_at: Vec<Kind>;
+    // A framing needs a few sightings behind it. A run (samples between
+    // framing changes) of fewer than three face sightings is a transient
+    // (a stray detection, a head passing through) and would otherwise win
+    // a whole shot or force a blink cut; synthetic framings (wide, fixed)
+    // are exempt.
+    let strong: Vec<&Target> = {
+        let mut runs: Vec<Vec<&Target>> = Vec::new();
+        for (i, s) in strong.iter().enumerate() {
+            let new_run = i == 0 || s.cut || strong[i - 1].kind != s.kind;
+            if new_run {
+                runs.push(Vec::new());
+            }
+            if let Some(r) = runs.last_mut() {
+                r.push(s);
+            }
+        }
+        let solid =
+            |r: &Vec<&Target>| r.len() >= 3 || !matches!(r[0].kind, Kind::Subject | Kind::Group);
+        if runs.iter().any(solid) {
+            runs.into_iter().filter(solid).flatten().collect()
+        } else {
+            strong
+        }
+    };
+    // Handoffs land on the new speaker's first word: detection confirms a
+    // turn ~0.3–0.8 s late, the words say when it really began. Samples
+    // between that onset and the confirmation still show the old framing,
+    // so they are dropped.
+    let onsets_t: Vec<f64> = onset_frames
+        .iter()
+        .filter_map(|&o| local(o))
+        .map(|o| (f0 + o) as f64 / fps)
+        .collect();
+    let mut ev: Vec<Ev> = Vec::with_capacity(strong.len());
+    let mut last_change = f64::NEG_INFINITY;
+    for (i, s) in strong.iter().enumerate() {
+        let mut e = Ev {
+            t: s.t,
+            ch: Ch::of(&s.rect, s.ax, s.ay),
+            kind: s.kind,
+            cut: i > 0 && s.cut,
+        };
+        let changes = e.cut || ev.last().is_some_and(|p: &Ev| p.kind != e.kind);
+        if e.cut && e.kind == Kind::Subject {
+            if let Some(o) = onsets_t
+                .iter()
+                .copied()
+                .filter(|&o| o + cfg.onset_back_s >= s.t && o <= s.t + 0.15)
+                .filter(|&o| o > last_change + 0.45)
+                .reduce(f64::max)
+            {
+                while ev.len() > 1 && ev.last().is_some_and(|p| p.t >= o) {
+                    ev.pop();
+                }
+                e.t = o.min(s.t);
+            }
+        }
+        if changes {
+            last_change = e.t;
+        }
+        ev.push(e);
+    }
+
+    // --- 2. dense desired signal ----------------------------------------------
+    // Linear between sightings, stepped at framing changes, with a
+    // confidence weight that fades inside long gaps (the solver, not a
+    // straight line, decides how to bridge a dropout).
     let mut desired: Vec<Ch> = Vec::with_capacity(len);
-    // Frame index where a discrete change begins (handoff/kind change).
+    let mut weight: Vec<f64> = Vec::with_capacity(len);
+    let mut kinds: Vec<Kind> = Vec::with_capacity(len);
     let mut change = vec![false; len];
     {
-        let mut kinds = Vec::with_capacity(len);
         let mut i = 0usize;
         for k in 0..len {
             let t = (f0 + k) as f64 / fps;
-            while i + 1 < strong.len() && strong[i + 1].t <= t + 1e-9 {
+            while i + 1 < ev.len() && ev[i + 1].t <= t + 1e-9 {
                 i += 1;
             }
-            let a = strong[i];
-            let ch_a = Ch::of(&a.rect, a.ax, a.ay);
-            let ch = if t <= a.t || i + 1 >= strong.len() {
-                ch_a
+            let a = ev[i];
+            let (ch, w) = if t < a.t - 1e-9 {
+                (a.ch, 0.02) // before the first sighting
+            } else if i + 1 >= ev.len() {
+                let w = if t - a.t < 0.35 { 1.0 } else { 0.02 };
+                (a.ch, w)
             } else {
-                let b = strong[i + 1];
-                if b.cut || b.kind != a.kind {
-                    ch_a // step: hold until the change lands
+                let b = ev[i + 1];
+                let gap = b.t - a.t;
+                let w = if gap <= 0.35 {
+                    1.0
                 } else {
-                    let u = ((t - a.t) / (b.t - a.t).max(1e-9)).clamp(0.0, 1.0);
-                    ch_a.lerp(&Ch::of(&b.rect, b.ax, b.ay), u)
+                    let near = (t - a.t).min(b.t - t);
+                    (-(near - 0.1).max(0.0) / 0.35).exp().max(0.02)
+                };
+                if b.cut || b.kind != a.kind {
+                    (a.ch, w) // step: hold until the change lands
+                } else {
+                    let u = ((t - a.t) / gap.max(1e-9)).clamp(0.0, 1.0);
+                    (a.ch.lerp(&b.ch, u), w)
                 }
             };
             desired.push(ch);
+            weight.push(w);
             kinds.push(a.kind);
         }
         for k in 1..len {
@@ -372,18 +468,16 @@ fn plan_shot(
                 change[k] = true;
             }
         }
-        // Handoff flags: the first frame at/after each strong cut sample.
-        for s in strong.iter().skip(1).filter(|s| s.cut) {
-            let k = ((s.t * fps).round() as usize).saturating_sub(f0);
+        for e in ev.iter().skip(1).filter(|e| e.cut) {
+            let k = ((e.t * fps).round() as usize).saturating_sub(f0);
             if k > 0 && k < len {
                 change[k] = true;
             }
         }
-        kind_at = kinds;
     }
     // Spike-killing median, never across a discrete change.
     let half = ((cfg.median_s * fps / 2.0).round() as usize).max(1);
-    let desired: Vec<Ch> = {
+    let run_bounds = |change: &[bool]| {
         let mut seg_start = vec![0usize; len];
         let mut seg_end = vec![len; len];
         let mut s = 0;
@@ -400,265 +494,202 @@ fn plan_shot(
                 e = k;
             }
         }
+        (seg_start, seg_end)
+    };
+    let mut desired: Vec<Ch> = {
+        let (ss, se) = run_bounds(&change);
         (0..len)
             .map(|k| {
-                let lo = k.saturating_sub(half).max(seg_start[k]);
-                let hi = (k + half + 1).min(seg_end[k]);
+                let lo = k.saturating_sub(half).max(ss[k]);
+                let hi = (k + half + 1).min(se[k]);
                 median_ch(&desired[lo..hi])
             })
             .collect()
     };
 
-    // --- 2. holds ----------------------------------------------------------
-    let persist = ((cfg.persist_s * fps).round() as usize).max(1);
-    let look = ((cfg.look_s * fps).round() as usize).max(1);
-    let next_change = |k: usize| (k + 1..len).find(|&j| change[j]).unwrap_or(len);
-    let provisional = |k: usize| median_ch(&desired[k..(k + look).min(next_change(k)).max(k + 1)]);
-    // (start frame, triggered by a discrete change?)
-    let mut holds: Vec<(usize, bool)> = vec![(0, false)];
-    let mut p = provisional(0);
-    let mut kind = kind_at[0];
-    let mut run = 0usize;
-    let mut k = 1;
-    while k < len {
-        let outside = kind_at[k] != kind || p.dev(&desired[k], cfg) > 1.0;
-        if change[k] && outside {
-            holds.push((k, true));
-            p = provisional(k);
-            kind = kind_at[k];
-            run = 0;
-        } else if outside {
-            run += 1;
-            if run >= persist {
-                let e = k + 1 - run;
-                holds.push((e, false));
-                p = provisional(e);
-                kind = kind_at[e];
-                run = 0;
-                k = e;
+    // --- 3. snaps ----------------------------------------------------------------
+    // Discrete moves the camera cuts instead of panning:
+    // - speaker switches between people who don't share a frame (no
+    //   whip-pan across the table);
+    // - layout changes (close-up <-> letterboxed wide);
+    // - any reframe near an edit jump-cut (the edit hides it).
+    let mut snaps: Vec<usize> = Vec::new();
+    for k in 1..len {
+        if !change[k] {
+            continue;
+        }
+        let (from, to) = (desired[k - 1], desired[k]);
+        let (fk, tk) = (kinds[k - 1], kinds[k]);
+        let far = fk == Kind::Subject
+            && tk == Kind::Subject
+            && (to.cx - from.cx).abs() > cfg.switch_cut_frac * from.lw.exp().max(to.lw.exp());
+        let layout = cfg.layout_cut && (fk == Kind::Wide) != (tk == Kind::Wide);
+        if far || layout {
+            snaps.push(k);
+        }
+    }
+    let jw = ((cfg.jump_win_s * fps).round() as usize).max(1);
+    for j in jump_frames.iter().filter_map(|&j| local(j)) {
+        if j == 0 || snaps.iter().any(|&s| s.abs_diff(j) <= jw) {
+            // A snap nearby moves onto the jump-cut instead.
+            if let Some(s) = snaps.iter_mut().find(|s| s.abs_diff(j) <= jw && **s != j) {
+                let (a, b) = ((*s).min(j), (*s).max(j));
+                if *s > j {
+                    let v = (desired[*s], kinds[*s]);
+                    for k in a..b {
+                        (desired[k], kinds[k]) = v;
+                    }
+                } else if a > 0 {
+                    let v = (desired[a - 1], kinds[a - 1]);
+                    for k in a..b {
+                        (desired[k], kinds[k]) = v;
+                    }
+                }
+                *s = j;
+            }
+            continue;
+        }
+        let lo = j.saturating_sub(jw);
+        let hi = (j + jw).min(len);
+        let l = median_ch(&desired[lo..j]);
+        let r = median_ch(&desired[j..hi]);
+        if l.dev(&r, cfg) > 2.0 {
+            // Both sides settle onto their framing right at the cut.
+            for d in &mut desired[lo..j] {
+                if l.dev(d, cfg) > 1.0 {
+                    *d = l;
+                }
+            }
+            for d in &mut desired[j..hi] {
+                if r.dev(d, cfg) > 1.0 {
+                    *d = r;
+                }
+            }
+            snaps.push(j);
+        }
+    }
+    snaps.sort_unstable();
+    snaps.dedup();
+    // No blink framings: a framing that would be on screen shorter than
+    // `min_show` is skipped — the previous one rides out to the next snap
+    // (or shot end), and a shot opening on a blink opens on what follows.
+    let min_show = ((cfg.min_show_s * fps).round() as usize).max(1);
+    let mut kept: Vec<usize> = Vec::new();
+    for (i, &s) in snaps.iter().enumerate() {
+        let next = snaps.get(i + 1).copied().unwrap_or(len);
+        let prev = kept.last().copied().unwrap_or(0);
+        if next - s < min_show {
+            let v = (desired[s - 1], kinds[s - 1]);
+            for k in s..next {
+                (desired[k], kinds[k]) = v;
+                change[k] = false;
+            }
+        } else if s - prev < min_show && prev == 0 {
+            let v = (desired[s], kinds[s]);
+            for k in 0..s {
+                (desired[k], kinds[k]) = v;
+                change[k] = false;
             }
         } else {
-            run = 0;
+            kept.push(s);
         }
-        k += 1;
     }
-    // Final pose per hold: median of everything it covers.
-    let mut hp: Vec<(usize, bool, Ch, Kind)> = holds
-        .iter()
-        .enumerate()
-        .map(|(i, &(s, trig))| {
-            let e = holds.get(i + 1).map(|h| h.0).unwrap_or(len);
-            (s, trig, median_ch(&desired[s..e.max(s + 1)]), kind_at[s])
-        })
-        .collect();
-    // Merge near-identical neighbors (a move that wouldn't read as one).
-    let mut merged: Vec<(usize, bool, Ch, Kind)> = Vec::with_capacity(hp.len());
-    for h in hp.drain(..) {
-        if let Some(last) = merged.last() {
-            if last.3 == h.3 && last.2.dev(&h.2, cfg) < 0.35 {
-                continue;
+    let snaps = kept;
+    // A soft change (near handoff, group edge) that would only just start
+    // before a snap is skipped too: the snap takes the camera past it.
+    for k in 1..len {
+        if !change[k] || snaps.contains(&k) {
+            continue;
+        }
+        let next = snaps.iter().copied().find(|&s| s > k).unwrap_or(len);
+        if next - k < min_show {
+            let v = (desired[k - 1], kinds[k - 1]);
+            for j in k..next {
+                (desired[j], kinds[j]) = v;
+                change[j] = false;
             }
         }
-        merged.push(h);
     }
 
-    // --- 3. moves -------------------------------------------------------------
-    struct Move {
-        at: usize,
-        /// Triggered by a discrete change (handoff, framing class flip).
-        trig: bool,
-        snap: bool,
-        start: usize,
-        dur: usize,
-    }
-    let local = |f: usize| f.checked_sub(f0).filter(|&k| k < len);
-    let mut moves: Vec<Move> = Vec::new();
-    let mut last_at = 0usize;
-    for i in 1..merged.len() {
-        let (mut at, trig, to, to_kind) = merged[i];
-        let (_, _, from, from_kind) = merged[i - 1];
-        let d = from.dist(&to);
-        // Handoffs land on the new speaker's first word (detection confirms
-        // a turn ~0.3–0.8s late; the words say when it really began).
-        if trig && to_kind == Kind::Subject {
-            let t_at = at;
-            let back = (cfg.onset_back_s * fps) as usize;
-            if let Some(o) = onset_frames
-                .iter()
-                .filter_map(|&o| local(o))
-                .filter(|&o| o + back >= t_at && o <= t_at + (0.15 * fps) as usize)
-                .filter(|&o| o > last_at + persist)
-                .max()
-            {
-                at = o;
+    // --- 4. solve the path ------------------------------------------------------
+    // Per piece (between snaps and soft changes) and channel: the smoothest
+    // path (least acceleration) that keeps the subject inside the dead
+    // band, fitted offline to the whole clip — no lag, no stop-and-go.
+    let soft: Vec<usize> = (1..len)
+        .filter(|&k| change[k] && !snaps.contains(&k))
+        .collect();
+    let lam = |t: f64| (t * fps / std::f64::consts::TAU).powi(4);
+    let mut path = desired.clone();
+    let mut cuts = vec![0usize];
+    cuts.extend(snaps.iter().copied());
+    cuts.extend(soft.iter().copied());
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.push(len);
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if b <= a {
+            continue;
+        }
+        let d = &desired[a..b];
+        let wt = &weight[a..b];
+        for c in 0..6 {
+            let dc: Vec<f64> = d.iter().map(|x| x.get(c)).collect();
+            if dc.windows(2).all(|p| p[0] == p[1]) {
+                continue; // constant is exact already (and the common case)
+            }
+            let (band, safe, t): (Vec<f64>, Vec<f64>, f64) = match c {
+                0 => (
+                    d.iter().map(|x| cfg.band_x * x.lw.exp()).collect(),
+                    d.iter().map(|x| cfg.safe_x * x.lw.exp()).collect(),
+                    cfg.pan_s,
+                ),
+                1 => (
+                    d.iter().map(|x| cfg.band_y * x.lh.exp()).collect(),
+                    d.iter().map(|x| cfg.safe_y * x.lh.exp()).collect(),
+                    cfg.tilt_s,
+                ),
+                2 | 3 => (vec![cfg.band_z; b - a], vec![0.3; b - a], cfg.zoom_s),
+                _ => (vec![0.0; b - a], vec![f64::INFINITY; b - a], cfg.anchor_s),
+            };
+            let still = if c == 2 || c == 3 { 2e-3 } else { 0.75 };
+            let sol = solve_band(&dc, wt, &band, &safe, lam(t), still);
+            for (k, v) in sol.into_iter().enumerate() {
+                path[a + k].set(c, v);
             }
         }
-        // An edit jump-cut close by hides the reframe: snap onto it.
-        let jw = (cfg.jump_win_s * fps).round() as usize;
-        let jump = jump_frames
-            .iter()
-            .filter_map(|&j| local(j))
-            .filter(|&j| j > last_at && j + jw >= at && j <= at + jw)
-            .min_by_key(|&j| (j as i64 - at as i64).abs());
-        let far_switch = trig
-            && from_kind == Kind::Subject
-            && to_kind == Kind::Subject
-            && (to.cx - from.cx).abs() > cfg.switch_cut_frac * from.lw.exp().max(to.lw.exp());
-        let layout = cfg.layout_cut && trig && (from_kind == Kind::Wide) != (to_kind == Kind::Wide);
-        let (at, snap) = match jump {
-            Some(j) => (j, true),
-            None => (at, far_switch || layout),
-        };
-        let dur = ((cfg.glide_base_s + cfg.glide_per_s * d).clamp(cfg.glide_min_s, cfg.glide_max_s)
+    }
+    // --- 5. glides ---------------------------------------------------------------
+    // A soft change (a handoff between neighbors, a group forming or
+    // breaking up) is a deliberate move from one settled framing to the
+    // next: a smootherstep dolly (zero velocity and acceleration at both
+    // ends — no wind-up, no overshoot) timed by distance, starting a beat
+    // before the change. Never across a snap.
+    let solved = path.clone();
+    for &k in &soft {
+        let lo = cuts.iter().copied().filter(|&c| c < k).max().unwrap_or(0);
+        let hi = cuts.iter().copied().find(|&c| c > k).unwrap_or(len);
+        let (from, to) = (solved[k - 1], solved[k]);
+        let dist = from.dist(&to);
+        let dur = ((cfg.glide_base_s + cfg.glide_per_s * dist)
+            .clamp(cfg.glide_min_s, cfg.glide_max_s)
             * fps)
             .round() as usize;
-        let lead = if trig {
-            (cfg.lead_s * fps).round() as usize
-        } else {
-            dur * 35 / 100 // drift: center the move on the exit
-        };
-        let start = at.saturating_sub(lead).max(last_at + 1).min(at);
-        merged[i].0 = at;
-        moves.push(Move {
-            at,
-            trig,
-            snap,
-            start,
-            dur: dur.max(1),
-        });
-        last_at = at;
-    }
-    // A glide must land before the next snap. A framing that would barely
-    // be on screen before the cut is skipped (a move straight into a cut
-    // reads as a twitch; the cut takes the camera past it); otherwise the
-    // glide is squeezed to fit.
-    let min_show = (0.8 * fps).round() as usize;
-    // Same at the shot's end: the shot cut reframes anyway, so a change
-    // that would show for a blink before it (a handoff snap 0.3 s before
-    // the edit cuts away) is dropped and the current framing rides out.
-    for i in 0..moves.len() {
-        if len.saturating_sub(moves[i].at) < min_show {
-            merged[i + 1].2 = merged[i].2;
-            merged[i + 1].3 = merged[i].3;
-        } else if moves[i].start + moves[i].dur > len {
-            moves[i].dur = (len - moves[i].start).max(1);
-        }
-    }
-    for i in 0..moves.len().saturating_sub(1) {
-        if moves[i].snap || !moves[i + 1].snap {
+        let s0 = k.saturating_sub(dur * 3 / 10).max(lo);
+        let s1 = (s0 + dur.max(2)).min(hi);
+        if s1 <= s0 + 1 {
             continue;
         }
-        let room = moves[i + 1].at.saturating_sub(moves[i].start);
-        if room >= moves[i].dur {
-            continue;
-        }
-        if moves[i + 1].at.saturating_sub(moves[i].at) >= min_show {
-            moves[i].dur = room.max(1);
-        } else {
-            merged[i + 1].2 = merged[i].2;
-            merged[i + 1].3 = merged[i].3;
-        }
-    }
-
-    // --- 4. render the path ------------------------------------------------------
-    let mut path: Vec<Ch> = Vec::with_capacity(len);
-    let mut kinds: Vec<Kind> = Vec::with_capacity(len);
-    for i in 0..merged.len() {
-        let s = merged[i].0;
-        let e = merged.get(i + 1).map(|h| h.0).unwrap_or(len);
-        for _ in s..e.max(s) {
-            path.push(merged[i].2);
-            kinds.push(merged[i].3);
+        for (j, p) in path.iter_mut().enumerate().take(s1).skip(s0) {
+            let u = smootherstep((j - s0) as f64 / (s1 - s0 - 1) as f64);
+            let (l, r) = if j < k {
+                (solved[j], solved[k])
+            } else {
+                (solved[k - 1], solved[j])
+            };
+            *p = l.lerp(&r, u);
         }
     }
-    path.truncate(len);
-    kinds.truncate(len);
-    while path.len() < len {
-        path.push(*path.last().unwrap_or(&merged[0].2));
-        kinds.push(*kinds.last().unwrap_or(&merged[0].3));
-    }
-    // Snap points split the smoothing; glides overwrite their span.
-    let mut snaps = vec![false; len];
-    for (i, m) in moves.iter().enumerate() {
-        let to = merged[i + 1].2;
-        if m.snap {
-            if m.at < len {
-                snaps[m.at] = true;
-            }
-            continue;
-        }
-        let from = if m.start > 0 {
-            path[m.start - 1]
-        } else {
-            path[0]
-        };
-        // Never past the next snap (it owns the frames from its cut on).
-        let cap = moves
-            .get(i + 1)
-            .filter(|n| n.snap)
-            .map(|n| n.at)
-            .unwrap_or(len);
-        let end = (m.start + m.dur).min(len).min(cap);
-        for (k, p) in path.iter_mut().enumerate().take(end).skip(m.start) {
-            let u = (k + 1 - m.start) as f64 / m.dur as f64;
-            *p = from.lerp(&to, smootherstep(u));
-        }
-        // The move's own tail belongs to the new hold.
-        let next = moves.get(i + 1).map(|n| n.start).unwrap_or(len);
-        for p in path.iter_mut().take(next.min(len)).skip(end) {
-            *p = to;
-        }
-        // Framing class flips mid-glide (a dolly lands as its target kind).
-        for kd in kinds.iter_mut().take(end.min(len)).skip(m.start) {
-            *kd = merged[i + 1].3;
-        }
-    }
-    // --- 5. continuous follow ----------------------------------------------------
-    // Drift reframes chained closer than `track_hold_s` mean the subject
-    // itself is moving (a walking presenter). Stop-and-go holds would read
-    // as a nervous operator, so that stretch follows the zero-phase
-    // smoothed subject path instead, blended in and out.
-    let hold_gap = (cfg.track_hold_s * fps).round() as usize;
-    let drift = |m: &Move| !m.snap && !m.trig;
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < moves.len() {
-        if !drift(&moves[i]) {
-            i += 1;
-            continue;
-        }
-        let mut j = i;
-        while j + 1 < moves.len()
-            && drift(&moves[j + 1])
-            && moves[j + 1].at - moves[j].at < hold_gap
-        {
-            j += 1;
-        }
-        if j > i {
-            let a = moves[i].start;
-            let b = (moves[j].start + moves[j].dur).min(len);
-            // Never follow across a discrete framing change.
-            let b = (a + 1..b).find(|&k| change[k] || snaps[k]).unwrap_or(b);
-            spans.push((a, b));
-        }
-        i = j + 1;
-    }
-    if !spans.is_empty() {
-        let follow = smooth_segments(&desired, &change, cfg.track_sigma_s * fps);
-        let ramp = ((0.5 * fps).round() as usize).max(1);
-        for (a, b) in spans {
-            let n = b - a;
-            let ramp = ramp.min(n / 2).max(1);
-            for k in a..b {
-                let edge = (k - a + 1).min(b - k) as f64 / ramp as f64;
-                let u = edge.clamp(0.0, 1.0);
-                let w = u * u * (3.0 - 2.0 * u);
-                path[k] = path[k].lerp(&follow[k], w);
-            }
-        }
-    }
-
-    let path = smooth_segments(&path, &snaps, cfg.smooth_s * fps);
     Some(
         path.iter()
             .zip(kinds.iter())
@@ -672,52 +703,183 @@ fn plan_shot(
     )
 }
 
-/// Zero-phase Gaussian smoothing per snap-delimited segment (edges
-/// replicate, so holds stay exactly still).
-fn smooth_segments(path: &[Ch], snaps: &[bool], sigma: f64) -> Vec<Ch> {
-    if sigma < 0.5 || path.len() < 3 {
-        return path.to_vec();
+/// Stiffness of the safe band relative to a full-confidence sighting.
+const SAFE_W: f64 = 40.0;
+/// Pull toward the exact framing inside the dead band (relative weight):
+/// only picks *where* a still camera rests (the average framing), far too
+/// weak to move it.
+const REST_W: f64 = 0.002;
+/// Velocity penalty relative to the acceleration penalty's scale: among
+/// equally smooth paths prefer the stillest (a camera at rest stays at
+/// rest instead of creeping inside the band).
+const DRAG: f64 = 0.05;
+
+/// Dead-band smoothing path: the minimizer of
+///
+/// ```text
+///   Σ w·dist(c, [d-band, d+band])²  +  SAFE_W·w·dist(c, [d-safe, d+safe])²
+///     + REST_W·w·(c-d)²  +  lam·Σ (Δ²c)²  +  DRAG·√lam·Σ (Δc)²
+/// ```
+///
+/// Inside the band the data costs (next to) nothing, so the path is as
+/// still as it can be; only a subject that leaves the band bends it, as
+/// late and as gently as the band allows. The safe band caps how far a
+/// fast subject may lead the camera. `lam = (T·fps/2π)⁴` makes `T` seconds
+/// the shortest period the camera reproduces.
+///
+/// The cost is piecewise quadratic, so it is solved exactly by active-set
+/// Newton: guess which frames sit outside each band, solve that quadratic
+/// (one banded Cholesky, O(n)), repeat until the guess is self-consistent
+/// (a handful of rounds). A path spanning less than `still` is locked off
+/// exactly. Pure (unit-tested).
+fn solve_band(d: &[f64], w: &[f64], band: &[f64], safe: &[f64], lam: f64, still: f64) -> Vec<f64> {
+    let n = d.len();
+    if n < 4 {
+        return d.to_vec();
     }
-    let r = (sigma * 3.0).ceil() as isize;
-    let w: Vec<f64> = (-r..=r)
-        .map(|i| (-(i * i) as f64 / (2.0 * sigma * sigma)).exp())
-        .collect();
-    let wsum: f64 = w.iter().sum();
-    let mut out = path.to_vec();
-    let mut s = 0;
-    let n = path.len();
-    while s < n {
-        let mut e = s + 1;
-        while e < n && !snaps[e] {
-            e += 1;
+    let lam1 = DRAG * lam.sqrt();
+    // Side of each band a frame sits on: -1 below, 0 inside, +1 above.
+    let side = |c: f64, d: f64, b: f64| -> i8 {
+        if c > d + b {
+            1
+        } else if c < d - b {
+            -1
+        } else {
+            0
         }
-        let seg = &path[s..e];
-        // Constant segments are exact already (and the common case).
-        if seg.windows(2).any(|p| p[0] != p[1]) {
-            for k in 0..seg.len() {
-                let mut acc = [0.0f64; 6];
-                for (j, wj) in w.iter().enumerate() {
-                    let idx =
-                        (k as isize + j as isize - r).clamp(0, seg.len() as isize - 1) as usize;
-                    let c = &seg[idx];
-                    for (a, v) in acc.iter_mut().zip([c.cx, c.cy, c.lw, c.lh, c.ax, c.ay]) {
-                        *a += wj * v;
-                    }
-                }
-                let a = acc.map(|v| v / wsum);
-                out[s + k] = Ch {
-                    cx: a[0],
-                    cy: a[1],
-                    lw: a[2],
-                    lh: a[3],
-                    ax: a[4],
-                    ay: a[5],
-                };
+    };
+    let solve = |act: &[(i8, i8)]| {
+        let mut diag = vec![0.0; n];
+        let mut rhs = vec![0.0; n];
+        for k in 0..n {
+            let (a, s) = act[k];
+            diag[k] += REST_W * w[k];
+            rhs[k] += REST_W * w[k] * d[k];
+            if a != 0 {
+                diag[k] += w[k];
+                rhs[k] += w[k] * (d[k] + a as f64 * band[k]);
+            }
+            if s != 0 && safe[k].is_finite() {
+                diag[k] += SAFE_W * w[k];
+                rhs[k] += SAFE_W * w[k] * (d[k] + s as f64 * safe[k]);
             }
         }
-        s = e;
+        Banded::whittaker(&diag, lam, lam1).cholesky().solve(&rhs)
+    };
+    // Start from the plain smoother (every frame pulled to its framing),
+    // then let frames inside the band go free.
+    let full: Vec<f64> = {
+        let diag: Vec<f64> = w.iter().map(|&x| x.max(1e-6)).collect();
+        let rhs: Vec<f64> = (0..n).map(|k| diag[k] * d[k]).collect();
+        Banded::whittaker(&diag, lam, lam1).cholesky().solve(&rhs)
+    };
+    let act_of = |c: &[f64]| -> Vec<(i8, i8)> {
+        (0..n)
+            .map(|k| (side(c[k], d[k], band[k]), side(c[k], d[k], safe[k])))
+            .collect()
+    };
+    let mut act = act_of(&full);
+    let mut c = solve(&act);
+    for _ in 0..60 {
+        let next = act_of(&c);
+        if next == act {
+            break;
+        }
+        act = next;
+        c = solve(&act);
     }
-    out
+    let (lo, hi) = c
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
+    if hi - lo < still {
+        let mean = c.iter().sum::<f64>() / n as f64;
+        return vec![mean; n];
+    }
+    c
+}
+
+/// Symmetric positive-definite pentadiagonal matrix (bandwidth 2), stored
+/// as its lower band: `a[k] = [A(k,k-2), A(k,k-1), A(k,k)]`.
+struct Banded {
+    a: Vec<[f64; 3]>,
+}
+
+impl Banded {
+    /// `diag(w) + lam·D2ᵀD2 + lam1·D1ᵀD1`, Dk the k-th difference operator.
+    fn whittaker(w: &[f64], lam: f64, lam1: f64) -> Self {
+        let n = w.len();
+        let mut a: Vec<[f64; 3]> = w.iter().map(|&x| [0.0, 0.0, x]).collect();
+        for r in 0..n.saturating_sub(1) {
+            a[r][2] += lam1;
+            a[r + 1][2] += lam1;
+            a[r + 1][1] -= lam1;
+        }
+        for r in 0..n.saturating_sub(2) {
+            let co = [1.0, -2.0, 1.0];
+            for i in 0..3 {
+                for j in 0..=i {
+                    // (r+i, r+j), lower triangle: offset i-j.
+                    a[r + i][2 - (i - j)] += lam * co[i] * co[j];
+                }
+            }
+        }
+        // A tiny ridge keeps all-zero-weight stretches solvable.
+        for row in a.iter_mut() {
+            row[2] += 1e-9;
+        }
+        Banded { a }
+    }
+
+    /// In-place banded Cholesky: A = L·Lᵀ (L stored in the same layout).
+    fn cholesky(mut self) -> Self {
+        let n = self.a.len();
+        for k in 0..n {
+            for off in (0..=2usize).rev() {
+                // L(k, k-off)
+                let Some(j) = k.checked_sub(off) else {
+                    continue;
+                };
+                let mut s = self.a[k][2 - off];
+                for m in (k.saturating_sub(2)).max(j.saturating_sub(2))..j {
+                    s -= self.a[k][2 - (k - m)] * self.a[j][2 - (j - m)];
+                }
+                if off == 0 {
+                    self.a[k][2] = s.max(1e-12).sqrt();
+                } else {
+                    self.a[k][2 - off] = s / self.a[j][2];
+                }
+            }
+        }
+        self
+    }
+
+    /// Solve L·Lᵀ·x = b.
+    fn solve(&self, b: &[f64]) -> Vec<f64> {
+        let n = b.len();
+        let mut y = vec![0.0; n];
+        for k in 0..n {
+            let mut s = b[k];
+            for off in 1..=2usize {
+                if let Some(j) = k.checked_sub(off) {
+                    s -= self.a[k][2 - off] * y[j];
+                }
+            }
+            y[k] = s / self.a[k][2];
+        }
+        let mut x = vec![0.0; n];
+        for k in (0..n).rev() {
+            let mut s = y[k];
+            for off in 1..=2usize {
+                if k + off < n {
+                    s -= self.a[k + off][2 - off] * x[k + off];
+                }
+            }
+            x[k] = s / self.a[k][2];
+        }
+        x
+    }
 }
 
 /// Emphasis punch-in tuning.
@@ -778,8 +940,20 @@ pub fn apply_punches(
     if n == 0 || windows.is_empty() {
         return 0;
     }
+    // Visibly moving: panning faster than 6% of the frame per second, or
+    // zooming faster than 4%/s. A slow drift can carry a punch (the zoom
+    // is anchored on the face); a pan or a cut can't.
     let moving: Vec<bool> = (0..n)
-        .map(|k| k > 0 && poses[k].rect != poses[k - 1].rect)
+        .map(|k| {
+            if k == 0 {
+                return false;
+            }
+            let (a, b) = (poses[k - 1].rect, poses[k].rect);
+            (b.cx() - a.cx()).abs() / a.w.max(1.0) * fps > 0.06
+                || (b.cy() - a.cy()).abs() / a.h.max(1.0) * fps > 0.06
+                || (b.w / a.w.max(1.0)).ln().abs() * fps > 0.04
+                || poses[k].kind != poses[k - 1].kind
+        })
         .collect();
     let guard = (cfg.guard_s * fps).round() as usize;
     let frame = |t: f64| ((t * fps).round().max(0.0) as usize).min(n);

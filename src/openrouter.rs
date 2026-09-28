@@ -116,7 +116,7 @@ fn tool_schema() -> serde_json::Value {
                                         "share": {"type": "integer"}
                                     }
                                 },
-                                "title": {"type": "string"},
+                                "title": {"type": "string", "description": "On-screen headline shown over the clip: 3-7 words, sentence case, states the payoff or tension so a scroller instantly gets why to watch (e.g. \"Why most startups die in year one\"). Not a transcript quote, no hashtags, no emojis, no trailing period."},
                                 "hashtags": {"type": "array", "items": {"type": "string"}},
                                 "caption_style": {"type": "string", "enum": ["tiktok","karaoke","hormozi","minimal"]}
                             },

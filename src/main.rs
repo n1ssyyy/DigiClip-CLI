@@ -14,6 +14,7 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    digiclip_rs::process::gentle_self();
     if args.serve {
         // Never outlive our spawner: an orphaned engine keeps
         // `resources\digiclip.exe` locked and the next install/update

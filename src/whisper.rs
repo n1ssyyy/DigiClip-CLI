@@ -395,6 +395,7 @@ pub async fn transcribe(
     // Enforce the model-tier timeout (PHP used Process::setTimeout).
     // Poll the child; kill on expiry so a stuck sidecar can't hang the CLI.
     let mut child = crate::process::command(prog).args(args).spawn()?;
+    crate::process::gentle(&child);
     let deadline = std::time::Duration::from_secs(opts.timeout_s.max(60));
     let start = std::time::Instant::now();
     let status = loop {

@@ -101,6 +101,9 @@ pub struct JobOptions {
     /// `9:16` (default), `4:5`, `1:1`, `16:9`.
     #[serde(default)]
     pub aspect: Option<String>,
+    /// Caption motion: `pop` (default), `words`, `none`.
+    #[serde(default)]
+    pub caption_anim: Option<String>,
     /// Absent = off, `""` = each clip's title, text = that text.
     #[serde(default)]
     pub headline: Option<String>,
@@ -693,6 +696,13 @@ fn args_for(
     }
     if let Some(v) = o.aspect.as_ref().filter(|v| !v.trim().is_empty()) {
         flag(&mut argv, "--aspect", v.clone());
+    }
+    if let Some(v) = o
+        .caption_anim
+        .as_ref()
+        .filter(|v| matches!(v.as_str(), "pop" | "words" | "none"))
+    {
+        flag(&mut argv, "--caption-anim", v.clone());
     }
     // `""` = on with the default (clip title / brand yellow).
     if let Some(v) = &o.headline {
@@ -1719,6 +1729,16 @@ mod tests {
         assert!(a.merge.is_none());
         assert!(a.kit && a.punch && a.gpu);
         assert!(a.openrouter_key.is_none());
+    }
+
+    #[test]
+    fn caption_motion_reaches_args() {
+        let (src, out, mut o, s) = opts();
+        assert_eq!(args_for(&src, &out, &o, &s).unwrap().caption_anim, "pop");
+        o.caption_anim = Some("words".into());
+        assert_eq!(args_for(&src, &out, &o, &s).unwrap().caption_anim, "words");
+        o.caption_anim = Some("bogus".into());
+        assert_eq!(args_for(&src, &out, &o, &s).unwrap().caption_anim, "pop");
     }
 
     #[test]

@@ -73,6 +73,95 @@ pub fn title_for(clip: &Clip, words: &[Word]) -> String {
     }
 }
 
+/// Openers that carry no meaning on a headline.
+const FILLER_OPEN: &[&str] = &[
+    "so",
+    "and",
+    "but",
+    "like",
+    "um",
+    "uh",
+    "uhm",
+    "okay",
+    "ok",
+    "well",
+    "yeah",
+    "yes",
+    "right",
+    "now",
+    "look",
+    "listen",
+    "honestly",
+    "basically",
+    "actually",
+    "anyway",
+    "oh",
+    "hey",
+];
+/// Openers that point at something off-screen ("it", "that") — a headline
+/// starting on one makes no sense out of context.
+const DANGLING_OPEN: &[&str] = &[
+    "it", "it's", "its", "that", "that's", "he", "she", "they", "him", "her", "them", "which",
+    "because", "or", "then", "also", "too", "than", "who",
+];
+
+/// Offline on-screen headline from the clip's own words (output clock):
+/// the best short, complete sentence near the top — 3 to 9 words once
+/// filler openers are dropped, not leaning on context it doesn't have,
+/// questions and keyword-rich lines first. `None` when nothing reads well
+/// on its own (no headline beats a nonsensical one).
+pub fn headline_from_words(words: &[Word]) -> Option<String> {
+    let mut best: Option<(f64, String)> = None;
+    let mut sent: Vec<&Word> = Vec::new();
+    let mut consider = |sent: &[&Word]| {
+        let Some(first) = sent.first() else { return };
+        let last = sent[sent.len() - 1];
+        if first.s > 25.0 || !last.w.ends_with(['.', '!', '?']) {
+            return;
+        }
+        let mut ws: Vec<&str> = sent.iter().map(|w| w.w.trim()).collect();
+        while let Some(w) = ws.first() {
+            if FILLER_OPEN.contains(&clean(w).as_str()) || w.ends_with(',') && ws.len() > 3 {
+                ws.remove(0);
+            } else {
+                break;
+            }
+        }
+        if ws.len() < 3 || ws.len() > 9 {
+            return;
+        }
+        let lower: Vec<String> = ws.iter().map(|w| clean(w)).collect();
+        if DANGLING_OPEN.contains(&lower[0].as_str())
+            || lower
+                .iter()
+                .any(|w| matches!(w.as_str(), "um" | "uh" | "uhm" | "mm" | "hmm"))
+        {
+            return;
+        }
+        let text = ws.join(" ");
+        let keys = (1..ws.len())
+            .filter(|&i| crate::captions::ass::is_keyword(ws[i], false))
+            .count();
+        let score = if text.ends_with('?') { 2.0 } else { 0.0 }
+            + if text.ends_with('!') { 1.0 } else { 0.0 }
+            + keys.min(2) as f64
+            - 0.2 * (ws.len() as f64 - 6.0).abs()
+            - 0.04 * first.s;
+        if best.as_ref().is_none_or(|(b, _)| score > *b) {
+            best = Some((score, text));
+        }
+    };
+    for w in words {
+        sent.push(w);
+        if w.w.ends_with(['.', '!', '?', '…']) {
+            consider(&sent);
+            sent.clear();
+        }
+    }
+    best.map(|(_, t)| crate::captions::ass::headline_text(&t, 44))
+        .filter(|t| !t.is_empty())
+}
+
 /// Hashtags: picker tags first, topped up with the clip's most frequent
 /// content words (len>=5, not stopwords), max 8, lowercased.
 pub fn hashtags_for(clip: &Clip, words: &[Word]) -> Vec<String> {
@@ -166,6 +255,23 @@ mod tests {
         let words = tw("Why is this airplane so fast today. It keeps flying higher now.");
         let t = title_for(&clip(), &words);
         assert_eq!(t, "Why is this airplane so fast today");
+    }
+
+    #[test]
+    fn headline_is_a_short_complete_sentence_or_nothing() {
+        // Skips the rambling opener and the context-dependent "It's…",
+        // strips the filler opener, prefers the question.
+        let words = tw(
+            "Do we get to take all this home with him and during longer shoots we just keep going. \
+             It's crazy. So, why do most creators quit in year one? Nobody talks about that.",
+        );
+        assert_eq!(
+            headline_from_words(&words).as_deref(),
+            Some("Why do most creators quit in year one?")
+        );
+        // Nothing stands on its own: no headline.
+        let words = tw("and then he said that it was um fine and we kept going with it");
+        assert_eq!(headline_from_words(&words), None);
     }
 
     #[test]
