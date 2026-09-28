@@ -162,7 +162,7 @@ fn headline_candidate(sentence: &str, t: f64) -> Option<(f64, String)> {
         }
     }
     let text = ws.join(" ");
-    if ws.len() < 3 || ws.len() > 9 || text.chars().count() > HEADLINE_CHARS {
+    if ws.len() < 4 || ws.len() > 9 || text.chars().count() > HEADLINE_CHARS {
         return None;
     }
     let lower: Vec<String> = ws.iter().map(|w| clean(w)).collect();
@@ -199,7 +199,7 @@ const HEADLINE_CHARS: usize = 48;
 
 /// Offline on-screen headline: the clip's hook line when it stands on its
 /// own (it's the opening sentence, straight from the transcript), else the
-/// best short, complete sentence in the clip's first seconds — 3 to 9
+/// best short, complete sentence in the clip's first seconds — 4 to 9
 /// words once filler openers are dropped, no context-dependent opener
 /// ("it", "that"), real questions only (no "…, right?"). `None` when
 /// nothing reads well on its own: no headline beats a nonsensical one.
@@ -348,6 +348,8 @@ mod tests {
             Some("Who here's not using more than a $20 version?")
         );
         assert_eq!(headline_for("Raise your hand, right?", &[]), None);
+        // Too short to say anything (a transcription gap, usually).
+        assert_eq!(headline_for("Who here before?", &[]), None);
         assert_eq!(
             headline_for("Here's not using more than $20 version?", &[]),
             None
