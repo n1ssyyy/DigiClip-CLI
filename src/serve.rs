@@ -90,6 +90,9 @@ pub struct JobOptions {
     pub style: Option<String>,
     #[serde(default)]
     pub lang: Option<String>,
+    /// Caption language (translated); absent/"off" = the spoken language.
+    #[serde(default)]
+    pub subs_lang: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -779,6 +782,9 @@ fn args_for(
     }
     if let Some(v) = o.aspect.as_ref().filter(|v| !v.trim().is_empty()) {
         flag(&mut argv, "--aspect", v.clone());
+    }
+    if let Some(v) = crate::translate::target_code(o.subs_lang.as_deref()) {
+        flag(&mut argv, "--subs-lang", v);
     }
     if let Some(v) = o
         .caption_anim
