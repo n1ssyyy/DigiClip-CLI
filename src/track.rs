@@ -396,6 +396,7 @@ impl FrameReader {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
+        crate::process::gentle(&child);
         let out = child
             .stdout
             .take()
@@ -463,6 +464,18 @@ pub fn sample_frames(
     seek: Option<(f64, f64)>,
 ) -> anyhow::Result<Vec<(f64, Vec<u8>)>> {
     FrameReader::open(ffmpeg, source, fps, width, sample_h, seek)?.collect()
+}
+
+/// Detector sample size: ~768x432 worth of pixels at the source aspect,
+/// upscaling small sources by up to 1.25x. Measured on real podcasts
+/// (`examples/track_recall.rs`): 480px-wide samples missed ~20% of frames
+/// with a clearly visible face (each miss froze the framing), 640px
+/// missed <1% and 768px none, all at the same ~5 ms/frame.
+pub fn sample_dims(src_w: u32, src_h: u32) -> (u32, u32) {
+    let (w, h) = (src_w.max(2) as f64, src_h.max(2) as f64);
+    let s = ((768.0 * 432.0) / (w * h)).sqrt().min(1.25);
+    let even = |v: f64| ((v.round() as u32).max(2) + 1) & !1;
+    (even(w * s), even(h * s))
 }
 
 /// Verify and pin a candidate shot cut. The tracker samples at 8–15 Hz, so
@@ -720,7 +733,10 @@ pub fn window_for_face(
     base: Base,
     score: f64,
 ) -> (f64, f64, f64, f64) {
-    let zmax: f64 = if score >= 0.65 { 1.3 } else { 1.15 };
+    // Continuous in the score: a threshold here made the zoom pump
+    // whenever the detector's confidence flickered across it.
+    let u = ((score - 0.5) / 0.3).clamp(0.0, 1.0);
+    let zmax: f64 = 1.15 + 0.15 * u * u * (3.0 - 2.0 * u);
     let zmax = zmax.min((base.h / base.min_h).max(1.0));
     let z = (0.38 / frac.max(0.05)).clamp(1.0, zmax);
     let w = base.w / z;
@@ -887,13 +903,10 @@ pub fn plan_tracks(
     progress: Option<crate::progress::SharedPct>,
     cancel: &crate::progress::CancelFlag,
 ) -> anyhow::Result<Tracked> {
-    // Sample as fast as practical: DirectML does 15fps comfortably, CPU
-    // YuNet + pipe decode ~8fps. 480px-wide samples (vs 320) resolve small
-    // faces with far less box jitter; the planner densifies to the frame.
-    let fps: u32 = if tracker.gpu { 15 } else { 8 };
-    let sample_w: u32 = 480;
-    let sample_h: u32 =
-        ((src_h as f64 * sample_w as f64 / src_w as f64).round() as u32).max(2) & !1;
+    // 15 Hz on either EP: YuNet at ~768x432 costs ~5 ms/frame on CPU and
+    // DirectML alike. See [`sample_dims`] for why that size.
+    let fps: u32 = 15;
+    let (sample_w, sample_h) = sample_dims(src_w, src_h);
     // Track only the requested span (picked clip ranges, not the source).
     let (r0, r1) = range.unwrap_or((0.0, duration));
     let frames = FrameReader::open(
@@ -912,7 +925,6 @@ pub fn plan_tracks(
     let cut_dist = CUT_FRAC * src_wf;
 
     let mut primary: Option<Face> = None;
-    let mut last_seen_t = f64::NEG_INFINITY;
     // Challenger waiting to dethrone the primary (face + consecutive wins).
     let mut pending: Option<(Face, u32)> = None;
     // No ping-pong: a fresh switch holds the floor ~2.5s (a full turn of
@@ -963,7 +975,7 @@ pub fn plan_tracks(
         }
         // Stale identity after 2s unseen: re-pick fresh (avoids latching
         // onto the wrong person when the speaker changes off-screen).
-        if *t - last_seen_t > 2.0 {
+        if *t - primary_t > 2.0 {
             primary = None;
             pending = None;
         }
@@ -1082,9 +1094,6 @@ pub fn plan_tracks(
         // Presence still counts (no Wide strobing), identity is retained —
         // the camera just holds instead of chasing quiet faces.
         let frozen = !speech_active(words, *t);
-        if frozen {
-            pending = None;
-        }
         let (group_now, group_edge) = if frozen {
             (group_state.on, false)
         } else {
@@ -1093,81 +1102,95 @@ pub fn plan_tracks(
         if group_now {
             group_samples += 1;
         }
-        // Contender = persistence + mouth + detector score. A different
-        // face must win twice running before it dethrones the primary, so a
-        // single-sample teleport detection can never take over the camera.
-        // Breaking a fresh 2.5s lock takes SUSTAINED winning (~0.75s of
-        // consecutive wins, not 4 lucky samples): overlapping banter no
-        // longer whips A→B→C in under a second.
+        // Where is the primary now? Its best-overlapping box, or — when it
+        // is the only face, or a head-width away at most — the face within
+        // walking distance of where it was last matched (a presenter who
+        // walked through a detector dropout is not a new speaker). Following
+        // the primary is independent of the handoff gate below: a pending
+        // challenger or a silent stretch never freezes the camera on a
+        // stale box.
         let n_det = faces.len();
-        let contender: Option<Face> = if faces.is_empty() {
-            None
-        } else if let Some(prev) = &primary {
-            let mut best: Option<(Face, f64)> = None;
-            for (i, f) in faces.iter().enumerate() {
-                let score = f.score * 1.5 + iou(f, prev) + motions[i] * 2.5;
-                if best.as_ref().map(|(_, b)| score > *b).unwrap_or(true) {
-                    best = Some((f.clone(), score));
-                }
-            }
-            best.map(|(f, _)| f)
-        } else {
-            faces
-                .into_iter()
+        let matched: Option<usize> = primary.as_ref().and_then(|prev| {
+            let (bi, bo) = faces
+                .iter()
                 .enumerate()
-                .max_by(|(ia, a), (ib, b)| {
-                    (a.score * (1.0 + motions[*ia]) * a.w * a.h)
-                        .partial_cmp(&(b.score * (1.0 + motions[*ib]) * b.w * b.h))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(_, f)| f)
+                .map(|(i, f)| (i, iou(f, prev)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+            if bo >= 0.2 {
+                return Some(bi);
+            }
+            let reach = reacquire_frac(*t - primary_t) * src_wf;
+            let (ni, nd) = faces
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, (f.cx() - prev.cx()).abs()))
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+            let close = nd <= 0.5 * prev.w.max(faces[ni].w);
+            ((n_det == 1 && nd <= reach) || close).then_some(ni)
+        });
+        // Contender = persistence + mouth + detector score (a fresh pick
+        // takes the biggest, most confident talker).
+        let contender: Option<usize> = if let Some(prev) = &primary {
+            (0..n_det).max_by(|&a, &b| {
+                let s = |i: usize| faces[i].score * 1.5 + iou(&faces[i], prev) + motions[i] * 2.5;
+                s(a).partial_cmp(&s(b)).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        } else {
+            (0..n_det).max_by(|&a, &b| {
+                let s = |i: usize| faces[i].score * (1.0 + motions[i]) * faces[i].w * faces[i].h;
+                s(a).partial_cmp(&s(b)).unwrap_or(std::cmp::Ordering::Equal)
+            })
         };
-        // `follow`: the pick is the primary itself, moved (not a handoff).
+        // Handoff gate. A different face must win twice running before it
+        // dethrones the primary, so a single-sample teleport detection can
+        // never take over the camera. Breaking a fresh 2.5s lock takes
+        // SUSTAINED winning (~0.75s of consecutive wins): overlapping banter
+        // doesn't whip A→B→C in under a second. A primary that is off screen
+        // holds no lock. Nobody takes the floor in silence.
+        // `follow`: the pick is the primary itself (not a handoff).
         let mut follow = false;
-        let pick: Option<Face> = match (&primary, contender) {
-            (_, None) => {
-                pending = None;
-                None
-            }
-            (None, c) => {
-                pending = None;
-                c
-            }
-            // Same person: overlapping, or the only face in frame found
-            // again within walking distance of where the primary was lost
-            // (a presenter who walked through a detector dropout is not a
-            // new speaker — no handoff, no cut).
-            (Some(prev), Some(c))
-                if iou(&c, prev) >= 0.2
-                    || (n_det == 1
-                        && (c.cx() - prev.cx()).abs()
-                            <= reacquire_frac(*t - primary_t) * src_wf) =>
-            {
-                pending = None;
-                follow = true;
-                Some(c)
-            }
-            (Some(prev), Some(c)) => match &pending {
-                Some((p, hits))
-                    if iou(&c, p) > 0.25 || (c.cx() - p.cx()).abs() < PENDING_FRAC * src_wf =>
-                {
-                    // Sustained floor-hold: ~0.75s of consecutive wins to
-                    // steal inside the lock (12 hits @15fps, 6 @8fps).
+        let pick: Option<Face> = if primary.is_none() {
+            pending = None;
+            contender.map(|i| faces[i].clone())
+        } else {
+            let challenger = contender.filter(|&c| Some(c) != matched && !frozen);
+            let won = match challenger {
+                None => {
+                    pending = None;
+                    None
+                }
+                Some(ci) => {
+                    let c = &faces[ci];
+                    let hits = match &pending {
+                        Some((p, h))
+                            if iou(c, p) > 0.25
+                                || (c.cx() - p.cx()).abs() < PENDING_FRAC * src_wf =>
+                        {
+                            h + 1
+                        }
+                        _ => 1,
+                    };
+                    // ~0.75s of consecutive wins steals inside the lock.
                     let steal_hits: u32 = ((0.75 * fps as f64).ceil() as u32).max(4);
-                    if *hits + 1 >= 2 && (*t - last_switch_t >= 2.5 || *hits + 1 >= steal_hits) {
+                    let unlocked = matched.is_none() || *t - last_switch_t >= 2.5;
+                    if hits >= 2 && (unlocked || hits >= steal_hits) {
                         pending = None;
                         last_switch_t = *t;
-                        Some(c)
+                        Some(ci)
                     } else {
-                        pending = Some((c, *hits + 1));
-                        Some(prev.clone())
+                        pending = Some((c.clone(), hits));
+                        None
                     }
                 }
-                _ => {
-                    pending = Some((c, 1));
-                    Some(prev.clone())
+            };
+            match (won, matched) {
+                (Some(ci), _) => Some(faces[ci].clone()),
+                (None, Some(mi)) => {
+                    follow = true;
+                    Some(faces[mi].clone())
                 }
-            },
+                (None, None) => None,
+            }
         };
 
         let face = pick
@@ -1175,41 +1198,28 @@ pub fn plan_tracks(
             .map(|f| (f.cx(), f.y + f.h / 2.0, f.h / src_hf));
         let pick_cx = face.map(|(cx, _, _)| cx).unwrap_or(f64::NAN);
         let pick_score = pick.as_ref().map(|f| f.score).unwrap_or(0.0);
-        let has_face = face.is_some() || group_now;
+        // Anyone on screen keeps the close-up layout (Wide means nobody).
+        let has_face = n_det > 0 || group_now;
         if has_face {
             ever_seen = true;
-            last_seen_t = *t;
         }
-        // Retain identity through gaps (the 2s stale-reset expires it), but
-        // never hand off on silence: frozen samples keep the old identity.
-        // The same person moving is followed through pauses (a presenter
-        // walks while thinking) — only switching waits for speech.
-        // Wiping on every faceless sample would defeat the challenger gate
-        // and let teleport detections take over after any dropout.
-        let silent_follow = frozen && follow && !group_now;
-        if (!frozen || silent_follow) && pick.is_some() {
-            // A pending challenger means the pick is the stale primary.
-            if pending.is_none() {
-                primary_t = *t;
-            }
+        if pick.is_some() {
+            primary_t = *t;
             primary = pick;
         }
-        // Raw window target (float, unrounded). Silence holds the last
-        // target unless the primary itself moved; a talking group shares
-        // one window; dropouts hold too — no drift home, no zoom on quiet
-        // faces. `grouped` is true only when THIS target frames the group —
-        // it drives the n_faces flag.
-        // Post-cut settle (SETTLE_S) and anything before the first sighting
-        // are placeholders: the planner opens on the settled speaker.
+        // Raw window target (float, unrounded). A talking group shares one
+        // window; otherwise the primary's face window. No evidence (primary
+        // off screen, group lost, post-cut settle, nothing seen yet) is a
+        // placeholder (`weak`) carrying the last real framing: the planner
+        // bridges it from the real samples around it. (Copied boxes used to
+        // pass as sightings, which stair-stepped the camera path.)
         let settling = *t - last_shot_t < SETTLE_S;
         let hold = || {
             let (hx, hy, hw, hh) = prev_raw.unwrap_or((base.x, base.y, base.w, base.h));
-            (hx, hy, hw, hh, false, prev_raw.is_none())
+            (hx, hy, hw, hh, false, true)
         };
         let (gx, gy, gw, gh, grouped, weak) = if settling {
             (base.x, base.y, base.w, base.h, false, true)
-        } else if frozen && !silent_follow {
-            hold()
         } else if group_now {
             match group_candidate {
                 Some((dx, dy, dw, dh)) => (dx, dy, dw, dh, true, false),
@@ -1226,22 +1236,23 @@ pub fn plan_tracks(
             }
         };
         // Punch anchor: the face (or the group's eye line) this frames.
-        let (ax, ay) = if weak || grouped {
+        let (ax, ay) = if grouped || settling {
             (gx + gw / 2.0, gy + gh * 0.4)
         } else {
             match face {
-                Some((cx, cy, _)) if !frozen || silent_follow => (cx, cy),
-                _ => prev_anchor.unwrap_or((gx + gw / 2.0, gy + gh * 0.4)),
+                Some((cx, cy, _)) => (cx, cy),
+                None => prev_anchor.unwrap_or((gx + gw / 2.0, gy + gh * 0.4)),
             }
         };
         // Speaker handoff (or group enter/exit): the desired window jumps.
         let ncx = gx + gw / 2.0;
         let cut = shot
             || group_edge
-            || !follow
-                && match (prev_raw, has_face) {
-                    (Some((px, _, pw, _)), true) => (ncx - (px + pw / 2.0)).abs() > cut_dist,
-                    _ => false,
+            || !weak
+                && !follow
+                && match prev_raw {
+                    Some((px, _, pw, _)) => (ncx - (px + pw / 2.0)).abs() > cut_dist,
+                    None => false,
                 };
         if !weak {
             prev_raw = Some((gx, gy, gw, gh));

@@ -28,6 +28,8 @@ pub fn system(count: usize, min_s: u64, max_s: u64, focus: Option<&str>) -> Stri
         "You are a short-form video editor for TikTok/Reels/Shorts. \
          Pick the {count} most viral-worthy moments. Rules: {target} \
          hook in the first 2s, self-contained payoff, no mid-sentence cuts.{focus} \
+         Give each clip a title: a punchy 3-7 word on-screen headline that \
+         states the payoff in plain words (not a transcript quote). \
          Use the submit_clips tool to return your results."
     )
 }

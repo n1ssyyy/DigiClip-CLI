@@ -103,13 +103,15 @@ Everything lands in `<input-name>-digiclip/`: `clip-01-9x16.mp4` with its `.ass`
 ```bash
 digiclip input.mp4 --aspect 1:1                 # also 4:5 (feed) and 16:9 (YouTube)
 digiclip input.mp4 --headline                   # clip title pinned on top (or --headline "Your text")
+digiclip input.mp4 --caption-anim words         # caption motion: pop (default), words, none
 digiclip input.mp4 --progress-bar               # watch-time bar along the bottom (or --progress-bar "#00E5FF")
 digiclip input.mp4 --logo logo.png --logo-pos br   # corner logo: tl, tr (default), bl, br
 digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked under speech
 ```
 
 - **Aspect.** The tracker, camera, captions and blur fill all work on the chosen canvas, and files are named after it (`clip-01-1x1.mp4`). Captions move to the lower third on non-vertical canvases, so they stay off faces.
-- **Headline.** A boxed title shown for the whole clip, top centre, below the platform's top bar. Bare `--headline` uses each clip's title, or its hook line when there isn't one.
+- **Headline.** A white title card shown for the whole clip, top centre, below the platform's top bar: at most two balanced lines, one accented word, a quick pop-in. Bare `--headline` uses each clip's title (the AI picker writes a 3–7 word headline); offline, a short self-contained sentence from the clip's first seconds, or no headline when nothing reads well on its own.
+- **Caption motion.** `pop` (default): each line pops in and fades out, keywords bump as they're spoken, lines never flash for a split second or run across a sentence end. `words`: the same, with words appearing one by one as they're spoken. `none`: static lines, as before.
 - **Logo.** A PNG or JPEG, sized to one box whatever its shape (square mark or wide wordmark) and slightly translucent. The headline and captions keep clear of its corner.
 - **Music.** Normalised to `--music-db` below the speech (default −16), looped to length, faded in and out, and ducked by roughly 6–9 dB while someone talks. The mix still lands on −14 LUFS.
 - **Focus.** The LLM is told the topic, the offline scorer boosts sentences that mention it, and every candidate that covers it ranks first. When nothing matches, the best clips overall are used.
@@ -126,6 +128,7 @@ digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked un
 | `--style` | `karaoke` | `tiktok` · `karaoke` · `hormozi` · `minimal` · `beast` · `neon` · `highlight` · `ghost` |
 | `DIGICLIP_RENDER_JOBS` | auto | How many clips render at once. |
 | `DIGICLIP_FFMPEG` | — | Use a specific ffmpeg. |
+| `DIGICLIP_PRIORITY` | gentle | `normal` turns off gentle mode (below-normal CPU and low disk-I/O priority for the engine and its ffmpeg/tracker children, so the PC stays responsive during renders). |
 
 A `.env` file works too — see `.env.example`.
 

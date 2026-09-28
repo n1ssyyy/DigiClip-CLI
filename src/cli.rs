@@ -143,6 +143,12 @@ pub struct Args {
     #[arg(long)]
     pub style: Option<String>,
 
+    /// Caption motion: pop (default — lines pop in, keywords bump as
+    /// they're spoken), words (pop + words appear one by one as they're
+    /// spoken), none (static lines).
+    #[arg(long, default_value = "pop", value_parser = ["pop", "words", "none"])]
+    pub caption_anim: String,
+
     /// Output aspect: 9:16 (default — TikTok, Reels, Shorts), 4:5
     /// (Instagram/Facebook feed), 1:1 (square), 16:9 (YouTube). Tracking,
     /// camera, captions and overlays all adapt.

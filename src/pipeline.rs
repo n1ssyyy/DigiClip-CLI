@@ -116,6 +116,7 @@ fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
             .and_then(crate::compose::parse_hex),
         logo,
         music,
+        anim: crate::captions::ass::Anim::parse(&args.caption_anim),
     })
 }
 
@@ -131,6 +132,7 @@ fn ass_opts(
         h: c.h,
         headline,
         dur,
+        anim: look.anim,
         // Logo width + its inset + a gap.
         clear: look.logo.as_ref().map(|l| crate::captions::ass::Clear {
             top: l.corner.is_top(),
@@ -1978,14 +1980,16 @@ fn exec_clip(
     let stem = format!("clip-{rank:02}-{}", look.canvas.tag());
     // Captions on the tight clock — the same clock the frames are on.
     let ass = out.join(format!("{stem}.ass"));
-    let headline = headline.map(|h| {
+    // Bare `--headline`: the picker's headline title, else one lifted
+    // from the clip's own words — never a raw mid-sentence hook quote.
+    let headline = headline.and_then(|h| {
         if h.trim().is_empty() {
             clip.title
                 .clone()
                 .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| clip.hook_line.clone())
+                .or_else(|| crate::kit::headline_from_words(&plan.retimed))
         } else {
-            h.to_string()
+            Some(h.to_string())
         }
     });
     std::fs::write(

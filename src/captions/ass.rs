@@ -316,6 +316,84 @@ pub fn group(
     lines
 }
 
+/// A caption line never runs across a sentence end: "TEACHER. RAISE"
+/// reads as one thought. Splits after any word that ends a sentence.
+fn split_sentences(lines: Vec<Vec<Word>>) -> Vec<Vec<Word>> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut cur = Vec::new();
+        for w in line {
+            let end = ends_sentence(&w.w);
+            cur.push(w);
+            if end {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+/// A line too short to read joins a neighbor from the same sentence
+/// ("I'M" + "KINDERGARTEN"), forward first, if the pair stays compact
+/// (a little over the preset's width is fine: it wraps, it doesn't flash).
+fn merge_flashes(lines: Vec<Vec<Word>>, max_c: usize) -> Vec<Vec<Word>> {
+    let chars = |l: &[Word]| l.iter().map(|w| w.w.chars().count() + 1).sum::<usize>();
+    let span = |l: &[Word]| l[l.len() - 1].e - l[0].s;
+    let fits = |a: &[Word], b: &[Word]| {
+        !ends_sentence(&a[a.len() - 1].w)
+            && b[0].s - a[a.len() - 1].e < 0.6
+            && chars(a) + chars(b) <= max_c + 8
+    };
+    let mut out: Vec<Vec<Word>> = Vec::with_capacity(lines.len());
+    let mut it = lines.into_iter().peekable();
+    while let Some(mut line) = it.next() {
+        if span(&line) < MIN_LINE_S {
+            if let Some(next) = it.peek() {
+                if fits(&line, next) {
+                    line.extend(it.next().unwrap_or_default());
+                    out.push(line);
+                    continue;
+                }
+            }
+            if let Some(prev) = out.last_mut() {
+                if fits(prev, &line) {
+                    prev.extend(line);
+                    continue;
+                }
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Shortest time a caption line stays up (s): a flash is unreadable and
+/// its pop/fade would flicker.
+const MIN_LINE_S: f64 = 0.45;
+/// Gaps shorter than this between lines are bridged (s): the line holds
+/// until the next one replaces it instead of blinking off.
+const BRIDGE_S: f64 = 0.35;
+
+/// On-screen span per line: its words' span, held through short gaps and
+/// to at least `MIN_LINE_S`, never overlapping the next line or `end`.
+fn hold_lines(lines: &[Vec<Word>], end: f64) -> Vec<(f64, f64)> {
+    (0..lines.len())
+        .map(|i| {
+            let (s, e) = (lines[i][0].s, lines[i][lines[i].len() - 1].e);
+            let next = lines.get(i + 1).map_or(end, |l| l[0].s).min(end);
+            let e = if next - e < BRIDGE_S {
+                next
+            } else {
+                e.max(s + MIN_LINE_S).min(next)
+            };
+            (s, e.max(lines[i][lines[i].len() - 1].e.min(end)))
+        })
+        .collect()
+}
+
 /// ASS timestamp H:MM:SS.cc (centiseconds).
 pub fn stamp(s: f64) -> String {
     let s = s.max(0.0);
@@ -329,6 +407,43 @@ pub fn stamp(s: f64) -> String {
     )
 }
 
+/// Caption motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Anim {
+    /// Each line pops in (quick scale overshoot + fade), keywords bump as
+    /// they're spoken.
+    #[default]
+    Pop,
+    /// Pop, and words appear one by one as they're spoken.
+    Words,
+    /// No motion: lines cut in and out (the pre-2.5 look).
+    Static,
+}
+
+impl Anim {
+    /// `pop` | `words` | `none` (unknown values fall back to `pop`).
+    pub fn parse(s: &str) -> Anim {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "static" => Anim::Static,
+            "words" | "word" | "reveal" => Anim::Words,
+            _ => Anim::Pop,
+        }
+    }
+}
+
+/// Headline budget (chars): two short lines on the card.
+const HEADLINE_MAX: usize = 44;
+/// Headline type and accent on the white card (&HAABBGGRR).
+const HEADLINE_INK: &str = "&H00111111";
+const HEADLINE_ACCENT: &str = "&H001E3CFF";
+/// Caption line entrance: fade in/out (ms) and a scale pop that settles by
+/// `POP_MS` — every word's scale is relative to this.
+const LINE_IN: i64 = 80;
+const LINE_OUT: i64 = 60;
+const POP_MS: i64 = 200;
+const LINE_POP: &str =
+    "\\fscx84\\fscy84\\t(0,110,\\fscx105\\fscy105)\\t(110,200,\\fscx100\\fscy100)";
+
 /// Canvas and extras for one captions file.
 #[derive(Debug, Clone)]
 pub struct AssOpts {
@@ -340,6 +455,8 @@ pub struct AssOpts {
     pub dur: f64,
     /// A corner logo the text keeps clear of.
     pub clear: Option<Clear>,
+    /// Caption motion.
+    pub anim: Anim,
 }
 
 /// Corner space taken by a logo: text on that band (headline at the top,
@@ -359,29 +476,103 @@ impl Default for AssOpts {
             headline: None,
             dur: 0.0,
             clear: None,
+            anim: Anim::default(),
         }
     }
 }
 
-/// Headline text: one line-ish, never mid-word (<= `max` chars + "...").
+/// Words a headline never ends on (a cut there reads as unfinished).
+const DANGLING: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "so", "to", "of", "in", "on", "at", "for", "with",
+    "from", "by", "as", "is", "are", "was", "were", "be", "that", "this", "my", "your", "our",
+    "their", "his", "her", "its", "if", "when", "than", "then", "because", "about", "into", "i",
+    "you", "we", "they", "he", "she", "it", "not", "just", "very", "really", "like", "all",
+];
+
+fn bare(w: &str) -> String {
+    w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+        .to_lowercase()
+}
+
+/// Headline text: clean, sentence-cased, at most `max` chars and never
+/// cut mid-thought — a long line is cut at its last clause break that
+/// fits, else at a word, minus any dangling tail ("…of the"). No
+/// ellipsis, no trailing full stop.
 pub fn headline_text(raw: &str, max: usize) -> String {
-    let t = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let t = t.replace(['{', '}', '\\'], "");
-    if t.chars().count() <= max {
-        return upper_first(&t);
-    }
-    let mut out = String::new();
-    for w in t.split(' ') {
-        if out.chars().count() + w.chars().count() + 1 > max {
+    let t = raw
+        .replace(['{', '}', '\\', '*', '"', '\u{201C}', '\u{201D}'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words: Vec<&str> = t.split(' ').filter(|w| !w.is_empty()).collect();
+    let mut n = 0;
+    let mut len = 0;
+    for w in &words {
+        let l = w.chars().count() + usize::from(n > 0);
+        if len + l > max {
             break;
         }
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(w);
+        len += l;
+        n += 1;
     }
-    let out = out.trim_end_matches([',', ';', ':', '-']).to_string();
-    format!("{}\u{2026}", upper_first(&out))
+    let mut keep = &words[..n];
+    if n < words.len() {
+        // Last clause break that keeps at least 3 words.
+        if let Some(i) = (3..=n)
+            .rev()
+            .find(|&i| keep[i - 1].ends_with([',', ';', ':', '.', '!', '?', '\u{2014}']))
+        {
+            keep = &keep[..i];
+        } else {
+            while keep.len() > 2 && DANGLING.contains(&bare(keep[keep.len() - 1]).as_str()) {
+                keep = &keep[..keep.len() - 1];
+            }
+        }
+    }
+    let out = keep.join(" ");
+    let out = out
+        .trim_end_matches([',', ';', ':', '.', '-', '\u{2014}', '\u{2026}'])
+        .trim();
+    upper_first(out)
+}
+
+/// Headline as ASS text: two balanced lines once it's long enough to
+/// wrap, one keyword in the accent color.
+fn headline_markup(h: &str, ink: &str, accent: &str) -> String {
+    let words: Vec<&str> = h.split(' ').collect();
+    // Accent: a keyword, else the longest content word.
+    let pick = (1..words.len())
+        .find(|&i| is_keyword(words[i], false))
+        .or_else(|| {
+            (0..words.len())
+                .filter(|&i| {
+                    let b = bare(words[i]);
+                    b.chars().count() >= 5 && !DANGLING.contains(&b.as_str())
+                })
+                .max_by_key(|&i| (words[i].chars().count(), usize::MAX - i))
+        });
+    // Balanced break: the split that minimizes the longer line.
+    let total = h.chars().count();
+    let brk = if total > 18 && words.len() > 1 {
+        (1..words.len()).min_by_key(|&i| {
+            let a = words[..i].join(" ").chars().count();
+            a.max(total - a - 1)
+        })
+    } else {
+        None
+    };
+    let mut out = String::new();
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 {
+            out.push_str(if Some(i) == brk { "\\N" } else { " " });
+        }
+        if Some(i) == pick {
+            out.push_str(&format!("{{\\1c{accent}&}}{w}{{\\1c{ink}&}}"));
+        } else {
+            out.push_str(w);
+        }
+    }
+    out
 }
 
 /// Sentence-case the first letter (transcript hooks often start lower).
@@ -403,7 +594,23 @@ pub fn build(words: &[Word], preset_name: &str, offset: f64) -> String {
 pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) -> String {
     let name = valid_preset(preset_name);
     let (display, style, (max_w, max_c)) = preset(&name);
-    let lines = group(&attach_punctuation(words), max_w, max_c, 0.6, 4.0);
+    let moving = o.anim != Anim::Static;
+    let mut lines = group(&attach_punctuation(words), max_w, max_c, 0.6, 4.0);
+    if moving {
+        lines = merge_flashes(split_sentences(lines), max_c);
+    }
+    let spans = if moving {
+        hold_lines(
+            &lines,
+            if o.dur > 0.0 {
+                o.dur + offset
+            } else {
+                f64::INFINITY
+            },
+        )
+    } else {
+        lines.iter().map(|l| (l[0].s, l[l.len() - 1].e)).collect()
+    };
     let (pw, ph) = (o.w.max(2), o.h.max(2));
     // Type is designed at 1080 wide; shorter canvases scale it down a bit.
     let k = (pw as f64 / PLAY_W as f64).min(ph as f64 / 1200.0).min(1.0);
@@ -460,37 +667,41 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         alignment,
         margin_v
     ));
-    // Headline: a translucent box, top center, clear of the platform's
-    // top bar on tall canvases.
+    // Headline: one solid white card (a single box behind both lines —
+    // BorderStyle 4) with dark type and one accented word, top center,
+    // clear of the platform's top bar on tall canvases.
     let headline = o
         .headline
         .as_deref()
-        .map(|h| headline_text(h, 64))
+        .map(|h| headline_text(h, HEADLINE_MAX))
         .filter(|h| !h.is_empty() && o.dur > 0.0);
     if headline.is_some() {
         let top = (ph as f64 * if tall { 0.085 } else { 0.05 }).round() as u32;
         let (ml, mr) = clear_of((90.0 * pw as f64 / PLAY_W as f64).round() as u32, true);
         out.push_str(&format!(
-            "Style: Headline,Archivo Black,{},&H00FFFFFF,&H00FFFFFF,&H38000000,&H38000000,0,0,0,0,100,100,0,0,3,{},0,8,{ml},{mr},{top},1\n",
-            px(58),
-            px(18),
+            "Style: Headline,Archivo Black,{},{HEADLINE_INK},{HEADLINE_INK},&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,4,{},0,8,{ml},{mr},{top},1\n",
+            px(64),
+            px(24),
         ));
     }
     out.push('\n');
     out.push_str("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
     if let Some(h) = &headline {
+        // Pops in: a quick overshoot, then settles.
         out.push_str(&format!(
-            "Dialogue: 1,{},{},Headline,,0,0,0,,{{\\fad(250,0)}}{h}\n",
+            "Dialogue: 1,{},{},Headline,,0,0,0,,{{\\fad(160,0)\\fscx72\\fscy72\\t(0,200,\\fscx106\\fscy106)\\t(200,340,\\fscx100\\fscy100)}}{}\n",
             stamp(0.0),
             stamp(o.dur),
+            headline_markup(h, HEADLINE_INK, HEADLINE_ACCENT),
         ));
     }
     let accent = accent_for(&name);
     let mut fresh = true; // next word opens a sentence (tracked across lines)
-    for line in &lines {
+    for (line, &(t0, t1)) in lines.iter().zip(&spans) {
         let mut text = String::new();
         let mut accented = false; // accent active: restore primary after
-        for w in line {
+        let mut bumped = false; // a keyword bump is in effect: re-base the scale
+        for (i, w) in line.iter().enumerate() {
             let word = if style.caps {
                 w.w.to_uppercase()
             } else {
@@ -498,21 +709,44 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
             };
             let word = word.replace(['{', '}', '\n', '\r'], "");
             let cs = (((w.e - w.s) * 100.0).round() as i64).max(1);
-            if is_keyword(&w.w, fresh) {
-                text.push_str(&format!("{{\\k{cs}\\1c{accent}&}}{word} "));
+            let key = is_keyword(&w.w, fresh);
+            // Offset into the line (ms): \t times are event-relative.
+            let dt = ((w.s - line[0].s) * 1000.0).round().max(0.0) as i64;
+            let mut tags = format!("\\k{cs}");
+            if moving && i == 0 {
+                tags.insert_str(0, &format!("\\fad({LINE_IN},{LINE_OUT}){LINE_POP}"));
+            }
+            if moving && bumped {
+                // Scale state carries to later text: restore the line's own.
+                tags.push_str(LINE_POP);
+                bumped = false;
+            }
+            if key {
+                tags.push_str(&format!("\\1c{accent}&"));
                 accented = true;
             } else if accented {
-                text.push_str(&format!("{{\\k{cs}\\1c{}&}}{word} ", style.primary));
+                tags.push_str(&format!("\\1c{}&", style.primary));
                 accented = false;
-            } else {
-                text.push_str(&format!("{{\\k{cs}}}{word} "));
             }
+            if moving && key && dt >= POP_MS {
+                tags.push_str(&format!(
+                    "\\t({dt},{},\\fscx114\\fscy114)\\t({},{},\\fscx100\\fscy100)",
+                    dt + 90,
+                    dt + 90,
+                    dt + 240
+                ));
+                bumped = true;
+            }
+            if o.anim == Anim::Words && i > 0 {
+                tags.push_str(&format!("\\alpha&HFF&\\t({dt},{},\\alpha&H00&)", dt + 80));
+            }
+            text.push_str(&format!("{{{tags}}}{word} "));
             fresh = ends_sentence(&w.w);
         }
         out.push_str(&format!(
             "Dialogue: 0,{},{},{},,0,0,0,,{}\n",
-            stamp(line[0].s - offset),
-            stamp(line[line.len() - 1].e - offset),
+            stamp(t0 - offset),
+            stamp(t1 - offset),
             display,
             text.trim_end()
         ));
@@ -547,9 +781,157 @@ mod tests {
 
     #[test]
     fn headline_text_is_sentence_cased_and_word_bounded() {
-        assert_eq!(headline_text("  the  {big}\\ one ", 64), "The big one");
-        let long = headline_text("if you guys are not hitting three rate limits a week", 30);
-        assert_eq!(long, "If you guys are not hitting\u{2026}");
+        assert_eq!(headline_text("  the  {big}\\ *one*. ", 64), "The big one");
+        // Cut at a word, minus the dangling tail; never an ellipsis.
+        let long = headline_text("the secret to growing fast is doing less of it", 30);
+        assert_eq!(long, "The secret to growing fast");
+        // Cut at the last clause break that fits.
+        let long = headline_text("nobody talks about this, but it changes everything", 40);
+        assert_eq!(long, "Nobody talks about this");
+        assert_eq!(
+            headline_text("Why is nobody doing this?", 44),
+            "Why is nobody doing this?"
+        );
+    }
+
+    #[test]
+    fn headline_is_one_card_on_two_balanced_lines() {
+        let m = headline_markup("The secret to growing fast", "&H00111111", "&H001E3CFF");
+        assert_eq!(
+            m,
+            "The {\\1c&H001E3CFF&}secret{\\1c&H00111111&} to\\Ngrowing fast"
+        );
+        let m = headline_markup("I made $1 million", "&H00111111", "&H001E3CFF");
+        assert_eq!(m, "I made {\\1c&H001E3CFF&}$1{\\1c&H00111111&} million");
+        let ass = build_for(
+            &words(),
+            "karaoke",
+            0.0,
+            &AssOpts {
+                headline: Some("Big news".into()),
+                dur: 9.0,
+                ..AssOpts::default()
+            },
+        );
+        let h = style_line(&ass, "Headline");
+        assert_eq!(h[15], "4"); // one box behind the whole event
+    }
+
+    fn first_line(ws: &[Word], anim: Anim) -> String {
+        let ass = build_for(
+            ws,
+            "minimal",
+            0.0,
+            &AssOpts {
+                anim,
+                ..AssOpts::default()
+            },
+        );
+        ass.lines()
+            .find(|l| l.starts_with("Dialogue: 0,"))
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn caption_motion_modes() {
+        // Static: the classic karaoke line, untouched.
+        let l = first_line(&words(), Anim::Static);
+        assert!(
+            l.ends_with(",,{\\k35}so {\\k35}this {\\k35}is {\\k35}the"),
+            "{l}"
+        );
+        // Pop: the line pops in and fades.
+        let l = first_line(&words(), Anim::Pop);
+        assert!(
+            l.contains(",,{\\fad(80,60)\\fscx84\\fscy84\\t(0,110,"),
+            "{l}"
+        );
+        assert!(!l.contains("alpha"));
+        // Words: later words appear as they're spoken.
+        let l = first_line(&words(), Anim::Words);
+        assert!(
+            l.contains("{\\k35\\alpha&HFF&\\t(400,480,\\alpha&H00&)}this"),
+            "{l}"
+        );
+        assert_eq!(Anim::parse("none"), Anim::Static);
+        assert_eq!(Anim::parse("WORDS"), Anim::Words);
+        assert_eq!(Anim::parse("?"), Anim::Pop);
+    }
+
+    #[test]
+    fn animated_lines_split_at_sentences_and_never_flash() {
+        let w = |t: &str, s: f64, e: f64| Word {
+            w: t.into(),
+            s,
+            e,
+            conf: None,
+        };
+        // "teacher." ends a sentence; "raise" starts the next line.
+        let ws = vec![
+            w("kindergarten", 0.0, 0.4),
+            w("teacher.", 0.45, 0.6),
+            w("raise", 0.65, 0.7),
+            w("hands", 2.0, 2.1),
+        ];
+        let ass = build_for(&ws, "minimal", 0.0, &AssOpts::default());
+        let d: Vec<&str> = ass
+            .lines()
+            .filter(|l| l.starts_with("Dialogue: 0,"))
+            .collect();
+        assert_eq!(d.len(), 3, "{ass}");
+        // Short gap bridged; a lone flash held to the minimum.
+        assert!(
+            d[0].starts_with("Dialogue: 0,0:00:00.00,0:00:00.65,"),
+            "{}",
+            d[0]
+        );
+        assert!(
+            d[1].starts_with("Dialogue: 0,0:00:00.65,0:00:01.10,"),
+            "{}",
+            d[1]
+        );
+        assert!(
+            d[2].starts_with("Dialogue: 0,0:00:02.00,0:00:02.45,"),
+            "{}",
+            d[2]
+        );
+        // Static keeps the words' own spans.
+        let ass = build_for(
+            &ws,
+            "minimal",
+            0.0,
+            &AssOpts {
+                anim: Anim::Static,
+                ..AssOpts::default()
+            },
+        );
+        assert!(ass.contains("Dialogue: 0,0:00:00.45,0:00:00.70,"), "{ass}");
+    }
+
+    #[test]
+    fn keywords_bump_and_restore_the_line_scale() {
+        let ws: Vec<Word> = "made a million now"
+            .split(' ')
+            .enumerate()
+            .map(|(i, w)| Word {
+                w: w.into(),
+                s: i as f64 * 0.4,
+                e: i as f64 * 0.4 + 0.35,
+                conf: Some(0.9),
+            })
+            .collect();
+        let l = first_line(&ws, Anim::Pop);
+        assert!(
+            l.contains(
+                "\\1c&H0000FFFF&\\t(800,890,\\fscx114\\fscy114)\\t(890,1040,\\fscx100\\fscy100)}million"
+            ),
+            "{l}"
+        );
+        assert!(
+            l.contains(&format!("{{\\k35{LINE_POP}\\1c&H00FFFFFF&}}now")),
+            "{l}"
+        );
     }
 
     #[test]
@@ -564,6 +946,7 @@ mod tests {
                 headline: Some("Big news".into()),
                 dur: 9.0,
                 clear: None,
+                anim: Anim::Pop,
             },
         );
         assert!(ass.contains("PlayResX: 1080\nPlayResY: 1080"));
@@ -572,8 +955,9 @@ mod tests {
         assert_eq!(cap[18], "2");
         let h = style_line(&ass, "Headline");
         assert_eq!((h[19], h[20]), ("90", "90"));
-        assert!(ass
-            .contains("Dialogue: 1,0:00:00.00,0:00:09.00,Headline,,0,0,0,,{\\fad(250,0)}Big news"));
+        assert!(ass.contains(
+            "Dialogue: 1,0:00:00.00,0:00:09.00,Headline,,0,0,0,,{\\fad(160,0)\\fscx72\\fscy72\\t(0,200,\\fscx106\\fscy106)\\t(200,340,\\fscx100\\fscy100)}Big news"
+        ));
     }
 
     #[test]
@@ -584,6 +968,7 @@ mod tests {
             headline: Some("Big news".into()),
             dur: 9.0,
             clear: Some(Clear { top, left, px: 260 }),
+            anim: Anim::Pop,
         };
         // Top-right logo: headline's right margin widens, captions untouched.
         let ass = build_for(&words(), "karaoke", 0.0, &opts(true, false));
