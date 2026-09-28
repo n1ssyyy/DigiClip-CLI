@@ -190,7 +190,8 @@ pub struct Args {
     #[arg(long)]
     pub focus: Option<String>,
 
-    /// Language code passed to whisper-cli (default: en)
+    /// Spoken language for transcription: a whisper code (en, es, de…)
+    /// or `auto` to detect it. English-only `.en` models always use en.
     #[arg(long, default_value = "en")]
     pub lang: String,
 

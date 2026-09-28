@@ -830,6 +830,12 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     // --- transcribe: Vulkan sidecar on GPU, embedded CPU otherwise --------
     let t = std::time::Instant::now();
     emit.stage(Stage::Transcribe, None);
+    // English-only models can't detect or transcribe anything else.
+    let lang = if args.model.ends_with(".en") {
+        "en".to_string()
+    } else {
+        args.lang.clone()
+    };
     let tr = if gpu_on && crate::binaries::resolve("whisper-cli-vulkan").is_some() {
         tracing::info!(
             "transcribe via whisper Vulkan sidecar (model={})…",
@@ -837,7 +843,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
         );
         let topts = crate::whisper::TranscribeOptions {
             model: args.model.clone(),
-            lang: args.lang.clone(),
+            lang: lang.clone(),
             gpu: true,
             threads,
             timeout_s: crate::whisper::timeout_for_model(&args.model),
@@ -851,7 +857,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
         }
         let sopts = crate::stt::SttOptions {
             model: args.model.clone(),
-            lang: args.lang.clone(),
+            lang: lang.clone(),
             threads,
         };
         tracing::info!(
