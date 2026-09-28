@@ -79,6 +79,7 @@ fn artifact_for(clip: &crate::validator::Clip, mp4: &str, kit: Option<String>) -
         why: clip.why_it_works.clone(),
         scores: clip.scores.clone(),
         hashtags: clip.hashtags.clone(),
+        variants: vec![],
     }
 }
 
@@ -335,10 +336,11 @@ async fn resolve_timeline(
     a: f64,
     b: f64,
     words: &[crate::whisper::Word],
+    canvas: crate::compose::Canvas,
     progress: Option<crate::progress::SharedPct>,
     cancel: &CancelFlag,
 ) -> Option<Timeline> {
-    let base = crate::track::Base::new(src_w as f64, src_h as f64, args.canvas());
+    let base = crate::track::Base::new(src_w as f64, src_h as f64, canvas);
     let max_x = (src_w as f64 - base.w).max(0.0);
     match args.framing {
         Framing::Center => None,
@@ -418,7 +420,7 @@ async fn resolve_timeline(
                 b,
                 Some((a, b)),
                 words,
-                args.canvas(),
+                canvas,
                 progress,
                 cancel,
             );
@@ -961,11 +963,18 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
         ocfg: &ocfg,
         vision_model: &vision_model,
         look: &look,
+        extra: false,
     };
 
     match args.mode {
         Mode::Full => {
             // --- full-video subtitle mode -----------------------------------
+            if args.canvases().len() > 1 {
+                tracing::warn!(
+                    "full mode renders one aspect: using {} only",
+                    look.canvas.tag()
+                );
+            }
             if args.dry_run {
                 println!(
                     "dry-run: would render full video ({dur:.0}s) with '{}' captions.",
@@ -1533,70 +1542,96 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                 );
             }
             let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(par));
-            let mut running: tokio::task::JoinSet<anyhow::Result<ClipArtifact>> =
+            let mut running: tokio::task::JoinSet<anyhow::Result<Rendered>> =
                 tokio::task::JoinSet::new();
             let mut report: Vec<ClipArtifact> = Vec::with_capacity(jobs.len());
+            let mut extras: Vec<(usize, crate::progress::Variant)> = Vec::new();
             let mut first_err: Option<anyhow::Error> = None;
-            for (clip, groups) in &jobs {
-                while let Some(r) = running.try_join_next() {
-                    settle_render(r, &mut report, &mut first_err);
-                }
-                if first_err.is_some() {
-                    break;
-                }
-                if let Err(e) = cancel.check() {
-                    first_err = Some(e);
-                    break;
-                }
-                let plan = match plan_clip(
-                    &pc,
-                    clip,
-                    groups,
-                    args.merge_flash && args.merge.is_some(),
-                    &mut tracker,
-                    &out,
-                    ctx,
-                )
-                .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        first_err = Some(e);
-                        break;
+            // Extra `--aspect`s: every clip again from the same cut, framed
+            // and captioned for that canvas, right after its main file.
+            let extra_looks: Vec<crate::render::Look> = args
+                .canvases()
+                .into_iter()
+                .skip(1)
+                .map(|canvas| crate::render::Look {
+                    canvas,
+                    ..look.clone()
+                })
+                .collect();
+            if !extra_looks.is_empty() {
+                let tags: Vec<&str> = extra_looks.iter().map(|l| l.canvas.tag()).collect();
+                tracing::info!("extra aspects per clip: {}", tags.join(", "));
+            }
+            'clips: for (clip, groups) in &jobs {
+                let passes =
+                    std::iter::once((&look, false)).chain(extra_looks.iter().map(|l| (l, true)));
+                for (lk, extra) in passes {
+                    while let Some(r) = running.try_join_next() {
+                        settle_render(r, &mut report, &mut extras, &mut first_err);
                     }
-                };
-                let slot = slots
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("render slots never close");
-                let (input, probe, out) = (input.clone(), probe.clone(), out.clone());
-                let (emit, cancel, kit) = (emit.clone(), cancel.clone(), args.kit);
-                let (look, headline) = (look.clone(), args.headline.clone());
-                running.spawn_blocking(move || {
-                    let _slot = slot;
-                    exec_clip(
-                        plan,
-                        &input,
-                        &probe,
-                        fps,
+                    if first_err.is_some() {
+                        break 'clips;
+                    }
+                    if let Err(e) = cancel.check() {
+                        first_err = Some(e);
+                        break 'clips;
+                    }
+                    let plan = match plan_clip(
+                        &pc.on(lk, extra),
+                        clip,
+                        groups,
+                        args.merge_flash && args.merge.is_some(),
+                        &mut tracker,
                         &out,
-                        gpu_on,
-                        per_threads,
-                        kit,
-                        &look,
-                        headline.as_deref(),
-                        &emit,
-                        &cancel,
+                        ctx,
                     )
-                });
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            first_err = Some(e);
+                            break 'clips;
+                        }
+                    };
+                    let slot = slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("render slots never close");
+                    let (input, probe, out) = (input.clone(), probe.clone(), out.clone());
+                    let (emit, cancel, kit) = (emit.clone(), cancel.clone(), args.kit);
+                    let (lk, headline) = (lk.clone(), args.headline.clone());
+                    running.spawn_blocking(move || {
+                        let _slot = slot;
+                        exec_clip(
+                            plan,
+                            &input,
+                            &probe,
+                            fps,
+                            &out,
+                            gpu_on,
+                            per_threads,
+                            kit,
+                            &lk,
+                            headline.as_deref(),
+                            extra,
+                            &emit,
+                            &cancel,
+                        )
+                    });
+                }
             }
             // A failure stops new renders; those already running finish.
             while let Some(r) = running.join_next().await {
-                settle_render(r, &mut report, &mut first_err);
+                settle_render(r, &mut report, &mut extras, &mut first_err);
             }
             if let Some(e) = first_err {
                 return Err(e);
+            }
+            for (rank, v) in extras {
+                if let Some(a) = report.iter_mut().find(|a| a.rank == rank) {
+                    a.variants.push(v);
+                }
             }
             report.sort_by_key(|a| a.rank);
             // The shared `clip.ass`/`clip.srt` stay "last clip wins" (CLI).
@@ -1627,14 +1662,23 @@ fn render_parallelism(clips: usize) -> usize {
     (crate::whisper::cpu_count() / 4).clamp(1, 3).min(clips)
 }
 
+/// A finished render: a clip's main file, or one of its extra aspects.
+#[allow(clippy::large_enum_variant)]
+enum Rendered {
+    Main(ClipArtifact),
+    Extra(usize, crate::progress::Variant),
+}
+
 /// Collect one finished render (keeps the first error).
 fn settle_render(
-    r: Result<anyhow::Result<ClipArtifact>, tokio::task::JoinError>,
+    r: Result<anyhow::Result<Rendered>, tokio::task::JoinError>,
     report: &mut Vec<ClipArtifact>,
+    extras: &mut Vec<(usize, crate::progress::Variant)>,
     first_err: &mut Option<anyhow::Error>,
 ) {
     match r {
-        Ok(Ok(a)) => report.push(a),
+        Ok(Ok(Rendered::Main(a))) => report.push(a),
+        Ok(Ok(Rendered::Extra(rank, v))) => extras.push((rank, v)),
         Ok(Err(e)) => {
             first_err.get_or_insert(e);
         }
@@ -1657,9 +1701,20 @@ struct PlanCtx<'a> {
     ocfg: &'a crate::openrouter::Config,
     vision_model: &'a str,
     look: &'a crate::render::Look,
+    /// Planning an extra `--aspect` of a clip that already rendered.
+    extra: bool,
 }
 
-impl PlanCtx<'_> {
+impl<'a> PlanCtx<'a> {
+    /// The same context on another look (`extra`: an extra aspect).
+    fn on(&self, look: &'a crate::render::Look, extra: bool) -> Self {
+        Self {
+            look,
+            extra,
+            ..*self
+        }
+    }
+
     fn src_dims(&self) -> (u32, u32) {
         (
             self.probe.width.unwrap_or(1280),
@@ -1857,12 +1912,27 @@ async fn plan_render(
         let (ga, gb) = (first.a, last.b);
         let out0 = part_frame0[pi] as f64 / r;
         // Part-local tracking pct maps onto the clip's overall track phase.
-        let track_hook = emit.shared_hook(move |p| JobEvent::ClipTrack {
-            rank,
-            pct: ((pi as u32 * 100 + p as u32) / n_parts as u32).min(100) as u8,
-        });
+        // Extra-aspect passes run after the clip is done: no progress.
+        let track_hook = if pc.extra {
+            None
+        } else {
+            emit.shared_hook(move |p| JobEvent::ClipTrack {
+                rank,
+                pct: ((pi as u32 * 100 + p as u32) / n_parts as u32).min(100) as u8,
+            })
+        };
         let tl = resolve_timeline(
-            pc.args, pc.ffmpeg, tracker, pc.gpu_on, src_w, src_h, ga, gb, pc.words, track_hook,
+            pc.args,
+            pc.ffmpeg,
+            tracker,
+            pc.gpu_on,
+            src_w,
+            src_h,
+            ga,
+            gb,
+            pc.words,
+            pc.look.canvas,
+            track_hook,
             cancel,
         )
         .await;
@@ -2071,9 +2141,10 @@ fn exec_clip(
     kit: bool,
     look: &crate::render::Look,
     headline: Option<&str>,
+    extra: bool,
     emit: &Emitter,
     cancel: &CancelFlag,
-) -> anyhow::Result<ClipArtifact> {
+) -> anyhow::Result<Rendered> {
     let ClipPlan { clip, mp4, plan } = plan;
     let rank = clip.rank;
     let stem = format!("clip-{rank:02}-{}", look.canvas.tag());
@@ -2118,10 +2189,14 @@ fn exec_clip(
             out: &mp4,
             gpu: gpu_on,
             threads,
-            label: &format!("clip #{rank}"),
+            label: &format!("clip #{rank} {}", look.canvas.tag()),
             look,
         },
-        emit.shared_hook(move |p| JobEvent::ClipRender { rank, pct: p }),
+        if extra {
+            None
+        } else {
+            emit.shared_hook(move |p| JobEvent::ClipRender { rank, pct: p })
+        },
         cancel,
     )?;
     tracing::info!(
@@ -2130,6 +2205,28 @@ fn exec_clip(
         plan.tight_total,
         plan.spans.len()
     );
+    let mp4_name = format!("{stem}.mp4");
+    if extra {
+        // Same cut and words as the main file: kit and SRT are shared.
+        let poster = format!("{stem}-poster.jpg");
+        let poster =
+            (emit.active() && crate::ffmpeg::poster(&mp4, &out.join(&poster))).then_some(poster);
+        let v = crate::progress::Variant {
+            aspect: look.canvas.tag().to_string(),
+            mp4: mp4_name,
+            poster,
+        };
+        emit.emit(JobEvent::ClipVariant {
+            rank,
+            variant: v.clone(),
+        });
+        println!(
+            "clip #{rank} {} -> {} (encoder {enc})",
+            v.aspect,
+            mp4.display()
+        );
+        return Ok(Rendered::Extra(rank, v));
+    }
     // Upload kit on the tight clock (cut fillers never become titles).
     if kit {
         let kit_clip = crate::validator::Clip {
@@ -2142,7 +2239,6 @@ fn exec_clip(
             tracing::warn!("upload kit failed for clip #{}: {e}", rank);
         }
     }
-    let mp4_name = format!("{stem}.mp4");
     let mut artifact = artifact_for(&clip, &mp4_name, kit.then(|| kit_name(rank)));
     artifact.tight_dur = plan.tight_total;
     // Serve-only: tile poster + live events (skipped on the CLI).
@@ -2164,7 +2260,7 @@ fn exec_clip(
         mp4.display(),
         clip.source
     );
-    Ok(artifact)
+    Ok(Rendered::Main(artifact))
 }
 
 /// Final edit polish for one picked range's cut plan: edges into the

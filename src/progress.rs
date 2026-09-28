@@ -106,6 +106,18 @@ pub struct ClipArtifact {
     pub scores: Option<crate::openrouter::Scores>,
     #[serde(default)]
     pub hashtags: Vec<String>,
+    /// The same clip in the extra `--aspect`s (main aspect is `mp4`).
+    #[serde(default)]
+    pub variants: Vec<Variant>,
+}
+
+/// One extra-aspect render of a clip (same cut, own framing + captions).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Variant {
+    /// Canvas tag, e.g. `1x1`.
+    pub aspect: String,
+    pub mp4: String,
+    pub poster: Option<String>,
 }
 
 /// Events the pipeline emits. Serve forwards these over `/ws` (throttling
@@ -136,6 +148,12 @@ pub enum JobEvent {
     /// A clip file landed: tile flips making -> done.
     ClipDone {
         clip: ClipArtifact,
+    },
+    /// An extra-aspect file of a clip landed (may arrive before or after
+    /// that clip's ClipDone).
+    ClipVariant {
+        rank: usize,
+        variant: Variant,
     },
     /// A download (ffmpeg zip, YuNet, STT weights) reported bytes.
     ModelsProgress {
