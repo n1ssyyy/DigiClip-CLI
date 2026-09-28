@@ -12,6 +12,9 @@
 //!    camera (speaker left → speaker right handoff → wide → back, plus an
 //!    emphasis punch) with burned captions; a few frames are dumped as PNG
 //!    for eyeballing.
+//! 3. **Split screen and other canvases.** A red|blue source renders as a
+//!    split (red on top, blue below, checked by pixel) and on a square
+//!    canvas (checked by size and frame count).
 
 use std::process::Command;
 
@@ -383,5 +386,162 @@ fn main() {
             "grab frame",
         );
     }
+
+    // ------------------------------------------------ 3. split screen + square
+    // Left half red, right half blue: the split puts red on top, blue below.
+    let duo = tmp.join("duo.mp4");
+    run(
+        Command::new("ffmpeg").args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=640x720:r=30:d=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=640x720:r=30:d=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-filter_complex",
+            "[0:v][1:v]hstack=inputs=2[v]",
+            "-map",
+            "[v]",
+            "-map",
+            "2:a",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            &duo.display().to_string(),
+        ]),
+        "make duo source",
+    );
+    let probe = digiclip_rs::ffmpeg::probe(&duo);
+    let spans = render::spans_for(&[(0.0, 3.0, 0)], fps);
+    let total: usize = spans.iter().map(|s| s.frames).sum();
+    let wide = camera::Pose {
+        rect: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1280.0,
+            h: 720.0,
+        },
+        ax: 640.0,
+        ay: 360.0,
+        kind: Kind::Wide,
+    };
+    let poses = vec![wide; total];
+    // Half-canvas aspect 1080x960 inside each color.
+    let half = |cx: f64| Rect::from_center(cx, 360.0, 540.0 * 1.125, 540.0);
+    let split = vec![(half(320.0), half(960.0)); total];
+    // Grab one frame as `w x h` RGB.
+    let rgb = |path: &std::path::Path, w: usize, h: usize| {
+        run(
+            Command::new("ffmpeg").args([
+                "-v",
+                "error",
+                "-ss",
+                "1.5",
+                "-i",
+                &path.display().to_string(),
+                "-frames:v",
+                "1",
+                "-vf",
+                &format!("scale={w}:{h},format=rgb24"),
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]),
+            "decode rgb",
+        )
+    };
+    let dims = |path: &std::path::Path| {
+        let out = run(
+            Command::new("ffprobe").args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+                &path.display().to_string(),
+            ]),
+            "ffprobe dims",
+        );
+        String::from_utf8_lossy(&out).trim().to_string()
+    };
+    let out = tmp.join("clip-split.mp4");
+    render::render(
+        &Job {
+            source: &duo,
+            probe: &probe,
+            fps,
+            spans: &spans,
+            poses: &poses,
+            flash: &[],
+            split: &split,
+            ass: None,
+            out: &out,
+            gpu: false,
+            threads: 4,
+            label: "split",
+            look: &Default::default(),
+        },
+        None,
+        &cancel,
+    )
+    .expect("split render");
+    assert_eq!(dims(&out), "1080,1920");
+    assert_eq!(probe_counts(&out).0, total);
+    // 1x2 pixels: top then bottom.
+    let px = rgb(&out, 1, 2);
+    let (top, bot) = (&px[0..3], &px[3..6]);
+    println!("split: top rgb {top:?}, bottom rgb {bot:?}");
+    assert!(
+        top[0] > 180 && top[2] < 80,
+        "top half must show the left (red) person"
+    );
+    assert!(
+        bot[2] > 180 && bot[0] < 80,
+        "bottom half must show the right (blue) person"
+    );
+
+    let out = tmp.join("clip-square.mp4");
+    render::render(
+        &Job {
+            source: &duo,
+            probe: &probe,
+            fps,
+            spans: &spans,
+            poses: &poses,
+            flash: &[],
+            split: &[],
+            ass: None,
+            out: &out,
+            gpu: false,
+            threads: 4,
+            label: "square",
+            look: &render::Look {
+                canvas: digiclip_rs::compose::Canvas::SQUARE,
+                ..Default::default()
+            },
+        },
+        None,
+        &cancel,
+    )
+    .expect("square render");
+    assert_eq!(dims(&out), "1080,1080");
+    assert_eq!(probe_counts(&out).0, total);
+    println!("split + square renders OK");
+
     println!("render smoke OK ({})", tmp.display());
 }

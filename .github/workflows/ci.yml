@@ -44,6 +44,52 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
+  render-smoke:
+    # Real renders through ffmpeg on every OS: A/V sync across jump cuts,
+    # the planned camera with burned captions, split screen, square
+    # canvas (examples/render_smoke.rs).
+    name: Render smoke (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y cmake clang libclang-dev build-essential ffmpeg
+
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: brew install cmake llvm ffmpeg
+
+      - name: Install Windows deps
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - name: ffmpeg has libass
+        shell: bash
+        run: |
+          ffmpeg -hide_banner -version | head -1
+          ffmpeg -hide_banner -filters | grep -E '^ ... (ass|subtitles) '
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: render-smoke
+
+      - name: Render smoke
+        run: cargo run --release --example render_smoke
+
   build:
     name: Build (${{ matrix.os }})
     needs: test
@@ -125,7 +171,7 @@ jobs:
 
   release:
     name: Release
-    needs: build
+    needs: [build, render-smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
