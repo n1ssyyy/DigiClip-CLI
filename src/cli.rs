@@ -151,7 +151,9 @@ pub struct Args {
 
     /// Output aspect: 9:16 (default — TikTok, Reels, Shorts), 4:5
     /// (Instagram/Facebook feed), 1:1 (square), 16:9 (YouTube). Tracking,
-    /// camera, captions and overlays all adapt.
+    /// camera, captions and overlays all adapt. A comma list
+    /// (`9:16,1:1`) renders every clip once per aspect from the same picks:
+    /// the first is the main file, the rest are extra files per clip.
     #[arg(long, default_value = "9:16", value_parser = parse_aspect)]
     pub aspect: String,
 
@@ -279,9 +281,19 @@ pub struct Args {
 }
 
 fn parse_aspect(s: &str) -> Result<String, String> {
-    crate::compose::Canvas::parse(s)
-        .map(|c| c.tag().replace('x', ":"))
-        .ok_or_else(|| format!("unknown aspect '{s}' (use 9:16, 4:5, 1:1 or 16:9)"))
+    let mut out: Vec<String> = Vec::new();
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let a = crate::compose::Canvas::parse(part)
+            .map(|c| c.tag().replace('x', ":"))
+            .ok_or_else(|| format!("unknown aspect '{part}' (use 9:16, 4:5, 1:1 or 16:9)"))?;
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    if out.is_empty() {
+        return Err("empty aspect (use 9:16, 4:5, 1:1 or 16:9)".into());
+    }
+    Ok(out.join(","))
 }
 
 fn parse_color(s: &str) -> Result<String, String> {
@@ -291,9 +303,17 @@ fn parse_color(s: &str) -> Result<String, String> {
 }
 
 impl Args {
-    /// The output canvas (`--aspect`).
+    /// The main output canvas (first `--aspect`).
     pub fn canvas(&self) -> crate::compose::Canvas {
-        crate::compose::Canvas::parse(&self.aspect).unwrap_or_default()
+        self.canvases().first().copied().unwrap_or_default()
+    }
+
+    /// Every requested canvas, main first.
+    pub fn canvases(&self) -> Vec<crate::compose::Canvas> {
+        self.aspect
+            .split(',')
+            .filter_map(|p| crate::compose::Canvas::parse(p.trim()))
+            .collect()
     }
 }
 

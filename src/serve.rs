@@ -239,6 +239,9 @@ pub struct ClipState {
     /// cache-bust the video and poster after an edit.
     #[serde(default)]
     pub rev: u32,
+    /// Extra-aspect files of this clip.
+    #[serde(default)]
+    pub variants: Vec<crate::progress::Variant>,
 }
 
 fn pending_state() -> String {
@@ -269,6 +272,7 @@ impl ClipState {
             scores: a.scores.clone(),
             hashtags: a.hashtags.clone(),
             rev: 0,
+            variants: a.variants.clone(),
         }
     }
 
@@ -1005,6 +1009,8 @@ async fn run_job(st: Arc<AppState>, id: String) {
                     let mut state = ClipState::done(&clip);
                     if let Some(c) = live.record.clips.iter_mut().find(|c| c.rank == clip.rank) {
                         state.rev = c.rev + 1;
+                        // Extra aspects can finish before the main file.
+                        state.variants = std::mem::take(&mut c.variants);
                         *c = state.clone();
                     } else {
                         state.rev = 1;
@@ -1018,6 +1024,14 @@ async fn run_job(st: Arc<AppState>, id: String) {
                             clip: state,
                         },
                     });
+                }
+                JobEvent::ClipVariant { rank, variant } => {
+                    if let Some(c) = live.record.clips.iter_mut().find(|c| c.rank == rank) {
+                        c.variants.retain(|v| v.aspect != variant.aspect);
+                        c.variants.push(variant);
+                        let r = live.record.clone();
+                        publish(&stf, &r);
+                    }
                 }
                 JobEvent::ModelsProgress {
                     id: mid,
@@ -2108,6 +2122,19 @@ mod tests {
         assert_eq!(a.canvas(), crate::compose::Canvas::TALL);
         assert_eq!(a.logo_pos, "tr");
         o.aspect = Some("3:1".into());
+        assert!(args_for(&src, &out, &o, &s).is_err());
+    }
+
+    #[test]
+    fn aspect_lists_render_every_canvas_main_first() {
+        use crate::compose::Canvas;
+        let (src, out, mut o, s) = opts();
+        o.aspect = Some("1:1, 9:16,1:1,,16:9".into());
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.aspect, "1:1,9:16,16:9");
+        assert_eq!(a.canvas(), Canvas::SQUARE);
+        assert_eq!(a.canvases(), [Canvas::SQUARE, Canvas::TALL, Canvas::WIDE]);
+        o.aspect = Some("9:16,3:1".into());
         assert!(args_for(&src, &out, &o, &s).is_err());
     }
 
