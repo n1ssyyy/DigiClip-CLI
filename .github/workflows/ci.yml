@@ -67,7 +67,11 @@ jobs:
 
       - name: Install macOS deps
         if: runner.os == 'macOS'
-        run: brew install cmake llvm ffmpeg
+        # Plain `ffmpeg` dropped libass in Homebrew's 9.0 split; the
+        # keg-only ffmpeg-full keeps it.
+        run: |
+          brew install cmake llvm ffmpeg-full
+          echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
 
       - name: Install Windows deps
         if: runner.os == 'Windows'
