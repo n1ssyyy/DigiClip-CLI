@@ -26,8 +26,8 @@ pub fn peaks(m: &[(f64, f64)], db: f64) -> Vec<(f64, f64)> {
         .enumerate()
         .map(|(i, _)| {
             let (mut s, mut n) = (0.0, 0);
-            for j in i.saturating_sub(2)..=(i + 2).min(m.len() - 1) {
-                s += m[j].1;
+            for x in &m[i.saturating_sub(2)..=(i + 2).min(m.len() - 1)] {
+                s += x.1;
                 n += 1;
             }
             s / n as f64

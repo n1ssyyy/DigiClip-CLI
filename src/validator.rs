@@ -92,8 +92,7 @@ fn sent_end_before(words: &[Word], t: f64) -> Option<f64> {
     words
         .iter()
         .filter(|w| w.s <= t + 1e-9)
-        .filter(|w| ends_sentence(&w.w))
-        .last()
+        .rfind(|w| ends_sentence(&w.w))
         .map(|w| w.e)
 }
 

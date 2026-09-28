@@ -230,7 +230,7 @@ fn segments_split_track_and_wide() {
     use digiclip_rs::track::{build_segments, SegKind};
     // Faces 0-5s, gap 5-10s, faces after.
     let mut seen: Vec<(f64, bool)> = (0..80)
-        .map(|i| (i as f64 * 0.25, i < 20 || i >= 40))
+        .map(|i| (i as f64 * 0.25, !(20..40).contains(&i)))
         .collect();
     let _ = &mut seen;
     let segs = build_segments(&seen, 20.0);

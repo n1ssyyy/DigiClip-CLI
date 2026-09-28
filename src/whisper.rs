@@ -152,6 +152,7 @@ pub fn cpu_count() -> usize {
 
 /// Pure command builder (no I/O): whisper binary + flags.
 /// This whisper.cpp release uses -ng/-dev, not the older -ngl.
+#[allow(clippy::too_many_arguments)]
 pub fn build_command(
     whisper: &Path,
     model: &Path,

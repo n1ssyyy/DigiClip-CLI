@@ -211,7 +211,7 @@ pub fn decode_stride(head: &StrideHeads, score_threshold: f32) -> Vec<Face> {
 }
 
 fn pad_to(x: usize, div: usize) -> usize {
-    ((x + div - 1) / div) * div
+    x.div_ceil(div) * div
 }
 
 /// Padded dims for an input size (OpenCV pads to multiples of 32 with 0).
@@ -1047,8 +1047,8 @@ pub fn plan_tracks(
         let all_talking = members.len() >= 2 && members.iter().all(|(_, m)| *m > 0.12);
         if all_talking {
             speech_live = 30;
-        } else if speech_live > 0 {
-            speech_live -= 1;
+        } else {
+            speech_live = speech_live.saturating_sub(1);
         }
         let group_candidate: Option<(f64, f64, f64, f64)> = if members.len() >= 2 && speech_live > 0
         {
@@ -1220,9 +1220,7 @@ pub fn plan_tracks(
             }
         };
         // Punch anchor: the face (or the group's eye line) this frames.
-        let (ax, ay) = if weak {
-            (gx + gw / 2.0, gy + gh * 0.4)
-        } else if grouped {
+        let (ax, ay) = if weak || grouped {
             (gx + gw / 2.0, gy + gh * 0.4)
         } else {
             match face {
@@ -1500,14 +1498,14 @@ mod tests {
         let mut s = GroupState::default();
         assert_eq!(s.step(false), (false, false));
         for _ in 0..3 {
-            assert_eq!(s.step(true).0, false, "blips must not engage");
+            assert!(!s.step(true).0, "blips must not engage");
         }
         // Fourth straight yes: on + edge (arrival dollies in).
         assert_eq!(s.step(true), (true, true));
         assert_eq!(s.step(true), (true, false));
         // Brief misses don't drop it...
         for _ in 0..7 {
-            assert_eq!(s.step(false).0, true);
+            assert!(s.step(false).0);
         }
         // ...but eight straight misses exit with an edge.
         assert_eq!(s.step(false), (false, true));
@@ -1770,7 +1768,10 @@ mod tests {
             h: 80.0,
             score: 0.9,
         };
-        assert!(faces_overlap(&[b.clone()], &[a.clone()]));
+        assert!(faces_overlap(
+            std::slice::from_ref(&b),
+            std::slice::from_ref(&a)
+        ));
         // Shot/reverse-shot: nobody overlaps → cut confirms.
         let c = Face {
             x: 400.0,
@@ -1779,9 +1780,12 @@ mod tests {
             h: 80.0,
             score: 0.9,
         };
-        assert!(!faces_overlap(&[c.clone()], &[a.clone()]));
+        assert!(!faces_overlap(
+            std::slice::from_ref(&c),
+            std::slice::from_ref(&a)
+        ));
         // Empty either side: no continuity to protect.
-        assert!(!faces_overlap(&[], &[a.clone()]));
+        assert!(!faces_overlap(&[], std::slice::from_ref(&a)));
         assert!(!faces_overlap(&[c], &[]));
     }
 }
