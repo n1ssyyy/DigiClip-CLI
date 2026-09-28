@@ -102,63 +102,132 @@ const FILLER_OPEN: &[&str] = &[
 /// starting on one makes no sense out of context.
 const DANGLING_OPEN: &[&str] = &[
     "it", "it's", "its", "that", "that's", "he", "she", "they", "him", "her", "them", "which",
-    "because", "or", "then", "also", "too", "than", "who",
+    "because", "or", "then", "also", "too", "than",
 ];
 
-/// Offline on-screen headline from the clip's own words (output clock):
-/// the best short, complete sentence near the top — 3 to 9 words once
-/// filler openers are dropped, not leaning on context it doesn't have,
-/// questions and keyword-rich lines first. `None` when nothing reads well
-/// on its own (no headline beats a nonsensical one).
-pub fn headline_from_words(words: &[Word]) -> Option<String> {
-    let mut best: Option<(f64, String)> = None;
-    let mut sent: Vec<&Word> = Vec::new();
-    let mut consider = |sent: &[&Word]| {
-        let Some(first) = sent.first() else { return };
-        let last = sent[sent.len() - 1];
-        if first.s > 25.0 || !last.w.ends_with(['.', '!', '?']) {
-            return;
-        }
-        let mut ws: Vec<&str> = sent.iter().map(|w| w.w.trim()).collect();
-        while let Some(w) = ws.first() {
-            if FILLER_OPEN.contains(&clean(w).as_str()) || w.ends_with(',') && ws.len() > 3 {
-                ws.remove(0);
-            } else {
-                break;
-            }
-        }
-        if ws.len() < 3 || ws.len() > 9 {
-            return;
-        }
-        let lower: Vec<String> = ws.iter().map(|w| clean(w)).collect();
-        if DANGLING_OPEN.contains(&lower[0].as_str())
-            || lower
-                .iter()
-                .any(|w| matches!(w.as_str(), "um" | "uh" | "uhm" | "mm" | "hmm"))
-        {
-            return;
-        }
-        let text = ws.join(" ");
-        let keys = (1..ws.len())
-            .filter(|&i| crate::captions::ass::is_keyword(ws[i], false))
-            .count();
-        let score = if text.ends_with('?') { 2.0 } else { 0.0 }
-            + if text.ends_with('!') { 1.0 } else { 0.0 }
-            + keys.min(2) as f64
-            - 0.2 * (ws.len() as f64 - 6.0).abs()
-            - 0.04 * first.s;
-        if best.as_ref().is_none_or(|(b, _)| score > *b) {
-            best = Some((score, text));
-        }
-    };
-    for w in words {
-        sent.push(w);
-        if w.w.ends_with(['.', '!', '?', '…']) {
-            consider(&sent);
-            sent.clear();
+/// Words a real question opens with.
+const QUESTION_OPEN: &[&str] = &[
+    "what",
+    "why",
+    "how",
+    "who",
+    "when",
+    "where",
+    "which",
+    "is",
+    "are",
+    "was",
+    "were",
+    "do",
+    "does",
+    "did",
+    "can",
+    "could",
+    "would",
+    "should",
+    "will",
+    "have",
+    "has",
+    "am",
+    "whats",
+    "what's",
+    "who's",
+    "how's",
+    "where's",
+    "isn't",
+    "aren't",
+    "don't",
+    "doesn't",
+    "didn't",
+    "can't",
+    "won't",
+    "wouldn't",
+    "shouldn't",
+];
+/// Tails that make a "question" a tag on a statement ("…, right?").
+const TAG_TAIL: &[&str] = &["right", "okay", "ok", "yeah", "huh", "no", "correct", "yes"];
+
+/// A sentence as a standalone headline: `(score, text)`, or `None` when
+/// it doesn't read well on its own. `t` = when it starts (s into the clip).
+fn headline_candidate(sentence: &str, t: f64) -> Option<(f64, String)> {
+    let mut ws: Vec<&str> = sentence.split_whitespace().collect();
+    if !ws.last()?.ends_with(['.', '!', '?']) {
+        return None;
+    }
+    while let Some(w) = ws.first() {
+        if FILLER_OPEN.contains(&clean(w).as_str()) || w.ends_with(',') && ws.len() > 3 {
+            ws.remove(0);
+        } else {
+            break;
         }
     }
-    best.map(|(_, t)| crate::captions::ass::headline_text(&t, 44))
+    let text = ws.join(" ");
+    if ws.len() < 3 || ws.len() > 9 || text.chars().count() > HEADLINE_CHARS {
+        return None;
+    }
+    let lower: Vec<String> = ws.iter().map(|w| clean(w)).collect();
+    if DANGLING_OPEN.contains(&lower[0].as_str())
+        || lower
+            .iter()
+            .any(|w| matches!(w.as_str(), "um" | "uh" | "uhm" | "mm" | "hmm"))
+        || ws
+            .iter()
+            .any(|w| w.contains("--") || w.contains('\u{2014}'))
+    {
+        return None;
+    }
+    let question = text.ends_with('?');
+    if question
+        && (!QUESTION_OPEN.contains(&lower[0].as_str())
+            || TAG_TAIL.contains(&lower[lower.len() - 1].as_str()))
+    {
+        return None;
+    }
+    let keys = (1..ws.len())
+        .filter(|&i| crate::captions::ass::is_keyword(ws[i], false))
+        .count();
+    let score = if question { 2.0 } else { 0.0 }
+        + if text.ends_with('!') { 1.0 } else { 0.0 }
+        + keys.min(2) as f64
+        - 0.2 * (ws.len() as f64 - 6.0).abs()
+        - 0.04 * t;
+    Some((score, text))
+}
+
+/// Longest offline headline (chars): it's shown whole, never cut.
+const HEADLINE_CHARS: usize = 48;
+
+/// Offline on-screen headline: the clip's hook line when it stands on its
+/// own (it's the opening sentence, straight from the transcript), else the
+/// best short, complete sentence in the clip's first seconds — 3 to 9
+/// words once filler openers are dropped, no context-dependent opener
+/// ("it", "that"), real questions only (no "…, right?"). `None` when
+/// nothing reads well on its own: no headline beats a nonsensical one.
+pub fn headline_for(hook: &str, words: &[Word]) -> Option<String> {
+    let pick = headline_candidate(hook, 0.0).or_else(|| {
+        let mut best: Option<(f64, String)> = None;
+        let mut sent: Vec<&Word> = Vec::new();
+        for w in words {
+            sent.push(w);
+            if w.w.ends_with(['.', '!', '?', '\u{2026}']) {
+                if sent[0].s <= 25.0 {
+                    let text = sent
+                        .iter()
+                        .map(|w| w.w.trim())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if let Some(c) = headline_candidate(&text, sent[0].s) {
+                        if best.as_ref().is_none_or(|(b, _)| c.0 > *b) {
+                            best = Some(c);
+                        }
+                    }
+                }
+                sent.clear();
+            }
+        }
+        best
+    });
+    pick.map(|(_, t)| crate::captions::ass::headline_text(&t, HEADLINE_CHARS))
         .filter(|t| !t.is_empty())
 }
 
@@ -266,12 +335,27 @@ mod tests {
              It's crazy. So, why do most creators quit in year one? Nobody talks about that.",
         );
         assert_eq!(
-            headline_from_words(&words).as_deref(),
+            headline_for("", &words).as_deref(),
             Some("Why do most creators quit in year one?")
         );
         // Nothing stands on its own: no headline.
         let words = tw("and then he said that it was um fine and we kept going with it");
-        assert_eq!(headline_from_words(&words), None);
+        assert_eq!(headline_for("and then he said", &words), None);
+        // A hook line that stands on its own wins; tag questions and
+        // questions that aren't questions never make it.
+        assert_eq!(
+            headline_for("Who here's not using more than a $20 version?", &words).as_deref(),
+            Some("Who here's not using more than a $20 version?")
+        );
+        assert_eq!(headline_for("Raise your hand, right?", &[]), None);
+        assert_eq!(
+            headline_for("Here's not using more than $20 version?", &[]),
+            None
+        );
+        assert_eq!(
+            headline_for("You do not have-- OK, who here is using more", &[]),
+            None
+        );
     }
 
     #[test]
