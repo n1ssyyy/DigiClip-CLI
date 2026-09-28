@@ -11,8 +11,8 @@ use clap::{Parser, ValueEnum};
 #[derive(Parser, Debug, Clone)]
 #[command(name = "digiclip", version, about)]
 pub struct Args {
-    /// Input video (.mp4, .mov, .mkv, .webm, .m4a) — or a folder of them.
-    /// Not needed with --provision.
+    /// Input video (.mp4, .mov, .mkv, .webm, .m4a), a folder of them, or
+    /// a link (downloaded with yt-dlp). Not needed with --provision.
     pub input: Option<PathBuf>,
 
     /// More inputs: every file (or folder) runs in turn, each into its own
