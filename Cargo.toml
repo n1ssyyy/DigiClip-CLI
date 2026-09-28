@@ -31,6 +31,7 @@ ndarray = "0.17"
 hound = "3"
 zip = "2"
 base64 = "0.22"
+fast_image_resize = "6"
 axum = { version = "0.8.9", features = ["ws"] }
 tower-http = { version = "0.7.1", features = ["cors", "fs"] }
 tower = { version = "0.5.3", features = ["util"] }

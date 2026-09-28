@@ -14,10 +14,32 @@
 
 use std::path::PathBuf;
 
+use crate::audio::Envelope;
+use crate::camera::{self, Kind, Pose, Target};
 use crate::cli::{Args, Framing, Mode};
+use crate::compose::Rect;
 use crate::progress::{CancelFlag, ClipArtifact, Emitter, JobEvent, Stage};
-use crate::render::{Chunk, ChunkKind};
+use crate::timeline::{CutPlan, Keep};
 use crate::track::RawTarget;
+use crate::whisper::Word;
+
+/// One framing stretch of a tracked range (absolute source seconds).
+#[derive(Debug, Clone)]
+struct Chunk {
+    t0: f64,
+    t1: f64,
+    kind: ChunkKind,
+}
+
+#[derive(Debug, Clone)]
+enum ChunkKind {
+    /// Face-following raw framing evidence (planned clip-wide).
+    Track(Vec<RawTarget>),
+    /// Nobody on camera: the whole frame, letterboxed over a blur fill.
+    Wide,
+    /// Static framing at 0..1 frame position (VLM suggestion).
+    Punch(f64),
+}
 
 /// Per-run context: serve passes a live emitter + cancel flag, the CLI
 /// passes [`JobCtx::cli`] (both no-ops) so CLI output never changes.
@@ -61,12 +83,13 @@ fn kit_name(rank: usize) -> String {
     format!("clip-{rank:02}-upload.txt")
 }
 
-/// Tracked timeline: raw per-sample framing targets + Track/Wide segments.
-/// Rendering smooths the whole clip in ONE camera path (bezier dollies
-/// between framings — never dissolves), so targets stay raw until render.
+/// Tracked timeline: raw per-sample framing evidence, frame-exact shot
+/// cuts and Track/Wide segments. The camera planner turns it into ONE path
+/// per clip once every keep is known.
 struct Timeline {
     raw: Vec<RawTarget>,
     segments: Vec<crate::track::Seg>,
+    shots: Vec<f64>,
 }
 
 fn out_dir_for(input: &std::path::Path, out_dir: &Option<PathBuf>) -> PathBuf {
@@ -213,48 +236,35 @@ fn log_group_shots(chunks: &[Chunk], clip: &crate::validator::Clip) {
     }
 }
 
-/// Emphasis punch windows for one tracked group (best-effort: any failure
-/// — or the toggle — yields no punches, never an error).
-fn scan_punches(
-    ffmpeg: &PathBuf,
-    input: &PathBuf,
-    words: &[crate::whisper::Word],
-    keeps: &[crate::timeline::Keep],
-    ga: f64,
-    gb: f64,
+/// Emphasis punch windows for one part (source clock). Best-effort and
+/// free: the loudness series comes from the already-extracted audio
+/// envelope (no extra ffmpeg passes).
+fn punch_windows(
+    env: Option<&Envelope>,
+    words: &[Word],
+    keeps: &[Keep],
     args: &Args,
 ) -> Vec<(f64, f64)> {
+    let (Some(env), Some(first), Some(last)) = (env, keeps.first(), keeps.last()) else {
+        return vec![];
+    };
     if !args.punch || args.punch_max == 0 {
         return vec![];
     }
-    match crate::punch::scan(ffmpeg, input, ga, gb) {
-        Ok(m) => {
-            let p = crate::punch::peaks(&m, args.punch_db);
-            let mut w = crate::punch::windows(&p, words, Some(keeps), args.punch_max);
-            // Clamp to the tracked span (word tails overshoot it) so every
-            // window covers real samples; drop slivers.
-            for (s, e) in w.iter_mut() {
-                *s = (*s).max(ga);
-                *e = (*e).min(gb);
-            }
-            w.retain(|(s, e)| e - s > 0.2);
-            for (s, e) in &w {
-                let txt: String = words
-                    .iter()
-                    .filter(|x| x.s >= *s - 0.25 && x.e <= *e + 0.25)
-                    .take(6)
-                    .map(|x| x.w.clone())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                tracing::info!("emphasis punch {s:.1}s-{e:.1}s: {txt}");
-            }
-            w
-        }
-        Err(e) => {
-            tracing::warn!("punch scan failed ({e}): continuing flat");
-            vec![]
-        }
+    let m = env.loudness(first.a, last.b);
+    let p = crate::punch::peaks(&m, args.punch_db);
+    let w = crate::punch::windows(&p, words, Some(keeps), args.punch_max);
+    for (s, e) in &w {
+        let txt: String = words
+            .iter()
+            .filter(|x| x.s >= *s - 0.25 && x.e <= *e + 0.25)
+            .take(6)
+            .map(|x| x.w.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!("emphasis punch {s:.1}s-{e:.1}s: {txt}");
     }
+    w
 }
 
 async fn resolve_timeline(
@@ -267,8 +277,6 @@ async fn resolve_timeline(
     a: f64,
     b: f64,
     words: &[crate::whisper::Word],
-    forced: &[f64],
-    punches: &[(f64, f64)],
     progress: Option<crate::progress::SharedPct>,
     cancel: &CancelFlag,
 ) -> Option<Timeline> {
@@ -287,16 +295,22 @@ async fn resolve_timeline(
                     let raw: Vec<RawTarget> = plan
                         .tracks
                         .into_iter()
-                        .map(|tp| RawTarget {
-                            t: tp.t,
-                            x: tp.x.clamp(0.0, max_x),
-                            y: 0.0,
-                            w: base_w,
-                            h: src_h as f64,
-                            cut: false,
-                            hard: false,
-                            n_faces: 1,
-                            pick_cx: tp.x + base_w / 2.0,
+                        .map(|tp| {
+                            let x = tp.x.clamp(0.0, max_x);
+                            RawTarget {
+                                t: tp.t,
+                                x,
+                                y: 0.0,
+                                w: base_w,
+                                h: src_h as f64,
+                                cut: false,
+                                hard: false,
+                                n_faces: 1,
+                                pick_cx: x + base_w / 2.0,
+                                ax: x + base_w / 2.0,
+                                ay: src_h as f64 * 0.4,
+                                weak: false,
+                            }
                         })
                         .collect();
                     let end = raw.last().map(|t| t.t).unwrap_or(b);
@@ -307,6 +321,7 @@ async fn resolve_timeline(
                             t1: end.max(b),
                             kind: crate::track::SegKind::Track,
                         }],
+                        shots: vec![],
                     };
                     Some(tl)
                 }
@@ -344,8 +359,6 @@ async fn resolve_timeline(
                 b,
                 Some((a, b)),
                 words,
-                forced,
-                punches,
                 progress,
                 cancel,
             );
@@ -374,9 +387,13 @@ async fn resolve_timeline(
                             }
                         );
                     }
+                    if !tracked.shots.is_empty() {
+                        tracing::info!("{} shot cut(s) pinned to the frame", tracked.shots.len());
+                    }
                     Some(Timeline {
                         raw: tracked.raw,
                         segments: tracked.segments,
+                        shots: tracked.shots,
                     })
                 }
                 Err(e) => {
@@ -576,10 +593,19 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     let probe = crate::ffmpeg::probe(&input);
     let duration_s = probe.duration_s.unwrap_or(0.0);
     let (src_w, src_h) = (probe.width.unwrap_or(1280), probe.height.unwrap_or(720));
+    // Renders keep the source's own cadence (29.97 stays 29.97: forcing 30
+    // would duplicate a frame every 33 s — a visible hitch).
+    let fps = probe.render_fps();
     tracing::info!(
-        "input: {} ({:.0}s, {src_w}x{src_h}), out: {}",
+        "input: {} ({:.0}s, {src_w}x{src_h}, {:.3} fps{}), out: {}",
         input.display(),
         duration_s,
+        crate::render::rate(fps),
+        if probe.is_bt601() {
+            ", BT.601 -> 709"
+        } else {
+            ""
+        },
         out.display()
     );
 
@@ -593,6 +619,14 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     tracing::info!("extract audio -> {}", wav.display());
     crate::ffmpeg::extract_wav(&input, &wav, 16000)?;
     let _ = crate::ffmpeg::poster(&input, &out.join("poster.jpg"));
+    // One 10 ms energy envelope drives cut placement and emphasis punches.
+    let env = match Envelope::load(&wav) {
+        Ok(e) => Some(e),
+        Err(e) => {
+            tracing::warn!("audio envelope unavailable ({e}): cuts stay on word stamps");
+            None
+        }
+    };
     tracing::info!("audio extract took {:.1}s", t.elapsed().as_secs_f64());
     emit.stage(Stage::Audio, Some(100));
     cancel.check()?;
@@ -667,6 +701,19 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             .unwrap_or_else(|_| "google/gemini-2.5-flash".into())
     });
 
+    let pc = PlanCtx {
+        args,
+        ffmpeg: &ffmpeg,
+        input: &input,
+        probe: &probe,
+        fps,
+        gpu_on,
+        words: &tr.words,
+        env: env.as_ref(),
+        ocfg: &ocfg,
+        vision_model: &vision_model,
+    };
+
     match args.mode {
         Mode::Full => {
             // --- full-video subtitle mode -----------------------------------
@@ -705,40 +752,50 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             emit.emit(JobEvent::ClipsPicked {
                 clips: vec![artifact.clone()],
             });
-            let track_hook = emit.shared_hook(|p| JobEvent::ClipTrack { rank: 1, pct: p });
-            let timeline = resolve_timeline(
-                args,
-                &ffmpeg,
+            // The whole video is one keep, planned and rendered by the same
+            // engine as clips.
+            let mut part = crate::timeline::CutPlan {
+                keeps: vec![Keep { a: 0.0, b: dur }],
+                removed: vec![],
+                tight_dur: dur,
+            };
+            crate::timeline::snap_keeps(&mut part.keeps, fps);
+            let plan = plan_render(
+                &pc,
+                std::slice::from_ref(&part),
+                false,
                 &mut tracker,
-                gpu_on,
-                src_w,
-                src_h,
-                0.0,
-                dur,
-                &tr.words,
-                &[],
-                &[],
-                track_hook.clone(),
+                &pseudo,
+                emit,
                 cancel,
             )
-            .await;
-            let chunks = chunks_for(&timeline, 0.0, dur);
-            let chunks =
-                resolve_punches(chunks, &tr.words, &ffmpeg, &input, &ocfg, &vision_model).await;
+            .await?;
+            let ass = out.join("full.ass");
+            std::fs::write(
+                &ass,
+                crate::captions::ass::build(&plan.retimed, &style, 0.0),
+            )?;
+            std::fs::write(
+                out.join("full.srt"),
+                crate::captions::srt::from_words(&plan.retimed),
+            )?;
             let t = std::time::Instant::now();
             emit.stage(Stage::Render, None);
-            let render_hook = emit.shared_hook(|p| JobEvent::ClipRender { rank: 1, pct: p });
-            let enc = crate::render::render_full(
-                &input,
-                &tr.words,
-                &style,
-                &chunks,
-                src_w,
-                src_h,
-                gpu_on,
-                &mp4,
-                threads,
-                render_hook.clone(),
+            let enc = crate::render::render(
+                &crate::render::Job {
+                    source: &input,
+                    probe: &probe,
+                    fps,
+                    spans: &plan.spans,
+                    poses: &plan.poses,
+                    flash: &plan.flash,
+                    ass: Some(&ass),
+                    out: &mp4,
+                    gpu: gpu_on,
+                    threads,
+                    label: "full",
+                },
+                emit.shared_hook(|p| JobEvent::ClipRender { rank: 1, pct: p }),
                 cancel,
             )?;
             tracing::info!("render took {:.1}s", t.elapsed().as_secs_f64());
@@ -1049,6 +1106,22 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                         })
                         .collect()
                 };
+            // Final edit polish: every cut edge into real silence (never a
+            // neighbor word), then onto the frame grid; the tile range
+            // reports what actually renders.
+            let mut jobs = jobs;
+            for (c, groups) in jobs.iter_mut() {
+                for g in groups.iter_mut() {
+                    finalize_plan(g, env.as_ref(), &tr.words, fps);
+                }
+                if let (Some(a), Some(b)) = (
+                    groups.first().and_then(|g| g.keeps.first()),
+                    groups.last().and_then(|g| g.keeps.last()),
+                ) {
+                    c.start_s = (a.a * 100.0).round() / 100.0;
+                    c.end_s = (b.b * 100.0).round() / 100.0;
+                }
+            }
             let final_clips: Vec<crate::validator::Clip> =
                 jobs.iter().map(|(c, _)| c.clone()).collect();
             std::fs::write(
@@ -1150,20 +1223,12 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                     break;
                 }
                 let plan = match plan_clip(
+                    &pc,
                     clip,
                     groups,
                     args.merge_flash && args.merge.is_some(),
-                    args,
-                    &ffmpeg,
                     &mut tracker,
-                    gpu_on,
-                    src_w,
-                    src_h,
-                    &tr.words,
-                    &input,
                     &out,
-                    &ocfg,
-                    &vision_model,
                     ctx,
                 )
                 .await
@@ -1179,17 +1244,16 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                     .acquire_owned()
                     .await
                     .expect("render slots never close");
-                let (input, ffmpeg, out) = (input.clone(), ffmpeg.clone(), out.clone());
+                let (input, probe, out) = (input.clone(), probe.clone(), out.clone());
                 let (emit, cancel, kit) = (emit.clone(), cancel.clone(), args.kit);
                 running.spawn_blocking(move || {
                     let _slot = slot;
                     exec_clip(
                         plan,
                         &input,
-                        &ffmpeg,
+                        &probe,
+                        fps,
                         &out,
-                        src_w,
-                        src_h,
                         gpu_on,
                         per_threads,
                         kit,
@@ -1251,299 +1315,458 @@ fn settle_render(
     }
 }
 
-/// One ffmpeg pass of a clip: the whole clip, or one keep of a
-/// tightened/merged clip.
-struct RenderUnit {
-    words: Vec<crate::whisper::Word>,
-    chunks: Vec<crate::render::Chunk>,
-    out: PathBuf,
-    flash: Option<(bool, bool)>,
-    hook: Option<crate::progress::SharedPct>,
-    /// Source range, for the timing log (segments only).
-    seg: Option<(f64, f64)>,
-}
-
-/// A clip after its sequential phase (tracking, punch look-ups). Owns
-/// everything the render needs, so it can run on a blocking thread next to
-/// other clips' renders.
-struct ClipPlan {
-    clip: crate::validator::Clip,
-    mp4: PathBuf,
-    /// Tightened/merged clips render one segment per keep into here, then
-    /// concatenate; `None` is the direct single pass.
-    segdir: Option<PathBuf>,
-    units: Vec<RenderUnit>,
-    retimed: Vec<crate::whisper::Word>,
-    tight_total: f64,
-    kinds_all: Vec<String>,
-}
-
-/// Plan one clip's render: a direct single pass when nothing was cut, else
-/// one segment per keep (each with its own local dolly schedule and
-/// rebased captions) to be concatenated with stream copy. Joins are hard
-/// jump cuts — the path snaps, never glides across deleted time.
-#[allow(clippy::too_many_arguments)]
-async fn plan_clip(
-    clip: &crate::validator::Clip,
-    groups: &[crate::timeline::CutPlan],
-    merge_flash: bool,
-    args: &Args,
-    ffmpeg: &PathBuf,
-    tracker: &mut Option<crate::track::Tracker>,
+/// Everything shared by every clip's planning.
+struct PlanCtx<'a> {
+    args: &'a Args,
+    ffmpeg: &'a PathBuf,
+    input: &'a PathBuf,
+    probe: &'a crate::ffmpeg::Probe,
+    fps: (u32, u32),
     gpu_on: bool,
-    src_w: u32,
-    src_h: u32,
-    words: &[crate::whisper::Word],
-    input: &PathBuf,
-    out: &PathBuf,
-    ocfg: &crate::openrouter::Config,
-    vision_model: &str,
-    ctx: &JobCtx<'_>,
-) -> anyhow::Result<ClipPlan> {
-    let emit = ctx.emit;
-    let cancel = ctx.cancel;
-    let rank = clip.rank;
-    let mp4 = out.join(format!("clip-{rank:02}-9x16.mp4"));
-    let all_keeps: Vec<crate::timeline::Keep> =
-        groups.iter().flat_map(|g| g.keeps.clone()).collect();
-    let retimed = crate::timeline::retime(words, &all_keeps);
-    let tight_total = crate::timeline::plan_dur(&all_keeps);
-    let fast = all_keeps.len() == 1
-        && (all_keeps[0].a - clip.start_s).abs() < 0.05
-        && (all_keeps[0].b - clip.end_s).abs() < 0.05;
-    let mut kinds_all: Vec<String> = Vec::new();
-    let mut units: Vec<RenderUnit> = Vec::new();
-    if fast {
-        // Untouched range: today's exact single pass (punch still applies).
-        let slice = crate::render::words_in(words, clip.start_s, clip.end_s);
-        if slice.is_empty() {
-            anyhow::bail!("No transcript words inside clip range.");
-        }
-        let punches = scan_punches(
-            ffmpeg,
-            input,
-            words,
-            &all_keeps,
-            clip.start_s,
-            clip.end_s,
-            args,
-        );
-        let track_hook = emit.shared_hook(move |p| JobEvent::ClipTrack { rank, pct: p });
-        let timeline = resolve_timeline(
-            args,
-            ffmpeg,
-            tracker,
-            gpu_on,
-            src_w,
-            src_h,
-            clip.start_s,
-            clip.end_s,
-            words,
-            &[],
-            &punches,
-            track_hook.clone(),
-            cancel,
+    words: &'a [Word],
+    env: Option<&'a Envelope>,
+    ocfg: &'a crate::openrouter::Config,
+    vision_model: &'a str,
+}
+
+impl PlanCtx<'_> {
+    fn src_dims(&self) -> (u32, u32) {
+        (
+            self.probe.width.unwrap_or(1280),
+            self.probe.height.unwrap_or(720),
         )
-        .await;
-        let chunks = chunks_for(&timeline, clip.start_s, clip.end_s);
-        let chunks = resolve_punches(chunks, words, ffmpeg, input, ocfg, vision_model).await;
-        kinds_all = kind_names(&chunks);
-        log_group_shots(&chunks, clip);
-        units.push(RenderUnit {
-            words: slice,
-            chunks,
-            out: mp4.clone(),
-            flash: None,
-            hook: emit.shared_hook(move |p| JobEvent::ClipRender { rank, pct: p }),
-            seg: None,
-        });
-        return Ok(ClipPlan {
-            clip: clip.clone(),
-            mp4,
-            segdir: None,
-            units,
-            retimed,
-            tight_total,
-            kinds_all,
-        });
     }
-    // Tightened/merged: one render per keep, concatenated.
-    let segdir = out.join(".segs").join(format!("{rank:02}"));
-    std::fs::create_dir_all(&segdir)?;
+}
+
+/// A fully planned render: spans on the output clock, one camera pose per
+/// output frame, captions on the same clock.
+struct RenderPlan {
+    spans: Vec<crate::render::Span>,
+    poses: Vec<Pose>,
+    flash: Vec<f32>,
+    retimed: Vec<Word>,
+    tight_total: f64,
+    kinds: Vec<String>,
+}
+
+/// Utterance onsets (output clock): word starts after a beat of silence.
+/// Speaker switches land on these.
+fn onsets(words: &[Word]) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut prev_e = f64::NEG_INFINITY;
+    for w in words {
+        if w.s - prev_e >= 0.25 {
+            out.push(w.s);
+        }
+        prev_e = prev_e.max(w.e);
+    }
+    out
+}
+
+/// Source time → output time within one part's keeps, clamping instants in
+/// removed spans forward onto the next kept frame.
+fn map_forward(t: f64, keeps: &[Keep]) -> Option<(f64, usize)> {
     let mut o = 0.0;
-    let n_groups = groups.len().max(1);
-    let n_segs = all_keeps.len().max(1);
-    for (gi, g) in groups.iter().enumerate() {
+    for (i, k) in keeps.iter().enumerate() {
+        if t < k.b - 1e-6 {
+            return Some((o + (t - k.a).max(0.0), i));
+        }
+        o += k.b - k.a;
+    }
+    None
+}
+
+/// Camera targets (output clock) for one part's chunks.
+fn chunk_targets(chunks: &[Chunk], keeps: &[Keep], out0: f64, sw: f64, sh: f64) -> Vec<Target> {
+    let base = crate::compose::base_rect(sw, sh);
+    let full = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: sw,
+        h: sh,
+    };
+    let mut out: Vec<Target> = Vec::new();
+    for (ci, c) in chunks.iter().enumerate() {
+        // The first sample of every chunk after the first is a framing
+        // change (Track↔Wide, VLM framing).
+        let mut pending_cut = ci > 0;
+        let mut push = |t: f64, rect: Rect, ax: f64, ay: f64, kind: Kind, cut: bool, weak: bool| {
+            if let Some(o) = crate::timeline::tight(t, keeps) {
+                out.push(Target {
+                    t: out0 + o,
+                    rect,
+                    ax,
+                    ay,
+                    kind,
+                    cut: cut || pending_cut,
+                    weak,
+                });
+                pending_cut = false;
+            }
+        };
+        // Synthetic framings: a sample every 0.5 s across the chunk.
+        let synth = |push: &mut dyn FnMut(f64), c: &Chunk| {
+            let mut t = c.t0;
+            while t < c.t1 - 1e-3 {
+                push(t);
+                t += 0.5;
+            }
+            push(c.t1 - 1e-3);
+        };
+        match &c.kind {
+            ChunkKind::Track(raws) if !raws.is_empty() => {
+                for r in raws {
+                    let rect = Rect {
+                        x: r.x,
+                        y: r.y,
+                        w: r.w,
+                        h: r.h,
+                    };
+                    let (ax, ay) = if r.ax.is_finite() && r.ay.is_finite() {
+                        (r.ax, r.ay)
+                    } else {
+                        (rect.cx(), rect.y + rect.h * 0.4)
+                    };
+                    let kind = if r.n_faces >= 2 {
+                        Kind::Group
+                    } else {
+                        Kind::Subject
+                    };
+                    push(r.t, rect, ax, ay, kind, r.cut, r.weak);
+                }
+            }
+            ChunkKind::Track(_) => synth(
+                &mut |t| {
+                    push(
+                        t,
+                        base,
+                        base.cx(),
+                        base.y + base.h * 0.4,
+                        Kind::Fixed,
+                        false,
+                        false,
+                    )
+                },
+                c,
+            ),
+            ChunkKind::Wide => synth(
+                &mut |t| push(t, full, full.cx(), full.cy(), Kind::Wide, false, false),
+                c,
+            ),
+            ChunkKind::Punch(x01) => {
+                let r = Rect {
+                    x: (x01 * sw - base.w / 2.0).clamp(0.0, (sw - base.w).max(0.0)),
+                    ..base
+                };
+                synth(
+                    &mut |t| push(t, r, r.cx(), r.y + r.h * 0.4, Kind::Fixed, false, false),
+                    c,
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Track, frame and plan the camera for one edit (a clip, a compilation
+/// or the full video). `parts` are its frame-snapped cut plans in output
+/// order; every part is tracked on its own source range.
+#[allow(clippy::too_many_arguments)]
+async fn plan_render(
+    pc: &PlanCtx<'_>,
+    parts: &[CutPlan],
+    merge_flash: bool,
+    tracker: &mut Option<crate::track::Tracker>,
+    clip: &crate::validator::Clip,
+    emit: &Emitter,
+    cancel: &CancelFlag,
+) -> anyhow::Result<RenderPlan> {
+    let rank = clip.rank;
+    let (src_w, src_h) = pc.src_dims();
+    let (sw, sh) = (src_w as f64, src_h as f64);
+    let r = crate::render::rate(pc.fps);
+    let ranges: Vec<(f64, f64, usize)> = parts
+        .iter()
+        .enumerate()
+        .flat_map(|(pi, p)| p.keeps.iter().map(move |k| (k.a, k.b, pi)))
+        .collect();
+    let spans = crate::render::spans_for(&ranges, pc.fps);
+    let total_frames: usize = spans.iter().map(|s| s.frames).sum();
+    if total_frames == 0 {
+        anyhow::bail!("clip #{rank}: nothing left to render after cuts");
+    }
+    let all_keeps: Vec<Keep> = parts.iter().flat_map(|p| p.keeps.clone()).collect();
+    let retimed = crate::timeline::retime(pc.words, &all_keeps);
+    // Exact output start of each part (whole frames).
+    let mut part_frame0 = vec![0usize; parts.len() + 1];
+    for s in &spans {
+        part_frame0[s.part + 1] += s.frames;
+    }
+    for i in 1..part_frame0.len() {
+        part_frame0[i] += part_frame0[i - 1];
+    }
+
+    let mut targets: Vec<Target> = Vec::new();
+    let mut hards: Vec<f64> = Vec::new();
+    let mut jumps: Vec<f64> = Vec::new();
+    let mut punches: Vec<(f64, f64)> = Vec::new();
+    let mut kinds: Vec<String> = Vec::new();
+    let n_parts = parts.len().max(1);
+    for (pi, part) in parts.iter().enumerate() {
         cancel.check()?;
-        let ga = g.keeps.first().map(|k| k.a).unwrap_or(clip.start_s);
-        let gb = g.keeps.last().map(|k| k.b).unwrap_or(clip.end_s);
-        let forced: Vec<f64> = g.keeps.iter().skip(1).map(|k| k.a).collect();
-        let punches = scan_punches(ffmpeg, input, words, &g.keeps, ga, gb, args);
-        // Group-local track pct maps onto the clip's overall track phase.
+        let (Some(first), Some(last)) = (part.keeps.first(), part.keeps.last()) else {
+            continue;
+        };
+        let (ga, gb) = (first.a, last.b);
+        let out0 = part_frame0[pi] as f64 / r;
+        // Part-local tracking pct maps onto the clip's overall track phase.
         let track_hook = emit.shared_hook(move |p| JobEvent::ClipTrack {
             rank,
-            pct: ((gi as u32 * 100 + p as u32) / n_groups as u32).min(100) as u8,
+            pct: ((pi as u32 * 100 + p as u32) / n_parts as u32).min(100) as u8,
         });
-        let timeline = resolve_timeline(
-            args,
-            ffmpeg,
-            tracker,
-            gpu_on,
-            src_w,
-            src_h,
-            ga,
-            gb,
-            words,
-            &forced,
-            &punches,
-            track_hook.clone(),
+        let tl = resolve_timeline(
+            pc.args, pc.ffmpeg, tracker, pc.gpu_on, src_w, src_h, ga, gb, pc.words, track_hook,
             cancel,
         )
         .await;
-        for k in &g.keeps {
-            cancel.check()?;
-            let len = (k.b - k.a).max(0.1);
-            let chunks = chunks_for(&timeline, k.a, k.b);
-            let chunks = resolve_punches(chunks, words, ffmpeg, input, ocfg, vision_model).await;
-            kinds_all.extend(kind_names(&chunks));
-            log_group_shots(&chunks, clip);
-            // Caption slice: tight clock rebased to this keep's source
-            // clock (render seeks + stamps from chunk times).
-            let seg_cap: Vec<crate::whisper::Word> = retimed
-                .iter()
-                .filter(|w| w.s >= o - 1e-6 && w.s < o + len - 1e-6)
-                .map(|w| {
-                    let mut q = (*w).clone();
-                    q.s += k.a - o;
-                    q.e += k.a - o;
-                    q
-                })
-                .collect();
-            let si = units.len();
-            // Merge flash joins: this segment carries its half of every
-            // white dip (head dip unless first, tail dip unless last).
-            let flash = merge_flash.then_some((si > 0, si + 1 < all_keeps.len()));
-            // Segment-local render pct maps onto the clip overall.
-            let hook = emit.shared_hook(move |p| JobEvent::ClipRender {
-                rank,
-                pct: ((si as u32 * 100 + p as u32) / n_segs as u32).min(100) as u8,
-            });
-            units.push(RenderUnit {
-                words: seg_cap,
-                chunks,
-                out: segdir.join(format!("seg{si:03}.mp4")),
-                flash,
-                hook,
-                seg: Some((k.a, k.b)),
-            });
-            o += len;
+        let chunks = chunks_for(&tl, ga, gb);
+        let chunks = resolve_punches(
+            chunks,
+            pc.words,
+            pc.ffmpeg,
+            pc.input,
+            pc.ocfg,
+            pc.vision_model,
+        )
+        .await;
+        kinds.extend(kind_names(&chunks));
+        log_group_shots(&chunks, clip);
+        targets.extend(chunk_targets(&chunks, &part.keeps, out0, sw, sh));
+        if pi > 0 {
+            hards.push(out0);
+        }
+        if let Some(tl) = &tl {
+            for &s in &tl.shots {
+                if let Some(o) = crate::timeline::tight(s, &part.keeps) {
+                    hards.push(out0 + o);
+                }
+            }
+        }
+        let mut o = out0;
+        for (ki, k) in part.keeps.iter().enumerate() {
+            if ki > 0 {
+                jumps.push(o);
+            }
+            o += k.b - k.a;
+        }
+        for (s, e) in punch_windows(pc.env, pc.words, &part.keeps, pc.args) {
+            if let Some((so, ki)) = map_forward(s, &part.keeps) {
+                let k = part.keeps[ki];
+                let eo = so + (e.min(k.b) - s.max(k.a)).max(0.0);
+                if eo - so > 0.2 {
+                    punches.push((out0 + so, out0 + eo));
+                }
+            }
         }
     }
-    Ok(ClipPlan {
-        clip: clip.clone(),
-        mp4,
-        segdir: Some(segdir),
-        units,
+    hards.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ons = onsets(&retimed);
+    let mut poses = camera::plan(
+        &camera::PlanInput {
+            targets: &targets,
+            frames: total_frames,
+            fps: r,
+            src_w: sw,
+            src_h: sh,
+            hards: &hards,
+            jumps: &jumps,
+            onsets: &ons,
+        },
+        &camera::CamCfg::default(),
+    );
+    // Punch depth respects the resolution floor (no mush on low-res input).
+    let mut pcfg = camera::PunchCfg::default();
+    pcfg.zoom = pcfg.zoom.min((sh / crate::track::MIN_CROP_H).max(1.08));
+    let landed = camera::apply_punches(&mut poses, &punches, r, sw, sh, &pcfg);
+    if !punches.is_empty() {
+        tracing::info!(
+            "clip #{rank}: {landed}/{} emphasis punch(es) landed (others fell on camera moves)",
+            punches.len()
+        );
+    }
+    // Dev aid: DIGICLIP_CAMERA_DUMP=<dir> writes targets + poses as CSV.
+    if let Some(dir) = std::env::var_os("DIGICLIP_CAMERA_DUMP") {
+        let dir = PathBuf::from(dir);
+        let mut t = String::from("t,x,y,w,h,kind,cut,weak\n");
+        for g in &targets {
+            t += &format!(
+                "{:.3},{:.1},{:.1},{:.1},{:.1},{:?},{},{}\n",
+                g.t, g.rect.x, g.rect.y, g.rect.w, g.rect.h, g.kind, g.cut, g.weak
+            );
+        }
+        let mut p = String::from("frame,x,y,w,h,kind\n");
+        for (i, q) in poses.iter().enumerate() {
+            p += &format!(
+                "{i},{:.2},{:.2},{:.2},{:.2},{:?}\n",
+                q.rect.x, q.rect.y, q.rect.w, q.rect.h, q.kind
+            );
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(format!("clip-{rank:02}-targets.csv")), t);
+        let _ = std::fs::write(dir.join(format!("clip-{rank:02}-poses.csv")), p);
+        let cuts: Vec<String> = hards.iter().map(|h| format!("{h:.3}")).collect();
+        let _ = std::fs::write(dir.join(format!("clip-{rank:02}-cuts.txt")), cuts.join(" "));
+    }
+    // "Moving" = visibly moving (>0.25 px/frame on any edge).
+    let moves = poses
+        .windows(2)
+        .filter(|w| {
+            let (a, b) = (w[0].rect, w[1].rect);
+            (a.x - b.x)
+                .abs()
+                .max((a.y - b.y).abs())
+                .max((a.w - b.w).abs())
+                > 0.25
+        })
+        .count();
+    tracing::info!(
+        "clip #{rank}: camera planned over {total_frames} frames ({} target(s), {} shot cut(s), {} jump cut(s), {:.0}% of frames moving)",
+        targets.len(),
+        hards.len(),
+        jumps.len(),
+        moves as f64 * 100.0 / total_frames as f64
+    );
+    // White dips at merge-part joins: ease to white into the join, back out.
+    let mut flash = Vec::new();
+    if merge_flash && parts.len() > 1 {
+        flash = vec![0.0f32; total_frames];
+        let d = ((0.15 * r).round() as usize).max(1);
+        for &b in &part_frame0[1..parts.len()] {
+            for k in b.saturating_sub(d)..(b + d).min(total_frames) {
+                let u = if k < b {
+                    (k + 1 + d - b) as f32 / d as f32
+                } else {
+                    1.0 - (k - b) as f32 / d as f32
+                };
+                let u = u.clamp(0.0, 1.0);
+                flash[k] = flash[k].max(u * u * (3.0 - 2.0 * u));
+            }
+        }
+    }
+    Ok(RenderPlan {
+        spans,
+        poses,
+        flash,
         retimed,
-        tight_total,
-        kinds_all,
+        tight_total: total_frames as f64 / r,
+        kinds,
     })
 }
 
-/// Render a planned clip (blocking: ffmpeg passes, concat, sidecars,
-/// poster). Runs next to other clips' renders, so everything it writes is
+/// A clip after its sequential phase (tracking, punch look-ups, camera
+/// plan). Owns everything the render needs, so it runs on a blocking
+/// thread next to other clips' renders.
+struct ClipPlan {
+    clip: crate::validator::Clip,
+    mp4: PathBuf,
+    plan: RenderPlan,
+}
+
+/// Plan one clip (sequential phase: one shared tracker).
+#[allow(clippy::too_many_arguments)]
+async fn plan_clip(
+    pc: &PlanCtx<'_>,
+    clip: &crate::validator::Clip,
+    groups: &[CutPlan],
+    merge_flash: bool,
+    tracker: &mut Option<crate::track::Tracker>,
+    out: &std::path::Path,
+    ctx: &JobCtx<'_>,
+) -> anyhow::Result<ClipPlan> {
+    let mp4 = out.join(format!("clip-{:02}-9x16.mp4", clip.rank));
+    if !groups.iter().any(|g| {
+        g.keeps
+            .iter()
+            .any(|k| pc.words.iter().any(|w| w.e > k.a && w.s < k.b))
+    }) {
+        anyhow::bail!("No transcript words inside clip range.");
+    }
+    let plan = plan_render(pc, groups, merge_flash, tracker, clip, ctx.emit, ctx.cancel).await?;
+    Ok(ClipPlan {
+        clip: clip.clone(),
+        mp4,
+        plan,
+    })
+}
+
+/// Render a planned clip (blocking): captions, ONE render pass, kit,
+/// poster. Runs next to other clips' renders, so everything it writes is
 /// named after its own rank.
 #[allow(clippy::too_many_arguments)]
 fn exec_clip(
     plan: ClipPlan,
     input: &std::path::Path,
-    ffmpeg: &std::path::Path,
+    probe: &crate::ffmpeg::Probe,
+    fps: (u32, u32),
     out: &std::path::Path,
-    src_w: u32,
-    src_h: u32,
     gpu_on: bool,
     threads: usize,
     kit: bool,
     emit: &Emitter,
     cancel: &CancelFlag,
 ) -> anyhow::Result<ClipArtifact> {
-    let ClipPlan {
-        clip,
-        mp4,
-        segdir,
-        units,
-        retimed,
-        tight_total,
-        kinds_all,
-    } = plan;
+    let ClipPlan { clip, mp4, plan } = plan;
     let rank = clip.rank;
     let stem = format!("clip-{rank:02}-9x16");
-    let mut enc = String::from("copy");
-    for u in &units {
-        cancel.check()?;
-        let t = std::time::Instant::now();
-        enc = crate::render::render_timeline(
-            input,
-            &u.words,
-            &clip.caption_style,
-            &u.chunks,
-            src_w,
-            src_h,
-            gpu_on,
-            &u.out,
+    // Captions on the tight clock — the same clock the frames are on.
+    let ass = out.join(format!("{stem}.ass"));
+    std::fs::write(
+        &ass,
+        crate::captions::ass::build(&plan.retimed, &clip.caption_style, 0.0),
+    )?;
+    std::fs::write(
+        out.join(format!("{stem}.srt")),
+        crate::captions::srt::from_words(&plan.retimed),
+    )?;
+    let t = std::time::Instant::now();
+    let enc = crate::render::render(
+        &crate::render::Job {
+            source: input,
+            probe,
+            fps,
+            spans: &plan.spans,
+            poses: &plan.poses,
+            flash: &plan.flash,
+            ass: Some(&ass),
+            out: &mp4,
+            gpu: gpu_on,
             threads,
-            "clip",
-            u.flash,
-            u.hook.clone(),
-            cancel,
-        )?;
-        let took = t.elapsed().as_secs_f64();
-        match u.seg {
-            Some((a, b)) => tracing::info!("clip #{rank} seg {a:.0}s-{b:.0}s took {took:.1}s"),
-            None => tracing::info!("clip #{rank} render took {took:.1}s"),
-        }
-    }
-    if let Some(segdir) = &segdir {
-        cancel.check()?;
-        let seg_files: Vec<PathBuf> = units.iter().map(|u| u.out.clone()).collect();
-        if seg_files.len() == 1 {
-            std::fs::rename(&seg_files[0], &mp4)?;
-        } else {
-            crate::render::concat_copy(ffmpeg, &seg_files, &mp4)?;
-        }
-        let _ = std::fs::remove_dir_all(segdir);
-        let _ = std::fs::remove_dir(out.join(".segs")); // drops the parent when empty
-        tracing::info!(
-            "clip #{} assembled {:.1}s tight from {} segs",
-            rank,
-            tight_total,
-            seg_files.len()
-        );
-        // Whole-clip sidecars on the tight clock (segments wrote temps).
-        std::fs::write(
-            out.join(format!("{stem}.ass")),
-            crate::captions::ass::build(&retimed, &clip.caption_style, 0.0),
-        )?;
-        std::fs::write(
-            out.join(format!("{stem}.srt")),
-            crate::captions::srt::from_words(&retimed),
-        )?;
-    }
+            label: &format!("clip #{rank}"),
+        },
+        emit.shared_hook(move |p| JobEvent::ClipRender { rank, pct: p }),
+        cancel,
+    )?;
+    tracing::info!(
+        "clip #{rank} render took {:.1}s ({:.1}s tight from {} keep(s))",
+        t.elapsed().as_secs_f64(),
+        plan.tight_total,
+        plan.spans.len()
+    );
     // Upload kit on the tight clock (cut fillers never become titles).
     if kit {
         let kit_clip = crate::validator::Clip {
             start_s: 0.0,
-            end_s: tight_total,
+            end_s: plan.tight_total,
             ..clip.clone()
         };
         let kit_path = out.join(kit_name(rank));
-        if let Err(e) = crate::kit::write(&kit_path, &kit_clip, &retimed) {
+        if let Err(e) = crate::kit::write(&kit_path, &kit_clip, &plan.retimed) {
             tracing::warn!("upload kit failed for clip #{}: {e}", rank);
         }
     }
     let mp4_name = format!("{stem}.mp4");
     let mut artifact = artifact_for(&clip, &mp4_name, kit.then(|| kit_name(rank)));
-    artifact.tight_dur = tight_total;
+    artifact.tight_dur = plan.tight_total;
     // Serve-only: tile poster + live events (skipped on the CLI).
     if emit.active() {
         let _ = crate::ffmpeg::poster(&mp4, &out.join(format!("{stem}-poster.jpg")));
@@ -1557,13 +1780,24 @@ fn exec_clip(
         rank,
         clip.start_s,
         clip.end_s,
-        tight_total,
+        plan.tight_total,
         clip.caption_style,
-        kinds_all.join("+"),
+        plan.kinds.join("+"),
         mp4.display(),
         clip.source
     );
     Ok(artifact)
+}
+
+/// Final edit polish for one picked range's cut plan: edges into the
+/// quietest nearby instant (never into a neighboring word), then onto the
+/// output frame grid.
+fn finalize_plan(plan: &mut CutPlan, env: Option<&Envelope>, words: &[Word], fps: (u32, u32)) {
+    if let Some(env) = env {
+        crate::timeline::refine_edges(plan, env, words);
+    }
+    crate::timeline::snap_keeps(&mut plan.keeps, fps);
+    plan.tight_dur = crate::timeline::plan_dur(&plan.keeps);
 }
 
 /// Exact-length fit for one picked clip: the validator sizes the source
