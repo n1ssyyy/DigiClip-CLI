@@ -35,6 +35,8 @@ fast_image_resize = "6"
 axum = { version = "0.8.9", features = ["ws"] }
 tower-http = { version = "0.7.1", features = ["cors", "fs"] }
 tower = { version = "0.5.3", features = ["util"] }
+# Laya (System One) tokenizer; no onig/esaxx C builds.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 # ONNX Runtime: DirectML execution provider exists on Windows only.
 # Linux/macOS build plain CPU (+ CoreML via system libs where ort enables

@@ -11,9 +11,14 @@ const JOBS: usize = 20;
 
 /// Blank out API keys: the saved key itself, `sk-…` tokens and bearer
 /// headers.
-pub(super) fn redact(text: &str, key: Option<&str>) -> String {
+pub(super) fn redact(text: &str, keys: &[Option<&str>]) -> String {
     let mut s = text.to_string();
-    if let Some(k) = key.map(str::trim).filter(|k| k.len() >= 8) {
+    for k in keys
+        .iter()
+        .flatten()
+        .map(|k| k.trim())
+        .filter(|k| k.len() >= 8)
+    {
         s = s.replace(k, "[REDACTED]");
     }
     let mut out = String::with_capacity(s.len());
@@ -116,7 +121,13 @@ pub(super) async fn diagnostics(st: &AppState) -> String {
         "\n== serve.log (last {LOG_TAIL} lines)\n{}\n",
         tail(&log, LOG_TAIL)
     );
-    redact(&s, settings.openrouter_key.as_deref())
+    redact(
+        &s,
+        &[
+            settings.openrouter_key.as_deref(),
+            settings.jev_key.as_deref(),
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -127,7 +138,7 @@ mod tests {
     fn keys_never_leave() {
         let t = "key=sk-or-v1-abcdef0123456789 and Authorization: Bearer abcdefghijkl, \
                  my-secret-key-value, sk-short";
-        let r = redact(t, Some("my-secret-key-value"));
+        let r = redact(t, &[Some("my-secret-key-value"), None]);
         assert!(!r.contains("abcdef0123456789"));
         assert!(!r.contains("abcdefghijkl"));
         assert!(!r.contains("my-secret-key-value"));
