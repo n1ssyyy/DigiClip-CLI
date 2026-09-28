@@ -70,7 +70,7 @@ pub fn ensure_fonts() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-async fn download_to(
+pub async fn download_to(
     url: &str,
     dest: &Path,
     label: &str,

@@ -6,6 +6,7 @@ pub mod captions;
 pub mod chapters;
 pub mod cli;
 pub mod compose;
+pub mod fetch;
 pub mod ffmpeg;
 pub mod framing;
 pub mod gpu;

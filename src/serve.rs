@@ -32,6 +32,11 @@ use tower_http::services::ServeFile;
 
 use crate::progress::{ClipArtifact, Emitter, JobEvent, Stage};
 
+mod diag;
+mod watch;
+
+use diag::diagnostics;
+
 // ---------------------------------------------------------------------------
 // Options / settings
 // ---------------------------------------------------------------------------
@@ -146,6 +151,20 @@ struct Settings {
     caption_default: String,
     tighten: String,
     punch: bool,
+    /// Watch folder: new videos dropped here start jobs with
+    /// `watch_options`.
+    watch_dir: Option<String>,
+    watch_on: bool,
+    watch_options: JobOptions,
+    /// Saved job-option presets (named), in the order the UI lists them.
+    presets: Vec<Preset>,
+}
+
+/// A named set of job options.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Preset {
+    name: String,
+    options: JobOptions,
 }
 
 impl Default for Settings {
@@ -160,6 +179,10 @@ impl Default for Settings {
             caption_default: "karaoke".into(),
             tighten: "light".into(),
             punch: true,
+            watch_dir: None,
+            watch_on: false,
+            watch_options: JobOptions::default(),
+            presets: vec![],
         }
     }
 }
@@ -175,6 +198,10 @@ struct SettingsPublic {
     caption_default: String,
     tighten: String,
     punch: bool,
+    watch_dir: Option<String>,
+    watch_on: bool,
+    watch_options: JobOptions,
+    presets: Vec<Preset>,
 }
 
 impl Settings {
@@ -189,6 +216,10 @@ impl Settings {
             caption_default: self.caption_default.clone(),
             tighten: self.tighten.clone(),
             punch: self.punch,
+            watch_dir: self.watch_dir.clone(),
+            watch_on: self.watch_on,
+            watch_options: self.watch_options.clone(),
+            presets: self.presets.clone(),
         }
     }
 }
@@ -203,6 +234,8 @@ impl Settings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
+    /// Fetching the source from a link (before it queues).
+    Downloading,
     Queued,
     Extracting,
     Transcribing,
@@ -312,6 +345,9 @@ pub struct JobRecord {
     pub out_dir: String,
     #[serde(default)]
     pub duration_s: f64,
+    /// The link a downloaded source came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 struct LiveJob {
@@ -411,6 +447,11 @@ enum Cmd {
         source: String,
         options: JobOptions,
     },
+    /// A job from a link: the source downloads first (yt-dlp).
+    JobStartUrl {
+        url: String,
+        options: JobOptions,
+    },
     JobCancel {
         job: String,
     },
@@ -470,6 +511,8 @@ enum Cmd {
     TranscriptGet {
         job: String,
     },
+    /// Write a redacted diagnostics bundle; replies with its path.
+    Diagnostics,
 }
 
 /// One server frame: a correlated `res` or an async `ev`.
@@ -931,6 +974,7 @@ async fn run_job(st: Arc<AppState>, id: String) {
             match ev {
                 JobEvent::Stage { stage, pct } => {
                     let status = match stage {
+                        Stage::Download => JobStatus::Downloading,
                         Stage::Provision | Stage::Audio => JobStatus::Extracting,
                         Stage::Transcribe => JobStatus::Transcribing,
                         Stage::Pick | Stage::Track => JobStatus::Analyzing,
@@ -1257,46 +1301,36 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             vec![ok(id, Some(data))]
         }
         Cmd::JobStart { source, options } => {
-            let src = PathBuf::from(&source);
-            if !src.is_file() {
-                return vec![err(id, format!("source not found: {source}"))];
+            if crate::fetch::is_url(&source) {
+                let record = start_url_job(&st, source.trim().to_string(), options).await;
+                return vec![ok(id, Some(serde_json::json!({ "job": record })))];
             }
-            let stem = src
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "video".into());
-            let probe = crate::ffmpeg::probe(&src);
-            let job_id = st.next_id("job");
-            let out_dir = st.job_path(&job_id).display().to_string();
-            let record = JobRecord {
-                id: job_id.clone(),
-                name: stem,
-                source,
-                status: JobStatus::Queued,
-                options,
-                clips: vec![],
-                error: None,
-                created_ms: now_ms(),
-                out_dir,
-                duration_s: probe.duration_s.unwrap_or(0.0),
-            };
-            st.persist_job(&record);
-            {
-                let mut jobs = st.jobs.lock().await;
-                let mut live = LiveJob::new(record.clone());
-                live.queued = true;
-                jobs.insert(job_id.clone(), live);
+            match start_job(&st, source, options).await {
+                Ok(record) => vec![ok(id, Some(serde_json::json!({ "job": record })))],
+                Err(e) => vec![err(id, e)],
             }
-            let _ = st.bus.send(ServerMsg::Ev {
-                ev: Event::JobCreated {
-                    job: record.clone(),
-                },
-            });
-            let st2 = st.clone();
-            tokio::spawn(async move {
-                run_job(st2, job_id).await;
-            });
+        }
+        Cmd::JobStartUrl { url, options } => {
+            if !crate::fetch::is_url(&url) {
+                return vec![err(id, "not a link (http:// or https://)")];
+            }
+            let record = start_url_job(&st, url.trim().to_string(), options).await;
             vec![ok(id, Some(serde_json::json!({ "job": record })))]
+        }
+        Cmd::Diagnostics => {
+            let text = diagnostics(&st).await;
+            let dir = st.data_dir.join("logs");
+            let path = dir.join(format!("diagnostics-{}.txt", now_ms()));
+            match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &text)) {
+                Ok(()) => vec![ok(
+                    id,
+                    Some(serde_json::json!({
+                        "path": path.display().to_string(),
+                        "bytes": text.len(),
+                    })),
+                )],
+                Err(e) => vec![err(id, format!("could not write diagnostics: {e}"))],
+            }
         }
         Cmd::JobCancel { job: jid } => {
             let jobs = st.jobs.lock().await;
@@ -1311,7 +1345,9 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
         Cmd::JobRemove { job: jid } => {
             let mut jobs = st.jobs.lock().await;
             match jobs.get_mut(&jid) {
-                Some(live) if live.running => {
+                Some(live) if live.running || live.record.status == JobStatus::Downloading => {
+                    // Running (or downloading): the run cleans up once it
+                    // stops.
                     live.removing = true;
                     live.cancel.cancel();
                     vec![ok(id, None)]
@@ -1336,6 +1372,23 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             };
             match exists_running {
                 Some((true, _)) => vec![err(id, "job is running")],
+                Some((false, record))
+                    if record.url.is_some() && !Path::new(&record.source).is_file() =>
+                {
+                    // The download never finished: fetch again.
+                    {
+                        let mut jobs = st.jobs.lock().await;
+                        if let Some(live) = jobs.get_mut(&jid) {
+                            live.cancel = crate::progress::CancelFlag::new();
+                            live.removing = false;
+                            live.queued = true;
+                            live.redo = None;
+                        }
+                    }
+                    let st2 = st.clone();
+                    tokio::spawn(async move { fetch_then_run(st2, jid).await });
+                    vec![ok(id, None)]
+                }
                 Some((false, mut record)) => {
                     // Fresh outputs, same knobs. Old clips stay visible
                     // until the new picks land (same language as retry in
@@ -1409,6 +1462,32 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             }
             if let Some(v) = patch.get("punch").and_then(|v| v.as_bool()) {
                 s.punch = v;
+            }
+            match patch.get("watch_dir") {
+                Some(serde_json::Value::String(v)) if !v.trim().is_empty() => {
+                    s.watch_dir = Some(v.trim().to_string())
+                }
+                Some(serde_json::Value::Null) => s.watch_dir = None,
+                _ => {}
+            }
+            if let Some(v) = patch.get("watch_on").and_then(|v| v.as_bool()) {
+                s.watch_on = v;
+            }
+            if let Some(v) = patch
+                .get("watch_options")
+                .and_then(|v| serde_json::from_value::<JobOptions>(v.clone()).ok())
+            {
+                s.watch_options = v;
+            }
+            if let Some(v) = patch
+                .get("presets")
+                .and_then(|v| serde_json::from_value::<Vec<Preset>>(v.clone()).ok())
+            {
+                s.presets = v
+                    .into_iter()
+                    .filter(|p| !p.name.trim().is_empty())
+                    .take(50)
+                    .collect();
             }
             let pub_ = s.public();
             st.save_settings(&s);
@@ -1679,6 +1758,199 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
 /// is built under the jobs lock; when a redo is already waiting for the
 /// worker the new spec joins it (same rank replaces) instead of queueing
 /// another run.
+/// Queue a job on a local file.
+async fn start_job(
+    st: &Arc<AppState>,
+    source: String,
+    options: JobOptions,
+) -> Result<JobRecord, String> {
+    let src = PathBuf::from(&source);
+    if !src.is_file() {
+        return Err(format!("source not found: {source}"));
+    }
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "video".into());
+    let probe = crate::ffmpeg::probe(&src);
+    let job_id = st.next_id("job");
+    let out_dir = st.job_path(&job_id).display().to_string();
+    let record = JobRecord {
+        id: job_id.clone(),
+        name: stem,
+        source,
+        status: JobStatus::Queued,
+        options,
+        clips: vec![],
+        error: None,
+        created_ms: now_ms(),
+        out_dir,
+        duration_s: probe.duration_s.unwrap_or(0.0),
+        url: None,
+    };
+    st.persist_job(&record);
+    {
+        let mut jobs = st.jobs.lock().await;
+        let mut live = LiveJob::new(record.clone());
+        live.queued = true;
+        jobs.insert(job_id.clone(), live);
+    }
+    let _ = st.bus.send(ServerMsg::Ev {
+        ev: Event::JobCreated {
+            job: record.clone(),
+        },
+    });
+    let st2 = st.clone();
+    tokio::spawn(async move {
+        run_job(st2, job_id).await;
+    });
+    Ok(record)
+}
+
+/// A job on a link: it shows at once (downloading), then queues like any
+/// other once the video is on disk.
+async fn start_url_job(st: &Arc<AppState>, url: String, options: JobOptions) -> JobRecord {
+    let job_id = st.next_id("job");
+    let out_dir = st.job_path(&job_id).display().to_string();
+    let record = JobRecord {
+        id: job_id.clone(),
+        name: crate::fetch::host(&url),
+        source: url.clone(),
+        status: JobStatus::Downloading,
+        options,
+        clips: vec![],
+        error: None,
+        created_ms: now_ms(),
+        out_dir,
+        duration_s: 0.0,
+        url: Some(url),
+    };
+    st.persist_job(&record);
+    {
+        let mut jobs = st.jobs.lock().await;
+        let mut live = LiveJob::new(record.clone());
+        live.queued = true;
+        jobs.insert(job_id.clone(), live);
+    }
+    let _ = st.bus.send(ServerMsg::Ev {
+        ev: Event::JobCreated {
+            job: record.clone(),
+        },
+    });
+    let st2 = st.clone();
+    tokio::spawn(async move { fetch_then_run(st2, job_id).await });
+    record
+}
+
+/// Download a link job's source (outside the render worker: downloads
+/// overlap renders), then run it.
+async fn fetch_then_run(st: Arc<AppState>, jid: String) {
+    let (url, dir, cancel) = {
+        let mut jobs = st.jobs.lock().await;
+        let Some(live) = jobs.get_mut(&jid) else {
+            return;
+        };
+        let Some(url) = live.record.url.clone() else {
+            return;
+        };
+        live.record.status = JobStatus::Downloading;
+        live.record.error = None;
+        let r = live.record.clone();
+        publish(&st, &r);
+        (
+            url,
+            PathBuf::from(&r.out_dir).join("source"),
+            live.cancel.clone(),
+        )
+    };
+    let stage = |pct: Option<u8>| {
+        let _ = st.bus.send(ServerMsg::Ev {
+            ev: Event::Stage {
+                job: jid.clone(),
+                stage: Stage::Download,
+                pct,
+            },
+        });
+    };
+    stage(Some(0));
+    let got = match crate::fetch::ensure_tool(None).await {
+        Ok(tool) => {
+            let (bus, j) = (st.bus.clone(), jid.clone());
+            let c = cancel.clone();
+            tokio::task::spawn_blocking(move || {
+                let last = std::sync::atomic::AtomicU8::new(0);
+                let on_pct = |p: u8| {
+                    if last.swap(p, Ordering::Relaxed) != p {
+                        let _ = bus.send(ServerMsg::Ev {
+                            ev: Event::Stage {
+                                job: j.clone(),
+                                stage: Stage::Download,
+                                pct: Some(p),
+                            },
+                        });
+                    }
+                };
+                crate::fetch::download(&tool, &url, &dir, &on_pct, &c)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r)
+        }
+        Err(e) => Err(anyhow::anyhow!("yt-dlp unavailable: {e}")),
+    };
+    let mut jobs = st.jobs.lock().await;
+    let Some(live) = jobs.get_mut(&jid) else {
+        return;
+    };
+    if live.removing {
+        let dir = live.record.out_dir.clone();
+        jobs.remove(&jid);
+        drop(jobs);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = st.bus.send(ServerMsg::Ev {
+            ev: Event::JobRemoved { id: jid },
+        });
+        return;
+    }
+    match got {
+        Ok(path) => {
+            live.record.name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| live.record.name.clone());
+            live.record.duration_s = crate::ffmpeg::probe(&path).duration_s.unwrap_or(0.0);
+            live.record.source = path.display().to_string();
+            live.record.status = JobStatus::Queued;
+            let r = live.record.clone();
+            drop(jobs);
+            publish(&st, &r);
+            run_job(st, jid).await;
+        }
+        Err(e) => {
+            live.queued = false;
+            let cancelled = cancel.is_cancelled();
+            live.record.status = if cancelled {
+                JobStatus::Cancelled
+            } else {
+                JobStatus::Failed
+            };
+            live.record.error = (!cancelled).then(|| e.to_string());
+            let r = live.record.clone();
+            drop(jobs);
+            publish(&st, &r);
+            if !cancelled {
+                let _ = st.bus.send(ServerMsg::Ev {
+                    ev: Event::Toast {
+                        tone: "error".into(),
+                        title: "Download failed".into(),
+                        body: truncate(&e.to_string(), 200),
+                    },
+                });
+            }
+        }
+    }
+}
+
 async fn queue_redo(
     st: &Arc<AppState>,
     jid: &str,
@@ -2024,6 +2296,7 @@ pub async fn run_serve(
     st.settings = Mutex::new(st.load_settings());
     st.jobs = Mutex::new(reload_jobs());
     let st = Arc::new(st);
+    tokio::spawn(watch::run(st.clone()));
 
     let app = axum::Router::new()
         .route("/ws", get(ws_handler))

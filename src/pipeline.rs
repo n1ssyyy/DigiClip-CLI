@@ -601,6 +601,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     if args.provision {
         return run_inner(&args, &ctx).await.map(|_| ());
     }
+    let args = fetch_links(args).await?;
     let jobs = batch_jobs(&args)?;
     if jobs.len() == 1 {
         let (input, out_dir) = jobs.into_iter().next().unwrap();
@@ -648,6 +649,35 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         anyhow::bail!("{} of {n} videos failed: {list}", failed.len());
     }
     Ok(())
+}
+
+/// Link inputs (`https://…`) download first (yt-dlp) into
+/// `<out-dir or here>/downloads/` and run as the files they became.
+async fn fetch_links(mut args: Args) -> anyhow::Result<Args> {
+    let is_link = |p: &PathBuf| crate::fetch::is_url(&p.to_string_lossy());
+    if !args.input.iter().chain(&args.more).any(is_link) {
+        return Ok(args);
+    }
+    let tool = crate::fetch::ensure_tool(None).await?;
+    let dir = args
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("downloads");
+    let get = |p: PathBuf| -> anyhow::Result<PathBuf> {
+        if !is_link(&p) {
+            return Ok(p);
+        }
+        let url = p.to_string_lossy().to_string();
+        tracing::info!("downloading {url}");
+        let f = crate::fetch::download(&tool, &url, &dir, &|_| {}, &CancelFlag::never())?;
+        tracing::info!("downloaded {}", f.display());
+        Ok(f)
+    };
+    let (input, more) = (args.input.take(), std::mem::take(&mut args.more));
+    args.input = input.map(get).transpose()?;
+    args.more = more.into_iter().map(get).collect::<anyhow::Result<_>>()?;
+    Ok(args)
 }
 
 /// Video/audio files the engine takes (a folder input picks these up).
