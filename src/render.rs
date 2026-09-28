@@ -34,7 +34,7 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc;
 
 use crate::camera::Pose;
-use crate::compose::{Compositor, Geom, Rect, OUT_H, OUT_W};
+use crate::compose::{Canvas, Compositor, Geom, Rect};
 use crate::ffmpeg::Probe;
 use crate::progress::{CancelFlag, SharedPct};
 
@@ -245,6 +245,118 @@ pub fn spans_for(keeps: &[(f64, f64, usize)], fps: (u32, u32)) -> Vec<Span> {
     out
 }
 
+/// Where a logo sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    /// `tl`, `tr`, `bl`, `br`.
+    pub fn parse(s: &str) -> Option<Corner> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tl" => Some(Corner::TopLeft),
+            "tr" => Some(Corner::TopRight),
+            "bl" => Some(Corner::BottomLeft),
+            "br" => Some(Corner::BottomRight),
+            _ => None,
+        }
+    }
+
+    pub fn is_top(self) -> bool {
+        matches!(self, Corner::TopLeft | Corner::TopRight)
+    }
+
+    pub fn is_left(self) -> bool {
+        matches!(self, Corner::TopLeft | Corner::BottomLeft)
+    }
+}
+
+/// A corner logo.
+#[derive(Debug, Clone)]
+pub struct Logo {
+    pub path: PathBuf,
+    pub corner: Corner,
+    /// Image width / height (1.0 when unknown).
+    pub aspect: f64,
+}
+
+impl Logo {
+    /// A logo from an image file; its shape is read from the header.
+    pub fn new(path: PathBuf, corner: Corner) -> Logo {
+        let aspect = image_size(&path)
+            .map(|(w, h)| w as f64 / h.max(1) as f64)
+            .filter(|a| a.is_finite() && *a > 0.0)
+            .unwrap_or(1.0);
+        Logo {
+            path,
+            corner,
+            aspect,
+        }
+    }
+
+    /// Drawn size (even px): fits a box 14% of the short canvas side tall
+    /// and 26% wide, so marks and wide wordmarks read at the same weight.
+    pub fn size(&self, c: Canvas) -> (u32, u32) {
+        let s = c.w.min(c.h) as f64;
+        let (bw, bh) = (s * 0.26, s * 0.14);
+        let w = bw.min(bh * self.aspect);
+        let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
+        (even(w), even(w / self.aspect))
+    }
+
+    /// Corner insets (x, y) in px.
+    pub fn inset(c: Canvas) -> (u32, u32) {
+        (
+            (c.w as f64 * 0.04).round() as u32,
+            (c.h as f64 * 0.035).round() as u32,
+        )
+    }
+}
+
+/// Pixel size of a PNG or JPEG from its header (no decoder needed).
+pub fn image_size(p: &Path) -> Option<(u32, u32)> {
+    let b = std::fs::read(p).ok()?;
+    let be16 =
+        |i: usize| -> Option<u32> { Some(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32) };
+    if b.len() >= 24 && b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let w = u32::from_be_bytes(b[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(b[20..24].try_into().ok()?);
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    if b.starts_with(&[0xFF, 0xD8]) {
+        let mut i = 2;
+        while i + 9 < b.len() {
+            if b[i] != 0xFF {
+                return None;
+            }
+            let m = b[i + 1];
+            // SOF0..SOF15 carry the size (C4/C8/CC are other tables).
+            if (0xC0..=0xCF).contains(&m) && !matches!(m, 0xC4 | 0xC8 | 0xCC) {
+                let (h, w) = (be16(i + 5)?, be16(i + 7)?);
+                return (w > 0 && h > 0).then_some((w, h));
+            }
+            i += 2 + be16(i + 2)? as usize;
+        }
+    }
+    None
+}
+
+/// Output canvas and overlays shared by every render of a run.
+#[derive(Debug, Clone, Default)]
+pub struct Look {
+    pub canvas: Canvas,
+    /// Progress bar color (sRGB); `None` = off.
+    pub bar: Option<(u8, u8, u8)>,
+    /// Corner logo.
+    pub logo: Option<Logo>,
+    /// Background music and its bed level (dB relative to the speech).
+    pub music: Option<(PathBuf, f64)>,
+}
+
 /// Everything one render needs.
 pub struct Job<'a> {
     pub source: &'a Path,
@@ -261,6 +373,8 @@ pub struct Job<'a> {
     pub gpu: bool,
     pub threads: usize,
     pub label: &'a str,
+    /// Canvas + overlays (default: 9:16, none).
+    pub look: &'a Look,
 }
 
 impl Job<'_> {
@@ -514,11 +628,32 @@ impl AudioPlan {
     }
 
     /// Final chain `[cat]` → `[a]`: gain, 48 kHz, exact total length.
-    fn finish(&self, loud: &Loudness) -> String {
+    /// With `music` (input index, bed level dB): the bed is normalized to
+    /// the level below the speech target, looped to length, faded in and
+    /// out, ducked by the speech (sidechain), then mixed under it; one
+    /// limiter guards the sum.
+    fn finish(&self, loud: &Loudness, music: Option<(usize, f64)>) -> String {
+        let n = self.total_samples;
+        let Some((mi, db)) = music else {
+            return format!(
+                "[cat]{}aresample=48000,apad=whole_len={n},atrim=end_sample={n}[a]",
+                loud.chain()
+            );
+        };
+        let fin = ((0.4 * SR) as u64).min(n / 4);
+        let fout = ((1.5 * SR) as u64).min(n / 3);
+        let bed = (TARGET_LUFS + db.clamp(-40.0, 0.0)).max(-70.0);
         format!(
-            "[cat]{}aresample=48000,apad=whole_len={n},atrim=end_sample={n}[a]",
-            loud.chain(),
-            n = self.total_samples
+            "[cat]{voice}asplit=2[vo][vk];\
+             [{mi}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,\
+             loudnorm=I={bed:.1}:TP=-6:LRA=11,aresample=48000,asetpts=N/SR/TB,\
+             atrim=end_sample={n},afade=t=in:ss=0:ns={fin},afade=t=out:ss={fo}:ns={fout}[mb];\
+             [mb][vk]sidechaincompress=threshold=0.03:ratio=2.5:attack=25:release=450:makeup=1[md];\
+             [vo][md]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,\
+             alimiter=limit={LIMIT}:attack=5:release=60:level=0,\
+             aresample=48000,apad=whole_len={n},atrim=end_sample={n}[a]",
+            voice = loud.voice(),
+            fo = n.saturating_sub(fout),
         )
     }
 }
@@ -539,6 +674,15 @@ const TARGET_LUFS: f64 = -14.0;
 const LIMIT: f64 = 0.794;
 
 impl Loudness {
+    /// Speech gain alone (the limiter comes after a music mix).
+    fn voice(&self) -> String {
+        match self {
+            Loudness::Linear(g) => format!("volume={g:.2}dB,"),
+            Loudness::Dynamic => "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,".into(),
+            Loudness::Silent => String::new(),
+        }
+    }
+
     fn chain(&self) -> String {
         match self {
             Loudness::Linear(g) => {
@@ -607,12 +751,32 @@ fn run(
     let total = job.total_frames();
     let dg = decode_geom(job.probe, job.fps);
     let src_g = Geom { w: dg.w, h: dg.h };
-    let out_g = Geom { w: OUT_W, h: OUT_H };
+    let canvas = job.look.canvas;
+    let out_g = Geom {
+        w: canvas.w,
+        h: canvas.h,
+    };
 
     // --- encoder ---------------------------------------------------------
+    // Inputs: 0 = composed frames, then the audio stretches, then the logo
+    // and music (when set).
+    let mut next_input = 1 + audio.inputs.len();
+    let logo = job.look.logo.as_ref().filter(|l| l.path.is_file());
+    let logo_idx = logo.map(|_| {
+        next_input += 1;
+        next_input - 1
+    });
+    let music = job.look.music.as_ref().filter(|(p, _)| p.is_file());
+    let music_idx = music.map(|(_, db)| {
+        next_input += 1;
+        (next_input - 1, *db)
+    });
     let mut vchain = String::from(
         "[0:v]setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
     );
+    if let (Some(l), Some(li)) = (logo, logo_idx) {
+        vchain.push_str(&logo_chain(li, l, canvas));
+    }
     if let Some(ass) = job.ass {
         vchain.push_str(&format!(
             ",ass={}:fontsdir={}",
@@ -621,17 +785,28 @@ fn run(
         ));
     }
     vchain.push_str("[v]");
-    let graph = format!("{vchain};{};{}", audio.graph(1), audio.finish(loud));
+    let graph = format!(
+        "{vchain};{};{}",
+        audio.graph(1),
+        audio.finish(loud, music_idx)
+    );
     let mut enc_cmd = crate::process::command(ffmpeg);
     enc_cmd
         .args(["-hide_banner", "-v", "error", "-y"])
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
         .arg("-s")
-        .arg(format!("{OUT_W}x{OUT_H}"))
+        .arg(format!("{}x{}", canvas.w, canvas.h))
         .arg("-framerate")
         .arg(format!("{}/{}", job.fps.0, job.fps.1))
         .args(["-i", "pipe:0"])
-        .args(audio.input_args(job.source))
+        .args(audio.input_args(job.source));
+    if let Some(l) = logo {
+        enc_cmd.arg("-i").arg(&l.path);
+    }
+    if let Some((p, _)) = music {
+        enc_cmd.args(["-stream_loop", "-1", "-i"]).arg(p);
+    }
+    enc_cmd
         .arg("-filter_complex")
         .arg(&graph)
         .args(["-map", "[v]", "-map", "[a]"])
@@ -692,8 +867,8 @@ fn run(
     });
 
     // --- compose loop (this thread) ----------------------------------------
-    let mut comp = Compositor::new(dg.w, dg.h);
-    let base = crate::compose::base_rect(
+    let mut comp = Compositor::new(dg.w, dg.h, canvas).with_bar(job.look.bar);
+    let base = canvas.base_rect(
         job.probe.width.unwrap_or(dg.w) as f64,
         job.probe.height.unwrap_or(dg.h) as f64,
     );
@@ -730,7 +905,8 @@ fn run(
         };
         let flash = job.flash.get(i).copied().unwrap_or(0.0);
         let t0 = std::time::Instant::now();
-        let composed = match comp.compose(&frame, rect, flash) {
+        let done = (i + 1) as f32 / total as f32;
+        let composed = match comp.compose(&frame, rect, flash, done) {
             Ok(c) => c,
             Err(e) => {
                 failure = Some(e);
@@ -806,6 +982,29 @@ fn run(
         compose_s * 1000.0 / total.max(1) as f64
     );
     Ok(())
+}
+
+/// Logo overlay (input `li`) on the video chain: sized by `Logo::size`,
+/// lightly translucent, inset from its corner. Captions burn on top.
+fn logo_chain(li: usize, logo: &Logo, c: Canvas) -> String {
+    let (lw, lh) = logo.size(c);
+    let (mx, my) = Logo::inset(c);
+    let x = if logo.corner.is_left() {
+        format!("{mx}")
+    } else {
+        format!("W-w-{mx}")
+    };
+    // Bottom corners sit higher: clear of the progress bar and the
+    // platform's bottom UI.
+    let y = if logo.corner.is_top() {
+        format!("{my}")
+    } else {
+        format!("H-h-{}", my * 2)
+    };
+    format!(
+        "[vpre];[{li}:v]format=rgba,scale={lw}:{lh}:flags=lanczos,colorchannelmixer=aa=0.9[logo];\
+         [vpre][logo]overlay=x={x}:y={y}:format=auto,format=yuv420p"
+    )
 }
 
 /// Decoder stage: one ffmpeg per span, frames streamed in output order.
@@ -975,4 +1174,66 @@ fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<String> 
         }
         String::from_utf8_lossy(&keep).into_owned()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_size_reads_png_and_jpeg_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        b.extend(640u32.to_be_bytes());
+        b.extend(160u32.to_be_bytes());
+        b.extend([8, 6, 0, 0, 0]);
+        std::fs::write(&png, &b).unwrap();
+        assert_eq!(image_size(&png), Some((640, 160)));
+        // JPEG: SOI, an APP0 segment, then SOF0 with h=300, w=500.
+        let jpg = dir.path().join("a.jpg");
+        let mut j = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        j.extend([0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0x2C, 0x01, 0xF4, 0x03]);
+        j.extend([0u8; 12]);
+        std::fs::write(&jpg, &j).unwrap();
+        assert_eq!(image_size(&jpg), Some((500, 300)));
+        let junk = dir.path().join("a.webp");
+        std::fs::write(&junk, b"RIFF....WEBP").unwrap();
+        assert_eq!(image_size(&junk), None);
+    }
+
+    #[test]
+    fn logos_fit_one_box_whatever_their_shape() {
+        let mark = Logo {
+            path: PathBuf::new(),
+            corner: Corner::TopRight,
+            aspect: 1.0,
+        };
+        let word = Logo {
+            aspect: 4.0,
+            ..mark.clone()
+        };
+        let tall = Canvas::TALL;
+        // 14% of 1080 tall for a square mark, width capped at 26% for a
+        // wordmark (so it is shorter, never wider than the box).
+        assert_eq!(mark.size(tall), (152, 152));
+        let (w, h) = word.size(tall);
+        assert_eq!(w, 280);
+        assert_eq!(h, 70);
+        assert!(w % 2 == 0 && h % 2 == 0);
+        assert_eq!(Corner::parse("BL"), Some(Corner::BottomLeft));
+        assert!(Corner::BottomLeft.is_left() && !Corner::BottomLeft.is_top());
+    }
+
+    #[test]
+    fn logo_chain_places_the_logo_in_its_corner() {
+        let l = Logo {
+            path: PathBuf::new(),
+            corner: Corner::BottomRight,
+            aspect: 1.0,
+        };
+        let f = logo_chain(3, &l, Canvas::SQUARE);
+        assert!(f.contains("[3:v]format=rgba,scale=152:152"), "{f}");
+        assert!(f.contains("overlay=x=W-w-43:y=H-h-76"), "{f}");
+    }
 }

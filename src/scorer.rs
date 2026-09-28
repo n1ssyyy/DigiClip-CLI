@@ -11,6 +11,9 @@ pub struct Heuristic {
     #[allow(dead_code)]
     pub target_min_s: f64,
     pub target_max_s: f64,
+    /// `--focus` terms (see `focus_terms`): sentences mentioning one rank
+    /// first.
+    pub focus: Vec<String>,
 }
 
 impl Default for Heuristic {
@@ -18,7 +21,100 @@ impl Default for Heuristic {
         Self {
             target_min_s: 20.0,
             target_max_s: 45.0,
+            focus: Vec::new(),
         }
+    }
+}
+
+/// Words too common to steer by.
+const FOCUS_STOP: &[&str] = &[
+    "a", "an", "the", "and", "or", "of", "on", "in", "to", "for", "with", "about", "my", "our",
+    "your", "how", "what", "why", "when", "is", "are", "was", "it", "its", "this", "that", "stuff",
+    "things", "thing", "talk", "talking", "part", "parts", "moment", "moments", "clip", "clips",
+];
+
+/// `--focus "pricing, AI agents"` -> match terms (`pricing` -> `pric`,
+/// `ai`, `agent`). Lowercase, stopwords dropped, light suffix stemming so
+/// "invest" finds "investing"/"investors".
+pub fn focus_terms(focus: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in focus.split(|c: char| !c.is_alphanumeric()) {
+        let w = raw.to_lowercase();
+        if w.is_empty() || FOCUS_STOP.contains(&w.as_str()) {
+            continue;
+        }
+        let mut t = w.clone();
+        for suf in ["ing", "ers", "er", "ed", "es", "s"] {
+            if let Some(stem) = w.strip_suffix(suf) {
+                if stem.chars().count() >= 4 {
+                    t = stem.to_string();
+                    break;
+                }
+            }
+        }
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Does `text` mention any focus term? Short terms (<= 3 chars, e.g.
+/// "ai") must match a whole word; longer ones match word prefixes.
+pub fn mentions_focus(text: &str, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .any(|w| {
+            let w = w.to_lowercase();
+            terms.iter().any(|t| {
+                if t.chars().count() <= 3 {
+                    w == *t
+                } else {
+                    w.starts_with(t.as_str())
+                }
+            })
+        })
+}
+
+/// Rank bump for picks whose words mention the focus: any picker (LLM
+/// included) gets the topic first, off-topic picks still backfill.
+/// Returns how many picks matched.
+pub fn apply_focus(raw: &mut [RawClip], words: &[Word], terms: &[String]) -> usize {
+    const BUMP: i64 = 15;
+    let mut hit = 0;
+    for c in raw.iter_mut() {
+        let text = words
+            .iter()
+            .filter(|w| w.s >= c.start_s - 0.05 && w.e <= c.end_s + 0.05)
+            .map(|w| w.w.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !mentions_focus(&text, terms) {
+            continue;
+        }
+        hit += 1;
+        let s = c.scores.get_or_insert(Scores {
+            hook: 50,
+            retention: 50,
+            value: 50,
+            share: 50,
+        });
+        for v in [&mut s.hook, &mut s.retention, &mut s.value, &mut s.share] {
+            *v = (*v + BUMP).min(100);
+        }
+    }
+    hit
+}
+
+/// Sentence score bonus when it mentions the focus.
+fn focus_bonus(text: &str, terms: &[String]) -> i64 {
+    if mentions_focus(text, terms) {
+        25
+    } else {
+        0
     }
 }
 
@@ -89,7 +185,7 @@ pub fn propose(words: &[Word], count: usize, ctx: &Heuristic) -> Vec<RawClip> {
             s: slice.first().map(|w| w.s).unwrap_or(0.0),
             e: slice.last().map(|w| w.e).unwrap_or(0.0),
             text: text.clone(),
-            score: score_sentence(&text, slice.len()),
+            score: score_sentence(&text, slice.len()) + focus_bonus(&text, &ctx.focus),
         });
     }
     sents.sort_by(|a, b| b.score.cmp(&a.score).then(a.idx.cmp(&b.idx)));
@@ -166,8 +262,9 @@ pub fn is_hook_filler(w: &str) -> bool {
 /// Complete-thought picks: top sentences grown by WHOLE sentences to >=20s
 /// (forward first so the payoff stays inside, then backward), capped at
 /// ~120s. Boundaries are sentence ends by construction — length flexes,
-/// the ending never lands mid-thought.
-pub fn propose_complete(words: &[Word], count: usize) -> Vec<RawClip> {
+/// the ending never lands mid-thought. `focus` terms rank their sentences
+/// first.
+pub fn propose_complete(words: &[Word], count: usize, focus: &[String]) -> Vec<RawClip> {
     if words.is_empty() || count == 0 {
         return vec![];
     }
@@ -191,7 +288,7 @@ pub fn propose_complete(words: &[Word], count: usize) -> Vec<RawClip> {
         ss.push(CS {
             s: slice.first().map(|w| w.s).unwrap_or(0.0),
             e: slice.last().map(|w| w.e).unwrap_or(0.0),
-            score: score_sentence(&text, slice.len()),
+            score: score_sentence(&text, slice.len()) + focus_bonus(&text, focus),
             text,
         });
     }
@@ -396,7 +493,7 @@ mod tests {
     #[test]
     fn complete_snaps_to_sentence_ends() {
         let words = tw("This is a complete thought here. And another follows right after it ends today for sure. The audience always loves a clean finish to the story arc today.");
-        let clips = propose_complete(&words, 1);
+        let clips = propose_complete(&words, 1, &[]);
         // Over-proposal: all 3 ranked sentences reach the validator.
         assert_eq!(clips.len(), 3);
         assert!(
@@ -420,6 +517,76 @@ mod tests {
             .join(" ");
         let words = tw(&text);
         assert_eq!(propose(&words, 2, &Heuristic::default()).len(), 6);
-        assert_eq!(propose_complete(&words, 2).len(), 6);
+        assert_eq!(propose_complete(&words, 2, &[]).len(), 6);
+    }
+
+    #[test]
+    fn focus_terms_stem_and_match() {
+        let t = focus_terms("Pricing, AI agents and the investing stuff");
+        assert_eq!(t, vec!["pric", "ai", "agent", "invest"]);
+        assert!(mentions_focus("We changed our prices last week.", &t));
+        assert!(mentions_focus("Investors hate that.", &t));
+        assert!(mentions_focus("An AI wrote it.", &t));
+        // Short terms match whole words only.
+        assert!(!mentions_focus(
+            "Fresh air and a fair price",
+            &focus_terms("ai")
+        ));
+        assert!(!mentions_focus("anything", &[]));
+    }
+
+    #[test]
+    fn focus_ranks_matching_sentences_first() {
+        let text = "Is this the best day ever? What a question to ask! \
+                    We talk about pricing here. Then more words follow on.";
+        let words = tw(text);
+        let plain = propose(&words, 1, &Heuristic::default());
+        assert!(!plain[0].hook_line.as_deref().unwrap().contains("pricing"));
+        let ctx = Heuristic {
+            focus: focus_terms("pricing"),
+            ..Default::default()
+        };
+        let focused = propose(&words, 1, &ctx);
+        assert!(focused[0].hook_line.as_deref().unwrap().contains("pricing"));
+        // Complete thoughts grow to >=20s, so check the window covers it.
+        let at = words.iter().find(|w| w.w == "pricing").unwrap().s;
+        let complete = propose_complete(&words, 1, &ctx.focus);
+        assert!(complete[0].start_s <= at && at < complete[0].end_s);
+    }
+
+    #[test]
+    fn apply_focus_bumps_only_matching_picks() {
+        let words = tw("Nothing here at all. We talk about pricing now.");
+        let mid = words.iter().find(|w| w.w.starts_with("We")).unwrap().s;
+        let mut raw = vec![
+            RawClip {
+                start_s: 0.0,
+                end_s: mid - 0.01,
+                hook_line: None,
+                why_it_works: None,
+                scores: Some(Scores {
+                    hook: 90,
+                    retention: 90,
+                    value: 90,
+                    share: 90,
+                }),
+                title: None,
+                hashtags: None,
+                caption_style: None,
+            },
+            RawClip {
+                start_s: mid,
+                end_s: words.last().unwrap().e,
+                hook_line: None,
+                why_it_works: None,
+                scores: None,
+                title: None,
+                hashtags: None,
+                caption_style: None,
+            },
+        ];
+        assert_eq!(apply_focus(&mut raw, &words, &focus_terms("pricing")), 1);
+        assert_eq!(raw[0].scores.as_ref().unwrap().hook, 90);
+        assert_eq!(raw[1].scores.as_ref().unwrap().hook, 65);
     }
 }

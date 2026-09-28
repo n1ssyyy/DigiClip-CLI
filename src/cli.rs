@@ -11,8 +11,14 @@ use clap::{Parser, ValueEnum};
 #[derive(Parser, Debug, Clone)]
 #[command(name = "digiclip", version, about)]
 pub struct Args {
-    /// Input video (.mp4, .mov, .mkv, .webm, .m4a). Not needed with --provision.
+    /// Input video (.mp4, .mov, .mkv, .webm, .m4a) — or a folder of them.
+    /// Not needed with --provision.
     pub input: Option<PathBuf>,
+
+    /// More inputs: every file (or folder) runs in turn, each into its own
+    /// `<name>-digiclip/` (under --out-dir when given).
+    #[arg(value_name = "MORE")]
+    pub more: Vec<PathBuf>,
 
     /// Output mode: `clips` cuts captioned 9:16 highlights (default 3),
     /// `full` keeps the whole video and burns in subtitles for it.
@@ -137,6 +143,47 @@ pub struct Args {
     #[arg(long)]
     pub style: Option<String>,
 
+    /// Output aspect: 9:16 (default — TikTok, Reels, Shorts), 4:5
+    /// (Instagram/Facebook feed), 1:1 (square), 16:9 (YouTube). Tracking,
+    /// camera, captions and overlays all adapt.
+    #[arg(long, default_value = "9:16", value_parser = parse_aspect)]
+    pub aspect: String,
+
+    /// Headline pinned at the top of every render. Bare `--headline` uses
+    /// each clip's title (or hook line); `--headline "TEXT"` sets it.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub headline: Option<String>,
+
+    /// Progress bar along the bottom edge. Bare = yellow, or a #RRGGBB
+    /// color: `--progress-bar "#FF3B30"`.
+    #[arg(long, num_args = 0..=1, default_missing_value = "#FFD400", value_parser = parse_color)]
+    pub progress_bar: Option<String>,
+
+    /// Logo / watermark image (PNG with transparency works best), scaled
+    /// to ~14% of the frame width.
+    #[arg(long)]
+    pub logo: Option<PathBuf>,
+
+    /// Logo corner: tl, tr (default), bl, br.
+    #[arg(long, default_value = "tr", value_parser = ["tl", "tr", "bl", "br"])]
+    pub logo_pos: String,
+
+    /// Background music (any audio file): looped, faded in and out, and
+    /// ducked automatically under speech.
+    #[arg(long)]
+    pub music: Option<PathBuf>,
+
+    /// Music bed level in dB relative to the speech (default -16; it ducks
+    /// a further ~6-9 dB while someone talks).
+    #[arg(long, default_value_t = -16.0, allow_hyphen_values = true)]
+    pub music_db: f64,
+
+    /// Steer clip picking toward a topic, e.g. `--focus "pricing, AI
+    /// agents"`. The LLM picker is told to prefer it; the offline scorer
+    /// boosts windows that mention it.
+    #[arg(long)]
+    pub focus: Option<String>,
+
     /// Language code passed to whisper-cli (default: en)
     #[arg(long, default_value = "en")]
     pub lang: String,
@@ -209,6 +256,25 @@ pub struct Args {
     /// root, i.e. %APPDATA%/digiclip on Windows).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+}
+
+fn parse_aspect(s: &str) -> Result<String, String> {
+    crate::compose::Canvas::parse(s)
+        .map(|c| c.tag().replace('x', ":"))
+        .ok_or_else(|| format!("unknown aspect '{s}' (use 9:16, 4:5, 1:1 or 16:9)"))
+}
+
+fn parse_color(s: &str) -> Result<String, String> {
+    crate::compose::parse_hex(s)
+        .map(|(r, g, b)| format!("#{r:02X}{g:02X}{b:02X}"))
+        .ok_or_else(|| format!("bad color '{s}' (use #RRGGBB)"))
+}
+
+impl Args {
+    /// The output canvas (`--aspect`).
+    pub fn canvas(&self) -> crate::compose::Canvas {
+        crate::compose::Canvas::parse(&self.aspect).unwrap_or_default()
+    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,16 +7,27 @@ pub fn stamp(s: f64) -> String {
     format!("{:02}:{:02}", (s / 60.0) as u64, (s % 60.0) as u64)
 }
 
-pub fn system(count: usize, min_s: u64, max_s: u64) -> String {
+pub fn system(count: usize, min_s: u64, max_s: u64, focus: Option<&str>) -> String {
     let target = if min_s == max_s {
         format!("each clip exactly {min_s}s long,")
     } else {
         format!("each clip {min_s}-{max_s}s long,")
     };
+    let focus = focus
+        .map(|f| f.trim().replace(['\n', '\r'], " "))
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            let f: String = f.chars().take(200).collect();
+            format!(
+                " Focus: the creator wants moments about \"{f}\" — pick those \
+                 first; fill any remaining slots with the next-best moments."
+            )
+        })
+        .unwrap_or_default();
     format!(
         "You are a short-form video editor for TikTok/Reels/Shorts. \
          Pick the {count} most viral-worthy moments. Rules: {target} \
-         hook in the first 2s, self-contained payoff, no mid-sentence cuts. \
+         hook in the first 2s, self-contained payoff, no mid-sentence cuts.{focus} \
          Use the submit_clips tool to return your results."
     )
 }

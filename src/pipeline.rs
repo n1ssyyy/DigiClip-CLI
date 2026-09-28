@@ -9,7 +9,7 @@
 //! - `audio.wav` (16kHz mono)
 //! - `transcript.json` ({words, segments, language, model})
 //! - `transcript.srt`
-//! - clips mode: `clip-01-9x16.mp4` + `clip-01.ass/srt`, `clips.json`
+//! - clips mode: `clip-01-9x16.mp4` (tag follows `--aspect`) + `clip-01.ass/srt`, `clips.json`
 //! - full mode: `full-9x16.mp4` + `full.ass/srt`
 
 use std::path::PathBuf;
@@ -92,6 +92,54 @@ struct Timeline {
     shots: Vec<f64>,
 }
 
+/// Canvas and overlays from the CLI flags. Missing logo/music files fail
+/// fast (they were asked for by name).
+fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
+    let logo = match &args.logo {
+        Some(p) if !p.is_file() => anyhow::bail!("--logo not found: {}", p.display()),
+        Some(p) => Some(crate::render::Logo::new(
+            p.clone(),
+            crate::render::Corner::parse(&args.logo_pos).unwrap_or(crate::render::Corner::TopRight),
+        )),
+        None => None,
+    };
+    let music = match &args.music {
+        Some(p) if !p.is_file() => anyhow::bail!("--music not found: {}", p.display()),
+        Some(p) => Some((p.clone(), args.music_db)),
+        None => None,
+    };
+    Ok(crate::render::Look {
+        canvas: args.canvas(),
+        bar: args
+            .progress_bar
+            .as_deref()
+            .and_then(crate::compose::parse_hex),
+        logo,
+        music,
+    })
+}
+
+/// Caption options for one render on this look.
+fn ass_opts(
+    look: &crate::render::Look,
+    headline: Option<String>,
+    dur: f64,
+) -> crate::captions::ass::AssOpts {
+    let c = look.canvas;
+    crate::captions::ass::AssOpts {
+        w: c.w,
+        h: c.h,
+        headline,
+        dur,
+        // Logo width + its inset + a gap.
+        clear: look.logo.as_ref().map(|l| crate::captions::ass::Clear {
+            top: l.corner.is_top(),
+            left: l.corner.is_left(),
+            px: l.size(c).0 + crate::render::Logo::inset(c).0 + (c.w as f64 * 0.025).round() as u32,
+        }),
+    }
+}
+
 fn out_dir_for(input: &std::path::Path, out_dir: &Option<PathBuf>) -> PathBuf {
     if let Some(d) = out_dir {
         return d.clone();
@@ -120,9 +168,14 @@ async fn pick_smart(
     ask: usize,
     min_len: f64,
     max_len: f64,
+    focus: Option<&str>,
 ) -> anyhow::Result<(Vec<crate::openrouter::RawClip>, String)> {
+    let heuristic = crate::scorer::Heuristic {
+        focus: focus.map(crate::scorer::focus_terms).unwrap_or_default(),
+        ..Default::default()
+    };
     if ocfg.has_key() {
-        let sys = crate::prompt::system(ask, min_len.round() as u64, max_len.round() as u64);
+        let sys = crate::prompt::system(ask, min_len.round() as u64, max_len.round() as u64, focus);
         let usr = crate::prompt::user(&tr.words, &tr.segments, dur, 8000);
         match crate::openrouter::analyze(ocfg, &sys, &usr).await {
             Ok(r) => {
@@ -137,7 +190,7 @@ async fn pick_smart(
                 }
                 tracing::warn!("LLM scoring failed ({msg}) — heuristic fallback");
                 Ok((
-                    crate::scorer::propose(&tr.words, ask, &crate::scorer::Heuristic::default()),
+                    crate::scorer::propose(&tr.words, ask, &heuristic),
                     "heuristic".to_string(),
                 ))
             }
@@ -145,7 +198,7 @@ async fn pick_smart(
     } else {
         tracing::info!("no OpenRouter key — heuristic scorer");
         Ok((
-            crate::scorer::propose(&tr.words, ask, &crate::scorer::Heuristic::default()),
+            crate::scorer::propose(&tr.words, ask, &heuristic),
             "heuristic".to_string(),
         ))
     }
@@ -280,7 +333,8 @@ async fn resolve_timeline(
     progress: Option<crate::progress::SharedPct>,
     cancel: &CancelFlag,
 ) -> Option<Timeline> {
-    let max_x = (src_w as f64 - src_h as f64 * 9.0 / 16.0).max(0.0);
+    let base = crate::track::Base::new(src_w as f64, src_h as f64, args.canvas());
+    let max_x = (src_w as f64 - base.w).max(0.0);
     match args.framing {
         Framing::Center => None,
         Framing::Plan => {
@@ -291,7 +345,7 @@ async fn resolve_timeline(
             match crate::framing::CropPlan::load(&p) {
                 Ok(plan) => {
                     // External plans carry x-only tracks; expand to base raw targets.
-                    let base_w = src_h as f64 * 9.0 / 16.0;
+                    let base_w = base.w;
                     let raw: Vec<RawTarget> = plan
                         .tracks
                         .into_iter()
@@ -300,15 +354,15 @@ async fn resolve_timeline(
                             RawTarget {
                                 t: tp.t,
                                 x,
-                                y: 0.0,
+                                y: base.y,
                                 w: base_w,
-                                h: src_h as f64,
+                                h: base.h,
                                 cut: false,
                                 hard: false,
                                 n_faces: 1,
                                 pick_cx: x + base_w / 2.0,
                                 ax: x + base_w / 2.0,
-                                ay: src_h as f64 * 0.4,
+                                ay: base.y + base.h * 0.4,
                                 weak: false,
                             }
                         })
@@ -359,6 +413,7 @@ async fn resolve_timeline(
                 b,
                 Some((a, b)),
                 words,
+                args.canvas(),
                 progress,
                 cancel,
             );
@@ -525,9 +580,137 @@ async fn resolve_punches(
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let emit = Emitter::null();
     let cancel = CancelFlag::never();
-    run_inner(&args, &JobCtx::cli(&emit, &cancel))
-        .await
-        .map(|_| ())
+    let ctx = JobCtx::cli(&emit, &cancel);
+    if args.provision {
+        return run_inner(&args, &ctx).await.map(|_| ());
+    }
+    let jobs = batch_jobs(&args)?;
+    if jobs.len() == 1 {
+        let (input, out_dir) = jobs.into_iter().next().unwrap();
+        let args = Args {
+            input: Some(input),
+            more: Vec::new(),
+            out_dir,
+            ..args
+        };
+        return run_inner(&args, &ctx).await.map(|_| ());
+    }
+    // Batch: one video after another (each already saturates the GPU and
+    // cores), a failure never stops the rest.
+    let n = jobs.len();
+    tracing::info!("batch: {n} videos");
+    let t0 = std::time::Instant::now();
+    let (mut made, mut failed) = (0usize, Vec::new());
+    for (k, (input, out_dir)) in jobs.into_iter().enumerate() {
+        tracing::info!("[{}/{n}] {}", k + 1, input.display());
+        let one = Args {
+            input: Some(input.clone()),
+            more: Vec::new(),
+            out_dir,
+            ..args.clone()
+        };
+        match run_inner(&one, &ctx).await {
+            Ok(arts) => made += arts.len(),
+            Err(e) => {
+                tracing::error!("[{}/{n}] {} failed: {e:#}", k + 1, input.display());
+                failed.push(input);
+            }
+        }
+    }
+    tracing::info!(
+        "batch done in {:.0}s: {} of {n} videos, {made} renders",
+        t0.elapsed().as_secs_f64(),
+        n - failed.len()
+    );
+    if !failed.is_empty() {
+        let list = failed
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!("{} of {n} videos failed: {list}", failed.len());
+    }
+    Ok(())
+}
+
+/// Video/audio files the engine takes (a folder input picks these up).
+const MEDIA_EXT: &[&str] = &[
+    "mp4", "mov", "mkv", "webm", "m4v", "avi", "m4a", "mp3", "wav",
+];
+
+fn is_media(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| MEDIA_EXT.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Every input (files, and the media files directly inside folders, by
+/// name) with its output directory. One input keeps the usual `--out-dir`
+/// meaning (that exact folder); several get `<name>-digiclip/` each, under
+/// `--out-dir` when given. Names that collide (`talk.mp4` + `talk.mov`)
+/// keep their extension in the folder name.
+fn batch_jobs(args: &Args) -> anyhow::Result<Vec<(PathBuf, Option<PathBuf>)>> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for p in args.input.iter().chain(args.more.iter()) {
+        if p.is_dir() {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(p)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|f| f.is_file() && is_media(f))
+                .collect();
+            found.sort();
+            if found.is_empty() {
+                tracing::warn!("no videos in {}", p.display());
+            }
+            files.extend(found);
+        } else if p.is_file() {
+            files.push(p.clone());
+        } else {
+            anyhow::bail!("input not found: {}", p.display());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|f| seen.insert(std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())));
+    if files.is_empty() {
+        anyhow::bail!(
+            "no input video{}",
+            args.input
+                .as_ref()
+                .map(|p| format!(" in {}", p.display()))
+                .unwrap_or_default()
+        );
+    }
+    if files.len() == 1 {
+        return Ok(vec![(files.remove(0), args.out_dir.clone())]);
+    }
+    let stem = |f: &PathBuf| {
+        f.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "video".into())
+    };
+    Ok(files
+        .iter()
+        .map(|f| {
+            let dup = files.iter().filter(|g| stem(g) == stem(f)).count() > 1;
+            let name = if dup {
+                let ext = f
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                format!("{}-{ext}-digiclip", stem(f))
+            } else {
+                format!("{}-digiclip", stem(f))
+            };
+            let dir = match &args.out_dir {
+                Some(d) => d.join(name),
+                None => f
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(name),
+            };
+            (f.clone(), Some(dir))
+        })
+        .collect())
 }
 
 /// Full pipeline with serve hooks. Returns one [`ClipArtifact`] per
@@ -608,6 +791,17 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
         },
         out.display()
     );
+
+    let look = look_for(args)?;
+    let tag = look.canvas.tag();
+    if look.canvas != crate::compose::Canvas::TALL {
+        tracing::info!(
+            "canvas {}x{} ({})",
+            look.canvas.w,
+            look.canvas.h,
+            args.aspect
+        );
+    }
 
     // (dry-run exits per-mode, after transcribe+picking, so it can print
     // the real picks and cut plan.)
@@ -712,6 +906,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
         env: env.as_ref(),
         ocfg: &ocfg,
         vision_model: &vision_model,
+        look: &look,
     };
 
     match args.mode {
@@ -745,8 +940,9 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                 caption_style: style.clone(),
                 source: "full".into(),
             };
-            let mp4 = out.join("full-9x16.mp4");
-            let mut artifact = artifact_for(&pseudo, "full-9x16.mp4", None);
+            let full_name = format!("full-{tag}.mp4");
+            let mp4 = out.join(&full_name);
+            let mut artifact = artifact_for(&pseudo, &full_name, None);
             artifact.tight_dur = dur;
             emit.stage(Stage::Pick, Some(100));
             emit.emit(JobEvent::ClipsPicked {
@@ -771,9 +967,17 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             )
             .await?;
             let ass = out.join("full.ass");
+            // Full mode: only an explicit headline text (a file name is no
+            // title).
+            let headline = args.headline.clone().filter(|h| !h.trim().is_empty());
             std::fs::write(
                 &ass,
-                crate::captions::ass::build(&plan.retimed, &style, 0.0),
+                crate::captions::ass::build_for(
+                    &plan.retimed,
+                    &style,
+                    0.0,
+                    &ass_opts(&look, headline, plan.tight_total),
+                ),
             )?;
             std::fs::write(
                 out.join("full.srt"),
@@ -794,6 +998,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                     gpu: gpu_on,
                     threads,
                     label: "full",
+                    look: &look,
                 },
                 emit.shared_hook(|p| JobEvent::ClipRender { rank: 1, pct: p }),
                 cancel,
@@ -858,7 +1063,9 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                 _ => None,
             };
             let bare_merge = args.merge.is_some() && explicit_ranges.is_none();
-            let (raw, source) = if explicit_ranges.is_some() {
+            let focus = args.focus.as_deref().filter(|f| !f.trim().is_empty());
+            let focus_terms = focus.map(crate::scorer::focus_terms).unwrap_or_default();
+            let (mut raw, source) = if explicit_ranges.is_some() {
                 (vec![], "merge".to_string())
             } else {
                 match args.kind {
@@ -898,15 +1105,33 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                     crate::cli::Kind::Complete => {
                         tracing::info!("complete-thought picking ({count} clips)");
                         (
-                            crate::scorer::propose_complete(&tr.words, ask),
+                            crate::scorer::propose_complete(&tr.words, ask, &focus_terms),
                             "heuristic-complete".to_string(),
                         )
                     }
                     crate::cli::Kind::Smart => {
-                        pick_smart(&ocfg, &tr, dur, ask, min_len, max_len).await?
+                        pick_smart(&ocfg, &tr, dur, ask, min_len, max_len, focus).await?
                     }
                 }
             };
+            // Focus: on-topic picks rank first whatever picked them (random
+            // moments and uniform timecuts stay as they are).
+            if !focus_terms.is_empty()
+                && matches!(
+                    args.kind,
+                    crate::cli::Kind::Smart | crate::cli::Kind::Complete
+                )
+            {
+                let hit = crate::scorer::apply_focus(&mut raw, &tr.words, &focus_terms);
+                tracing::info!(
+                    "focus {:?}: {hit}/{} candidates on topic",
+                    focus_terms,
+                    raw.len()
+                );
+                if hit == 0 {
+                    tracing::warn!("focus: nothing in the transcript matches — best picks overall");
+                }
+            }
             // Equal min and max ("exact mode") additionally widens each
             // window below until the tightened render fills the length
             // (see exact_fit) — except timecut, which sizes its own parts.
@@ -1137,7 +1362,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                     .iter()
                     .map(|c| {
                         let kit = args.kit.then(|| kit_name(c.rank));
-                        artifact_for(c, &format!("clip-{:02}-9x16.mp4", c.rank), kit)
+                        artifact_for(c, &format!("clip-{:02}-{tag}.mp4", c.rank), kit)
                     })
                     .collect(),
             });
@@ -1246,6 +1471,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                     .expect("render slots never close");
                 let (input, probe, out) = (input.clone(), probe.clone(), out.clone());
                 let (emit, cancel, kit) = (emit.clone(), cancel.clone(), args.kit);
+                let (look, headline) = (look.clone(), args.headline.clone());
                 running.spawn_blocking(move || {
                     let _slot = slot;
                     exec_clip(
@@ -1257,6 +1483,8 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                         gpu_on,
                         per_threads,
                         kit,
+                        &look,
+                        headline.as_deref(),
                         &emit,
                         &cancel,
                     )
@@ -1272,7 +1500,7 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             report.sort_by_key(|a| a.rank);
             // The shared `clip.ass`/`clip.srt` stay "last clip wins" (CLI).
             if let Some((last, _)) = jobs.last() {
-                let stem = format!("clip-{:02}-9x16", last.rank);
+                let stem = format!("clip-{:02}-{tag}", last.rank);
                 let _ = std::fs::copy(out.join(format!("{stem}.ass")), out.join("clip.ass"));
                 let _ = std::fs::copy(out.join(format!("{stem}.srt")), out.join("clip.srt"));
             }
@@ -1327,6 +1555,7 @@ struct PlanCtx<'a> {
     env: Option<&'a Envelope>,
     ocfg: &'a crate::openrouter::Config,
     vision_model: &'a str,
+    look: &'a crate::render::Look,
 }
 
 impl PlanCtx<'_> {
@@ -1377,8 +1606,15 @@ fn map_forward(t: f64, keeps: &[Keep]) -> Option<(f64, usize)> {
 }
 
 /// Camera targets (output clock) for one part's chunks.
-fn chunk_targets(chunks: &[Chunk], keeps: &[Keep], out0: f64, sw: f64, sh: f64) -> Vec<Target> {
-    let base = crate::compose::base_rect(sw, sh);
+fn chunk_targets(
+    chunks: &[Chunk],
+    keeps: &[Keep],
+    out0: f64,
+    sw: f64,
+    sh: f64,
+    canvas: crate::compose::Canvas,
+) -> Vec<Target> {
+    let base = canvas.base_rect(sw, sh);
     let full = Rect {
         x: 0.0,
         y: 0.0,
@@ -1541,7 +1777,14 @@ async fn plan_render(
         .await;
         kinds.extend(kind_names(&chunks));
         log_group_shots(&chunks, clip);
-        targets.extend(chunk_targets(&chunks, &part.keeps, out0, sw, sh));
+        targets.extend(chunk_targets(
+            &chunks,
+            &part.keeps,
+            out0,
+            sw,
+            sh,
+            pc.look.canvas,
+        ));
         if pi > 0 {
             hards.push(out0);
         }
@@ -1581,12 +1824,16 @@ async fn plan_render(
             hards: &hards,
             jumps: &jumps,
             onsets: &ons,
+            canvas: pc.look.canvas,
         },
         &camera::CamCfg::default(),
     );
     // Punch depth respects the resolution floor (no mush on low-res input).
     let mut pcfg = camera::PunchCfg::default();
-    pcfg.zoom = pcfg.zoom.min((sh / crate::track::MIN_CROP_H).max(1.08));
+    let base_h = pc.look.canvas.base_rect(sw, sh).h;
+    pcfg.zoom = pcfg
+        .zoom
+        .min((base_h / pc.look.canvas.min_crop_h()).max(1.08));
     let landed = camera::apply_punches(&mut poses, &punches, r, sw, sh, &pcfg);
     if !punches.is_empty() {
         tracing::info!(
@@ -1683,7 +1930,11 @@ async fn plan_clip(
     out: &std::path::Path,
     ctx: &JobCtx<'_>,
 ) -> anyhow::Result<ClipPlan> {
-    let mp4 = out.join(format!("clip-{:02}-9x16.mp4", clip.rank));
+    let mp4 = out.join(format!(
+        "clip-{:02}-{}.mp4",
+        clip.rank,
+        pc.look.canvas.tag()
+    ));
     if !groups.iter().any(|g| {
         g.keeps
             .iter()
@@ -1712,17 +1963,34 @@ fn exec_clip(
     gpu_on: bool,
     threads: usize,
     kit: bool,
+    look: &crate::render::Look,
+    headline: Option<&str>,
     emit: &Emitter,
     cancel: &CancelFlag,
 ) -> anyhow::Result<ClipArtifact> {
     let ClipPlan { clip, mp4, plan } = plan;
     let rank = clip.rank;
-    let stem = format!("clip-{rank:02}-9x16");
+    let stem = format!("clip-{rank:02}-{}", look.canvas.tag());
     // Captions on the tight clock — the same clock the frames are on.
     let ass = out.join(format!("{stem}.ass"));
+    let headline = headline.map(|h| {
+        if h.trim().is_empty() {
+            clip.title
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| clip.hook_line.clone())
+        } else {
+            h.to_string()
+        }
+    });
     std::fs::write(
         &ass,
-        crate::captions::ass::build(&plan.retimed, &clip.caption_style, 0.0),
+        crate::captions::ass::build_for(
+            &plan.retimed,
+            &clip.caption_style,
+            0.0,
+            &ass_opts(look, headline, plan.tight_total),
+        ),
     )?;
     std::fs::write(
         out.join(format!("{stem}.srt")),
@@ -1742,6 +2010,7 @@ fn exec_clip(
             gpu: gpu_on,
             threads,
             label: &format!("clip #{rank}"),
+            look,
         },
         emit.shared_hook(move |p| JobEvent::ClipRender { rank, pct: p }),
         cancel,
@@ -1888,6 +2157,63 @@ fn exact_fit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_expands_folders_and_names_outputs() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["b.mp4", "a.MOV", "b.mov", "notes.txt"] {
+            std::fs::write(dir.path().join(f), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("a-digiclip")).unwrap();
+        let args = Args::try_parse_from(["digiclip", dir.path().to_str().unwrap()]).unwrap();
+        let jobs = batch_jobs(&args).unwrap();
+        let names: Vec<String> = jobs
+            .iter()
+            .map(|(f, o)| {
+                format!(
+                    "{}>{}",
+                    f.file_name().unwrap().to_string_lossy(),
+                    o.as_ref().unwrap().file_name().unwrap().to_string_lossy()
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "a.MOV>a-digiclip",
+                "b.mov>b-mov-digiclip",
+                "b.mp4>b-mp4-digiclip"
+            ]
+        );
+        // One file keeps --out-dir as the exact folder.
+        let one = dir.path().join("b.mp4");
+        let args =
+            Args::try_parse_from(["digiclip", one.to_str().unwrap(), "--out-dir", "outs"]).unwrap();
+        assert_eq!(
+            batch_jobs(&args).unwrap(),
+            vec![(one.clone(), Some(PathBuf::from("outs")))]
+        );
+        // Several with --out-dir nest under it; duplicates collapse.
+        let args = Args::try_parse_from([
+            "digiclip",
+            one.to_str().unwrap(),
+            dir.path().join("a.MOV").to_str().unwrap(),
+            one.to_str().unwrap(),
+            "--out-dir",
+            "outs",
+        ])
+        .unwrap();
+        let jobs = batch_jobs(&args).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].1, Some(PathBuf::from("outs").join("b-digiclip")));
+        // Missing input is an error, an empty folder too.
+        let args = Args::try_parse_from(["digiclip", "nope-missing.mp4"]).unwrap();
+        assert!(batch_jobs(&args).is_err());
+        let empty = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from(["digiclip", empty.path().to_str().unwrap()]).unwrap();
+        assert!(batch_jobs(&args).is_err());
+    }
 
     #[test]
     fn merge_ranges_parse_and_clamp() {

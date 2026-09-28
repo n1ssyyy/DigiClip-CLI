@@ -156,6 +156,8 @@ pub struct PlanInput<'a> {
     pub jumps: &'a [f64],
     /// Utterance onsets (s): word starts after a pause; switches land here.
     pub onsets: &'a [f64],
+    /// Output canvas: its aspect sets the fallback (base) framing.
+    pub canvas: crate::compose::Canvas,
 }
 
 /// Channel vector: center x/y, ln width, ln height.
@@ -250,7 +252,7 @@ pub fn plan(inp: &PlanInput, cfg: &CamCfg) -> Vec<Pose> {
         return Vec::new();
     }
     let fps = inp.fps.max(1.0);
-    let base = crate::compose::base_rect(inp.src_w, inp.src_h);
+    let base = inp.canvas.base_rect(inp.src_w, inp.src_h);
     let fallback = Pose {
         rect: base,
         ax: base.cx(),
@@ -858,6 +860,7 @@ mod tests {
                 hards,
                 jumps,
                 onsets,
+                canvas: crate::compose::Canvas::TALL,
             },
             &CamCfg::default(),
         )

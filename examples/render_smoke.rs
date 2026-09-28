@@ -143,6 +143,7 @@ fn main() {
             gpu: false,
             threads: 4,
             label: "sync",
+            look: &Default::default(),
         },
         None,
         &cancel,
@@ -309,6 +310,7 @@ fn main() {
             hards: &[],
             jumps: &[],
             onsets: &[2.9],
+            canvas: Default::default(),
         },
         &camera::CamCfg::default(),
     );
@@ -342,6 +344,7 @@ fn main() {
             gpu: true,
             threads: 4,
             label: "camera",
+            look: &Default::default(),
         },
         None,
         &cancel,
