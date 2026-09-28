@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod binaries;
+pub mod cache;
 pub mod camera;
 pub mod captions;
 pub mod cli;
@@ -16,6 +17,7 @@ pub mod progress;
 pub mod prompt;
 pub mod provision;
 pub mod punch;
+pub mod redo;
 pub mod render;
 pub mod scorer;
 pub mod serve;

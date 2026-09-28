@@ -76,6 +76,9 @@ fn artifact_for(clip: &crate::validator::Clip, mp4: &str, kit: Option<String>) -
         ass: Some(format!("{stem}.ass")),
         srt: Some(format!("{stem}.srt")),
         kit,
+        why: clip.why_it_works.clone(),
+        scores: clip.scores.clone(),
+        hashtags: clip.hashtags.clone(),
     }
 }
 
@@ -808,13 +811,33 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     // (dry-run exits per-mode, after transcribe+picking, so it can print
     // the real picks and cut plan.)
 
+    // English-only models can't detect or transcribe anything else.
+    let lang = if args.model.ends_with(".en") {
+        "en".to_string()
+    } else {
+        args.lang.clone()
+    };
+    // Same source, model and language as the transcript already in `out`
+    // (a retry, an edit, a clip from the transcript): reuse audio + words.
+    let cache_key = crate::cache::source_key(&input, &args.model, &lang);
+    let cached = match (&cache_key, args.no_cache) {
+        (Some(k), false) => crate::cache::load(&out, k),
+        _ => None,
+    };
+
     // --- extract audio ----------------------------------------------------
     let t = std::time::Instant::now();
     emit.stage(Stage::Audio, None);
     let wav = out.join("audio.wav");
-    tracing::info!("extract audio -> {}", wav.display());
-    crate::ffmpeg::extract_wav(&input, &wav, 16000)?;
-    let _ = crate::ffmpeg::poster(&input, &out.join("poster.jpg"));
+    if cached.is_some() {
+        tracing::info!("audio + transcript cached in {}", out.display());
+    } else {
+        tracing::info!("extract audio -> {}", wav.display());
+        crate::ffmpeg::extract_wav(&input, &wav, 16000)?;
+    }
+    if cached.is_none() || !out.join("poster.jpg").is_file() {
+        let _ = crate::ffmpeg::poster(&input, &out.join("poster.jpg"));
+    }
     // One 10 ms energy envelope drives cut placement and emphasis punches.
     let env = match Envelope::load(&wav) {
         Ok(e) => Some(e),
@@ -830,13 +853,10 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     // --- transcribe: Vulkan sidecar on GPU, embedded CPU otherwise --------
     let t = std::time::Instant::now();
     emit.stage(Stage::Transcribe, None);
-    // English-only models can't detect or transcribe anything else.
-    let lang = if args.model.ends_with(".en") {
-        "en".to_string()
-    } else {
-        args.lang.clone()
-    };
-    let tr = if gpu_on && crate::binaries::resolve("whisper-cli-vulkan").is_some() {
+    let fresh = cached.is_none();
+    let mut tr = if let Some(tr) = cached {
+        tr
+    } else if gpu_on && crate::binaries::resolve("whisper-cli-vulkan").is_some() {
         tracing::info!(
             "transcribe via whisper Vulkan sidecar (model={})…",
             args.model
@@ -872,14 +892,40 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
         tr.words.len(),
         tr.segments.len()
     );
-    std::fs::write(
-        out.join("transcript.json"),
-        serde_json::to_string_pretty(&tr)?,
-    )?;
-    std::fs::write(
-        out.join("transcript.srt"),
-        crate::captions::srt::from_words(&tr.words),
-    )?;
+    // Redo: caption fixes land in the transcript itself, so every later
+    // render (and the editor) sees the corrected words.
+    let redo = match (&args.redo, args.mode) {
+        (Some(p), Mode::Clips) => Some(crate::redo::load(p)?),
+        (Some(_), Mode::Full) => {
+            tracing::warn!("--redo only applies to clips mode: ignored");
+            None
+        }
+        _ => None,
+    };
+    let fixed = redo.as_ref().map_or(0, |specs| {
+        specs
+            .iter()
+            .map(|s| crate::redo::apply_fixes(&mut tr.words, &s.fixes))
+            .sum()
+    });
+    if fixed > 0 {
+        tracing::info!("{fixed} caption word(s) fixed");
+    }
+    if fresh || fixed > 0 {
+        std::fs::write(
+            out.join("transcript.json"),
+            serde_json::to_string_pretty(&tr)?,
+        )?;
+        std::fs::write(
+            out.join("transcript.srt"),
+            crate::captions::srt::from_words(&tr.words),
+        )?;
+    }
+    if fresh {
+        if let Some(k) = &cache_key {
+            crate::cache::store(&out, k);
+        }
+    }
     tracing::info!("transcribe took {:.1}s", t.elapsed().as_secs_f64());
     emit.stage(Stage::Transcribe, Some(100));
     cancel.check()?;
@@ -1027,176 +1073,8 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             // --- clip picking FIRST (transcript only) -----------------------
             let t = std::time::Instant::now();
             emit.stage(Stage::Pick, None);
-            // Parse --span START-END (timecut); defaults to the whole video.
-            let parse_span = |span: Option<&str>, dur: f64| -> (f64, f64) {
-                if let Some(sp) = span {
-                    let mut it = sp.split('-');
-                    if let (Some(a), Some(b)) = (it.next(), it.next()) {
-                        if let (Ok(a), Ok(b)) = (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
-                            let (lo, hi) = (a.min(b).max(0.0), a.max(b).min(dur));
-                            if hi - lo >= 5.0 {
-                                return (lo, hi);
-                            }
-                        }
-                    }
-                    tracing::warn!("ignoring malformed --span '{sp}' (want START-END)");
-                }
-                (0.0, dur)
-            };
-            // --count 0 = auto (smart/complete only): ask for up to 10,
-            // keep whatever clears the merit bar (best always survives).
-            let auto = count == 0
-                && matches!(
-                    args.kind,
-                    crate::cli::Kind::Smart | crate::cli::Kind::Complete
-                );
-            let ask = if auto { 10 } else { count.max(1) };
-            // User duration window (--min-len/--max-len), needed by both
-            // the LLM prompt and the validator below. Clamped so an
-            // inverted or absurd window degrades to something sane.
-            let min_len = args.min_len.clamp(1.0, 600.0);
-            let max_len = args.max_len.clamp(min_len, 600.0);
-            // Explicit merge ranges skip picking entirely (no LLM call):
-            // overlapping/nearby ranges fuse so shared content never repeats.
-            let explicit_ranges: Option<Vec<(f64, f64)>> = match args.merge.as_deref() {
-                Some(ms) if !ms.trim().is_empty() => {
-                    let ranges = crate::timeline::fuse_overlaps(parse_ranges(ms, dur));
-                    if ranges.is_empty() {
-                        anyhow::bail!(
-                            "--merge parsed to no valid ranges (want A-B,C-D in seconds)"
-                        );
-                    }
-                    Some(ranges)
-                }
-                _ => None,
-            };
-            let bare_merge = args.merge.is_some() && explicit_ranges.is_none();
-            let focus = args.focus.as_deref().filter(|f| !f.trim().is_empty());
-            let focus_terms = focus.map(crate::scorer::focus_terms).unwrap_or_default();
-            let (mut raw, source) = if explicit_ranges.is_some() {
-                (vec![], "merge".to_string())
-            } else {
-                match args.kind {
-                    crate::cli::Kind::Timecut => {
-                        let (ts, te) = parse_span(args.span.as_deref(), dur);
-                        let len = args.timecut_len.max(5.0);
-                        let parts = crate::scorer::propose_timecut(&tr.words, ts, te, len);
-                        tracing::info!(
-                            "timecut: {} x {:.0}s parts over {:.0}s-{:.0}s",
-                            parts.len(),
-                            len,
-                            ts,
-                            te
-                        );
-                        (parts, "timecut".to_string())
-                    }
-                    crate::cli::Kind::Moments => {
-                        let seed = args.seed.unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos() as u64)
-                                .unwrap_or(0x9E3779B97F4A7C15)
-                        });
-                        tracing::info!(
-                            "moments: {} seeded windows (seed {seed})",
-                            if count == 0 { 3 } else { count }
-                        );
-                        (
-                            crate::scorer::propose_moments(
-                                &tr.words,
-                                if count == 0 { 3 } else { count },
-                                seed,
-                            ),
-                            format!("moments:{seed}"),
-                        )
-                    }
-                    crate::cli::Kind::Complete => {
-                        tracing::info!("complete-thought picking ({count} clips)");
-                        (
-                            crate::scorer::propose_complete(&tr.words, ask, &focus_terms),
-                            "heuristic-complete".to_string(),
-                        )
-                    }
-                    crate::cli::Kind::Smart => {
-                        pick_smart(&ocfg, &tr, dur, ask, min_len, max_len, focus).await?
-                    }
-                }
-            };
-            // Focus: on-topic picks rank first whatever picked them (random
-            // moments and uniform timecuts stay as they are).
-            if !focus_terms.is_empty()
-                && matches!(
-                    args.kind,
-                    crate::cli::Kind::Smart | crate::cli::Kind::Complete
-                )
-            {
-                let hit = crate::scorer::apply_focus(&mut raw, &tr.words, &focus_terms);
-                tracing::info!(
-                    "focus {:?}: {hit}/{} candidates on topic",
-                    focus_terms,
-                    raw.len()
-                );
-                if hit == 0 {
-                    tracing::warn!("focus: nothing in the transcript matches — best picks overall");
-                }
-            }
-            // Equal min and max ("exact mode") additionally widens each
-            // window below until the tightened render fills the length
-            // (see exact_fit) — except timecut, which sizes its own parts.
-            let exact_len = (max_len - min_len < 0.01
-                && !matches!(args.kind, crate::cli::Kind::Timecut))
-            .then_some(max_len);
-            let validator = match args.kind {
-                crate::cli::Kind::Timecut => {
-                    let len = args.timecut_len.max(5.0);
-                    crate::validator::Validator {
-                        min_s: (len - 5.0).max(5.0),
-                        max_s: len + 3.0,
-                        gate_grow_s: 2.0,
-                        complete_gate: args.complete_gate,
-                        hook_guard: args.hook_guard,
-                        ..Default::default()
-                    }
-                }
-                _ => crate::validator::Validator {
-                    min_s: min_len,
-                    max_s: max_len,
-                    complete_gate: args.complete_gate,
-                    hook_guard: args.hook_guard,
-                    ..Default::default()
-                },
-            };
-            // Timecut renders every part unless --take caps it.
-            let want = match args.kind {
-                crate::cli::Kind::Timecut => args.take.unwrap_or(usize::MAX),
-                _ => ask,
-            };
-            let mut clips = validator.normalize(raw, &tr.words, dur, want, &source);
-            // Explicit --style overrides every picker's suggestion.
-            if let Some(s) = args.style.as_deref() {
-                let s = crate::captions::ass::valid_preset(s);
-                for c in &mut clips {
-                    c.caption_style.clone_from(&s);
-                }
-            }
-            if auto && !clips.is_empty() {
-                // Merit mode: normalize sorts desc, so clips[0] is the best.
-                let best = clips[0].clone();
-                clips.retain(|c| c.score_total >= crate::scorer::AUTO_KEEP_SCORE);
-                if clips.is_empty() {
-                    clips.push(best);
-                }
-                for (i, c) in clips.iter_mut().enumerate() {
-                    c.rank = i + 1;
-                }
-                tracing::info!(
-                    "auto: kept {} clip(s) above merit {:.0}",
-                    clips.len(),
-                    crate::scorer::AUTO_KEEP_SCORE
-                );
-            }
-            // --- jobs: normal clips tighten in place; merge/flashback ----
-            // assemble one multi-range job (both override --kind) -----------
+            // Normal clips tighten in place; merge/flashback assemble one
+            // multi-range job (both override --kind).
             let tight_cfg = crate::timeline::TightenCfg {
                 mode: match args.tighten {
                     crate::cli::TightenMode::Off => crate::timeline::TightenMode::Off,
@@ -1227,117 +1105,316 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                 .map(crate::captions::ass::valid_preset)
                 .unwrap_or_else(|| "karaoke".into());
             let jobs: Vec<(crate::validator::Clip, Vec<crate::timeline::CutPlan>)> =
-                if let Some(mut ranges) = explicit_ranges {
-                    // Explicit ranges (pre-fused at parse): trim the tail past
-                    // the cap, tighten each, one compilation.
-                    while ranges.iter().map(|(a, b)| b - a).sum::<f64>() > args.merge_max
-                        && ranges.len() > 1
-                    {
-                        ranges.pop();
-                    }
-                    tracing::info!("merge: {} ranges (explicit)", ranges.len());
-                    let groups: Vec<crate::timeline::CutPlan> = ranges
+                if let Some(specs) = &redo {
+                    // Redo: exactly these clips, no picking.
+                    tracing::info!("redo: {} clip(s)", specs.len());
+                    specs
                         .iter()
-                        .map(|(a, b)| crate::timeline::tighten(*a, *b, &tr.words, &tight_cfg))
-                        .collect();
-                    let names = ranges
-                        .iter()
-                        .map(|(a, b)| format!("{a:.0}-{b:.0}s"))
-                        .collect::<Vec<_>>()
-                        .join(" + ");
-                    let clip = crate::validator::Clip {
-                        rank: 1,
-                        start_s: ranges[0].0,
-                        end_s: ranges.last().map(|r| r.1).unwrap_or(0.0),
-                        hook_line: format!("Merged compilation ({names})"),
-                        why_it_works: "User-merged ranges.".into(),
-                        score_total: 70.0,
-                        scores: None,
-                        title: None,
-                        hashtags: vec![],
-                        caption_style: caption_default.clone(),
-                        source: "merge".into(),
+                        .map(|sp| {
+                            let c = crate::redo::to_clip(sp, &tr.words, dur, &caption_default)?;
+                            let p =
+                                crate::timeline::tighten(c.start_s, c.end_s, &tr.words, &tight_cfg);
+                            Ok((c, vec![p]))
+                        })
+                        .collect::<anyhow::Result<_>>()?
+                } else {
+                    // Parse --span START-END (timecut); defaults to the whole video.
+                    let parse_span = |span: Option<&str>, dur: f64| -> (f64, f64) {
+                        if let Some(sp) = span {
+                            let mut it = sp.split('-');
+                            if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                                if let (Ok(a), Ok(b)) =
+                                    (a.trim().parse::<f64>(), b.trim().parse::<f64>())
+                                {
+                                    let (lo, hi) = (a.min(b).max(0.0), a.max(b).min(dur));
+                                    if hi - lo >= 5.0 {
+                                        return (lo, hi);
+                                    }
+                                }
+                            }
+                            tracing::warn!("ignoring malformed --span '{sp}' (want START-END)");
+                        }
+                        (0.0, dur)
                     };
-                    vec![(clip, groups)]
-                } else if bare_merge {
-                    // Bare merge: compile the agent's picks — repetitions
-                    // out, chronological, capped, overlaps fused, each part
-                    // tightened. This is the anti-fb3 path: no moment may
-                    // repeat another, even partially.
-                    if clips.is_empty() {
-                        anyhow::bail!("no clips survived validation (transcript too short?)");
-                    }
-                    let mut picks = dedupe_similar(clips, &tr.words);
-                    picks.sort_by(|a, b| a.start_s.partial_cmp(&b.start_s).unwrap());
-                    while picks.iter().map(|c| c.end_s - c.start_s).sum::<f64>() > args.merge_max
-                        && picks.len() > 1
-                    {
-                        let worst = picks
-                            .iter()
-                            .enumerate()
-                            .min_by(|a, b| a.1.score_total.partial_cmp(&b.1.score_total).unwrap())
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        picks.remove(worst);
-                    }
-                    let n = picks.len();
-                    let hook = picks
-                        .iter()
-                        .max_by(|a, b| a.score_total.partial_cmp(&b.score_total).unwrap())
-                        .map(|c| c.hook_line.clone())
-                        .unwrap_or_default();
-                    let avg = picks.iter().map(|c| c.score_total).sum::<f64>() / n as f64;
-                    let mut tags: Vec<String> = Vec::new();
-                    for c in &picks {
-                        for h in &c.hashtags {
-                            if !tags.contains(h) {
-                                tags.push(h.clone());
+                    // --count 0 = auto (smart/complete only): ask for up to 10,
+                    // keep whatever clears the merit bar (best always survives).
+                    let auto = count == 0
+                        && matches!(
+                            args.kind,
+                            crate::cli::Kind::Smart | crate::cli::Kind::Complete
+                        );
+                    let ask = if auto { 10 } else { count.max(1) };
+                    // User duration window (--min-len/--max-len), needed by both
+                    // the LLM prompt and the validator below. Clamped so an
+                    // inverted or absurd window degrades to something sane.
+                    let min_len = args.min_len.clamp(1.0, 600.0);
+                    let max_len = args.max_len.clamp(min_len, 600.0);
+                    // Explicit merge ranges skip picking entirely (no LLM call):
+                    // overlapping/nearby ranges fuse so shared content never repeats.
+                    let explicit_ranges: Option<Vec<(f64, f64)>> = match args.merge.as_deref() {
+                        Some(ms) if !ms.trim().is_empty() => {
+                            let ranges = crate::timeline::fuse_overlaps(parse_ranges(ms, dur));
+                            if ranges.is_empty() {
+                                anyhow::bail!(
+                                    "--merge parsed to no valid ranges (want A-B,C-D in seconds)"
+                                );
+                            }
+                            Some(ranges)
+                        }
+                        _ => None,
+                    };
+                    let bare_merge = args.merge.is_some() && explicit_ranges.is_none();
+                    let focus = args.focus.as_deref().filter(|f| !f.trim().is_empty());
+                    let focus_terms = focus.map(crate::scorer::focus_terms).unwrap_or_default();
+                    let (mut raw, source) = if explicit_ranges.is_some() {
+                        (vec![], "merge".to_string())
+                    } else {
+                        match args.kind {
+                            crate::cli::Kind::Timecut => {
+                                let (ts, te) = parse_span(args.span.as_deref(), dur);
+                                let len = args.timecut_len.max(5.0);
+                                let parts = crate::scorer::propose_timecut(&tr.words, ts, te, len);
+                                tracing::info!(
+                                    "timecut: {} x {:.0}s parts over {:.0}s-{:.0}s",
+                                    parts.len(),
+                                    len,
+                                    ts,
+                                    te
+                                );
+                                (parts, "timecut".to_string())
+                            }
+                            crate::cli::Kind::Moments => {
+                                let seed = args.seed.unwrap_or_else(|| {
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_nanos() as u64)
+                                        .unwrap_or(0x9E3779B97F4A7C15)
+                                });
+                                tracing::info!(
+                                    "moments: {} seeded windows (seed {seed})",
+                                    if count == 0 { 3 } else { count }
+                                );
+                                (
+                                    crate::scorer::propose_moments(
+                                        &tr.words,
+                                        if count == 0 { 3 } else { count },
+                                        seed,
+                                    ),
+                                    format!("moments:{seed}"),
+                                )
+                            }
+                            crate::cli::Kind::Complete => {
+                                tracing::info!("complete-thought picking ({count} clips)");
+                                (
+                                    crate::scorer::propose_complete(&tr.words, ask, &focus_terms),
+                                    "heuristic-complete".to_string(),
+                                )
+                            }
+                            crate::cli::Kind::Smart => {
+                                pick_smart(&ocfg, &tr, dur, ask, min_len, max_len, focus).await?
                             }
                         }
-                    }
-                    tags.truncate(8);
-                    // Fuse anything still overlapping (validator tolerates
-                    // <50% overlap between picks).
-                    let ranges: Vec<(f64, f64)> = crate::timeline::fuse_overlaps(
-                        picks.iter().map(|c| (c.start_s, c.end_s)).collect(),
-                    );
-                    tracing::info!("merge: compiled {n} picks into {} parts", ranges.len());
-                    let groups: Vec<crate::timeline::CutPlan> = ranges
-                        .iter()
-                        .map(|(a, b)| crate::timeline::tighten(*a, *b, &tr.words, &tight_cfg))
-                        .collect();
-                    let clip = crate::validator::Clip {
-                        rank: 1,
-                        start_s: ranges[0].0,
-                        end_s: ranges.last().map(|r| r.1).unwrap_or(0.0),
-                        hook_line: hook,
-                        why_it_works: format!(
-                            "Compilation of the {n} picked moments, chronological."
-                        ),
-                        score_total: avg,
-                        scores: None,
-                        title: None,
-                        hashtags: tags,
-                        caption_style: caption_default.clone(),
-                        source: format!("merge:{n}"),
                     };
-                    vec![(clip, groups)]
-                } else {
-                    if clips.is_empty() {
-                        anyhow::bail!("no clips survived validation (transcript too short?)");
+                    // Focus: on-topic picks rank first whatever picked them (random
+                    // moments and uniform timecuts stay as they are).
+                    if !focus_terms.is_empty()
+                        && matches!(
+                            args.kind,
+                            crate::cli::Kind::Smart | crate::cli::Kind::Complete
+                        )
+                    {
+                        let hit = crate::scorer::apply_focus(&mut raw, &tr.words, &focus_terms);
+                        tracing::info!(
+                            "focus {:?}: {hit}/{} candidates on topic",
+                            focus_terms,
+                            raw.len()
+                        );
+                        if hit == 0 {
+                            tracing::warn!(
+                                "focus: nothing in the transcript matches — best picks overall"
+                            );
+                        }
                     }
-                    clips
-                        .into_iter()
-                        .map(|mut c| {
-                            let p = match exact_len {
-                                Some(l) => exact_fit(&mut c, &tr.words, &tight_cfg, l, dur),
-                                None => crate::timeline::tighten(
-                                    c.start_s, c.end_s, &tr.words, &tight_cfg,
-                                ),
+                    // Equal min and max ("exact mode") additionally widens each
+                    // window below until the tightened render fills the length
+                    // (see exact_fit) — except timecut, which sizes its own parts.
+                    let exact_len = (max_len - min_len < 0.01
+                        && !matches!(args.kind, crate::cli::Kind::Timecut))
+                    .then_some(max_len);
+                    let validator = match args.kind {
+                        crate::cli::Kind::Timecut => {
+                            let len = args.timecut_len.max(5.0);
+                            crate::validator::Validator {
+                                min_s: (len - 5.0).max(5.0),
+                                max_s: len + 3.0,
+                                gate_grow_s: 2.0,
+                                complete_gate: args.complete_gate,
+                                hook_guard: args.hook_guard,
+                                ..Default::default()
+                            }
+                        }
+                        _ => crate::validator::Validator {
+                            min_s: min_len,
+                            max_s: max_len,
+                            complete_gate: args.complete_gate,
+                            hook_guard: args.hook_guard,
+                            ..Default::default()
+                        },
+                    };
+                    // Timecut renders every part unless --take caps it.
+                    let want = match args.kind {
+                        crate::cli::Kind::Timecut => args.take.unwrap_or(usize::MAX),
+                        _ => ask,
+                    };
+                    let mut clips = validator.normalize(raw, &tr.words, dur, want, &source);
+                    // Explicit --style overrides every picker's suggestion.
+                    if let Some(s) = args.style.as_deref() {
+                        let s = crate::captions::ass::valid_preset(s);
+                        for c in &mut clips {
+                            c.caption_style.clone_from(&s);
+                        }
+                    }
+                    if auto && !clips.is_empty() {
+                        // Merit mode: normalize sorts desc, so clips[0] is the best.
+                        let best = clips[0].clone();
+                        clips.retain(|c| c.score_total >= crate::scorer::AUTO_KEEP_SCORE);
+                        if clips.is_empty() {
+                            clips.push(best);
+                        }
+                        for (i, c) in clips.iter_mut().enumerate() {
+                            c.rank = i + 1;
+                        }
+                        tracing::info!(
+                            "auto: kept {} clip(s) above merit {:.0}",
+                            clips.len(),
+                            crate::scorer::AUTO_KEEP_SCORE
+                        );
+                    }
+                    let jobs: Vec<(crate::validator::Clip, Vec<crate::timeline::CutPlan>)> =
+                        if let Some(mut ranges) = explicit_ranges {
+                            // Explicit ranges (pre-fused at parse): trim the tail past
+                            // the cap, tighten each, one compilation.
+                            while ranges.iter().map(|(a, b)| b - a).sum::<f64>() > args.merge_max
+                                && ranges.len() > 1
+                            {
+                                ranges.pop();
+                            }
+                            tracing::info!("merge: {} ranges (explicit)", ranges.len());
+                            let groups: Vec<crate::timeline::CutPlan> = ranges
+                                .iter()
+                                .map(|(a, b)| {
+                                    crate::timeline::tighten(*a, *b, &tr.words, &tight_cfg)
+                                })
+                                .collect();
+                            let names = ranges
+                                .iter()
+                                .map(|(a, b)| format!("{a:.0}-{b:.0}s"))
+                                .collect::<Vec<_>>()
+                                .join(" + ");
+                            let clip = crate::validator::Clip {
+                                rank: 1,
+                                start_s: ranges[0].0,
+                                end_s: ranges.last().map(|r| r.1).unwrap_or(0.0),
+                                hook_line: format!("Merged compilation ({names})"),
+                                why_it_works: "User-merged ranges.".into(),
+                                score_total: 70.0,
+                                scores: None,
+                                title: None,
+                                hashtags: vec![],
+                                caption_style: caption_default.clone(),
+                                source: "merge".into(),
                             };
-                            (c, vec![p])
-                        })
-                        .collect()
+                            vec![(clip, groups)]
+                        } else if bare_merge {
+                            // Bare merge: compile the agent's picks — repetitions
+                            // out, chronological, capped, overlaps fused, each part
+                            // tightened. This is the anti-fb3 path: no moment may
+                            // repeat another, even partially.
+                            if clips.is_empty() {
+                                anyhow::bail!(
+                                    "no clips survived validation (transcript too short?)"
+                                );
+                            }
+                            let mut picks = dedupe_similar(clips, &tr.words);
+                            picks.sort_by(|a, b| a.start_s.partial_cmp(&b.start_s).unwrap());
+                            while picks.iter().map(|c| c.end_s - c.start_s).sum::<f64>()
+                                > args.merge_max
+                                && picks.len() > 1
+                            {
+                                let worst = picks
+                                    .iter()
+                                    .enumerate()
+                                    .min_by(|a, b| {
+                                        a.1.score_total.partial_cmp(&b.1.score_total).unwrap()
+                                    })
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(0);
+                                picks.remove(worst);
+                            }
+                            let n = picks.len();
+                            let hook = picks
+                                .iter()
+                                .max_by(|a, b| a.score_total.partial_cmp(&b.score_total).unwrap())
+                                .map(|c| c.hook_line.clone())
+                                .unwrap_or_default();
+                            let avg = picks.iter().map(|c| c.score_total).sum::<f64>() / n as f64;
+                            let mut tags: Vec<String> = Vec::new();
+                            for c in &picks {
+                                for h in &c.hashtags {
+                                    if !tags.contains(h) {
+                                        tags.push(h.clone());
+                                    }
+                                }
+                            }
+                            tags.truncate(8);
+                            // Fuse anything still overlapping (validator tolerates
+                            // <50% overlap between picks).
+                            let ranges: Vec<(f64, f64)> = crate::timeline::fuse_overlaps(
+                                picks.iter().map(|c| (c.start_s, c.end_s)).collect(),
+                            );
+                            tracing::info!("merge: compiled {n} picks into {} parts", ranges.len());
+                            let groups: Vec<crate::timeline::CutPlan> = ranges
+                                .iter()
+                                .map(|(a, b)| {
+                                    crate::timeline::tighten(*a, *b, &tr.words, &tight_cfg)
+                                })
+                                .collect();
+                            let clip = crate::validator::Clip {
+                                rank: 1,
+                                start_s: ranges[0].0,
+                                end_s: ranges.last().map(|r| r.1).unwrap_or(0.0),
+                                hook_line: hook,
+                                why_it_works: format!(
+                                    "Compilation of the {n} picked moments, chronological."
+                                ),
+                                score_total: avg,
+                                scores: None,
+                                title: None,
+                                hashtags: tags,
+                                caption_style: caption_default.clone(),
+                                source: format!("merge:{n}"),
+                            };
+                            vec![(clip, groups)]
+                        } else {
+                            if clips.is_empty() {
+                                anyhow::bail!(
+                                    "no clips survived validation (transcript too short?)"
+                                );
+                            }
+                            clips
+                                .into_iter()
+                                .map(|mut c| {
+                                    let p = match exact_len {
+                                        Some(l) => exact_fit(&mut c, &tr.words, &tight_cfg, l, dur),
+                                        None => crate::timeline::tighten(
+                                            c.start_s, c.end_s, &tr.words, &tight_cfg,
+                                        ),
+                                    };
+                                    (c, vec![p])
+                                })
+                                .collect()
+                        };
+                    jobs
                 };
             // Final edit polish: every cut edge into real silence (never a
             // neighbor word), then onto the frame grid; the tile range
@@ -1357,10 +1434,18 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
             }
             let final_clips: Vec<crate::validator::Clip> =
                 jobs.iter().map(|(c, _)| c.clone()).collect();
-            std::fs::write(
-                out.join("clips.json"),
-                serde_json::to_string_pretty(&final_clips)?,
-            )?;
+            if redo.is_some() {
+                let fresh: Vec<serde_json::Value> = final_clips
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<_, _>>()?;
+                crate::redo::merge_by_rank(&out.join("clips.json"), &fresh)?;
+            } else {
+                std::fs::write(
+                    out.join("clips.json"),
+                    serde_json::to_string_pretty(&final_clips)?,
+                )?;
+            }
             tracing::info!("clip picking took {:.1}s", t.elapsed().as_secs_f64());
             emit.stage(Stage::Pick, Some(100));
             // Picks land in the grid now (tiles show "making" until each
@@ -1402,10 +1487,18 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
                         }
                     })
                     .collect();
-                std::fs::write(
-                    out.join("cut_plan.json"),
-                    serde_json::to_string_pretty(&plans)?,
-                )?;
+                if redo.is_some() {
+                    let fresh: Vec<serde_json::Value> = plans
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<_, _>>()?;
+                    crate::redo::merge_by_rank(&out.join("cut_plan.json"), &fresh)?;
+                } else {
+                    std::fs::write(
+                        out.join("cut_plan.json"),
+                        serde_json::to_string_pretty(&plans)?,
+                    )?;
+                }
             }
             if args.dry_run {
                 for (clip, groups) in &jobs {

@@ -98,6 +98,14 @@ pub struct ClipArtifact {
     pub ass: Option<String>,
     pub srt: Option<String>,
     pub kit: Option<String>,
+    /// Why the picker chose it (the "why this clip" line in the UI).
+    #[serde(default)]
+    pub why: String,
+    /// Per-dimension scorecard (0-100) when the picker supplied one.
+    #[serde(default)]
+    pub scores: Option<crate::openrouter::Scores>,
+    #[serde(default)]
+    pub hashtags: Vec<String>,
 }
 
 /// Events the pipeline emits. Serve forwards these over `/ws` (throttling
