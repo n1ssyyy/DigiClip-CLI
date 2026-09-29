@@ -34,6 +34,7 @@ use crate::progress::{ClipArtifact, Emitter, JobEvent, Stage};
 
 mod diag;
 pub mod mcp;
+mod mcp_apps;
 mod watch;
 
 use diag::diagnostics;
@@ -571,7 +572,7 @@ enum Cmd {
     /// New MCP token: every connected client has to be set up again.
     McpRotateToken,
     /// Add (or with `remove`, take out) DigiClip in an AI app's MCP config:
-    /// `claude_desktop` or `cursor`.
+    /// any id in `mcp_apps::APPS` (`claude_desktop`, `codex`, `vscode`…).
     McpInstall {
         client: String,
         #[serde(default)]
