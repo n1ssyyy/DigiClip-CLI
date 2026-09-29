@@ -2,7 +2,7 @@
 //! the key), recent jobs and the tail of `logs/serve.log`, with anything
 //! key-shaped redacted.
 
-use super::{probe_health, AppState, JobRecord};
+use super::{health, AppState, JobRecord};
 
 /// Log lines kept from the end of `serve.log`.
 const LOG_TAIL: usize = 1500;
@@ -106,7 +106,7 @@ pub(super) async fn diagnostics(st: &AppState) -> String {
     );
     s += &format!(
         "== health\n{}\n\n",
-        pretty(serde_json::json!(probe_health()))
+        pretty(serde_json::json!(health().await))
     );
     s += &format!(
         "== settings\n{}\n\n",
@@ -126,6 +126,7 @@ pub(super) async fn diagnostics(st: &AppState) -> String {
         &[
             settings.openrouter_key.as_deref(),
             settings.jev_key.as_deref(),
+            settings.mcp_token.as_deref(),
         ],
     )
 }

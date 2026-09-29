@@ -33,6 +33,7 @@ use tower_http::services::ServeFile;
 use crate::progress::{ClipArtifact, Emitter, JobEvent, Stage};
 
 mod diag;
+pub mod mcp;
 mod watch;
 
 use diag::diagnostics;
@@ -166,6 +167,12 @@ struct Settings {
     watch_options: JobOptions,
     /// Saved job-option presets (named), in the order the UI lists them.
     presets: Vec<Preset>,
+    /// MCP server: on/off and its fixed loopback port.
+    mcp_on: bool,
+    mcp_port: u16,
+    /// MCP bearer token (made on first start, kept across restarts);
+    /// never part of [`SettingsPublic`].
+    mcp_token: Option<String>,
 }
 
 /// A named set of job options.
@@ -193,6 +200,9 @@ impl Default for Settings {
             watch_on: false,
             watch_options: JobOptions::default(),
             presets: vec![],
+            mcp_on: true,
+            mcp_port: mcp::DEFAULT_PORT,
+            mcp_token: None,
         }
     }
 }
@@ -214,6 +224,8 @@ struct SettingsPublic {
     watch_on: bool,
     watch_options: JobOptions,
     presets: Vec<Preset>,
+    mcp_on: bool,
+    mcp_port: u16,
 }
 
 impl Settings {
@@ -234,6 +246,8 @@ impl Settings {
             watch_on: self.watch_on,
             watch_options: self.watch_options.clone(),
             presets: self.presets.clone(),
+            mcp_on: self.mcp_on,
+            mcp_port: self.mcp_port,
         }
     }
 }
@@ -362,6 +376,9 @@ pub struct JobRecord {
     /// The link a downloaded source came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Who started the job when it wasn't the UI: `mcp:<client name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 struct LiveJob {
@@ -442,6 +459,15 @@ fn probe_health() -> Health {
     }
 }
 
+/// `probe_health` shells out (ffmpeg, nvidia-smi and a WMI query that can
+/// take seconds), so async callers run it on the blocking pool instead of
+/// stalling a runtime worker and, with it, the socket.
+async fn health() -> Health {
+    tokio::task::spawn_blocking(probe_health)
+        .await
+        .expect("health probe panicked")
+}
+
 // ---------------------------------------------------------------------------
 // Protocol
 // ---------------------------------------------------------------------------
@@ -461,12 +487,19 @@ enum Cmd {
     Hello,
     JobStart {
         source: String,
+        #[serde(default)]
         options: JobOptions,
+        /// Set by the MCP server (`mcp:<client>`), never by the UI.
+        #[serde(default, skip)]
+        origin: Option<String>,
     },
     /// A job from a link: the source downloads first (yt-dlp).
     JobStartUrl {
         url: String,
+        #[serde(default)]
         options: JobOptions,
+        #[serde(default, skip)]
+        origin: Option<String>,
     },
     JobCancel {
         job: String,
@@ -533,6 +566,17 @@ enum Cmd {
     },
     /// Write a redacted diagnostics bundle; replies with its path.
     Diagnostics,
+    /// MCP server state (port, token, clients, activity, tools).
+    McpState,
+    /// New MCP token: every connected client has to be set up again.
+    McpRotateToken,
+    /// Add (or with `remove`, take out) DigiClip in an AI app's MCP config:
+    /// `claude_desktop` or `cursor`.
+    McpInstall {
+        client: String,
+        #[serde(default)]
+        remove: bool,
+    },
 }
 
 /// One server frame: a correlated `res` or an async `ev`.
@@ -605,6 +649,17 @@ enum Event {
         title: String,
         body: String,
     },
+    /// MCP server state changed (see [`mcp::public`]).
+    Mcp {
+        mcp: serde_json::Value,
+    },
+    /// An MCP client asked the app to show something.
+    McpFocus {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        job: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        page: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +675,7 @@ struct AppState {
     worker: Semaphore,
     bus: broadcast::Sender<ServerMsg>,
     id_counter: AtomicU64,
+    mcp: mcp::Mcp,
 }
 
 struct ModelRun {
@@ -652,8 +708,15 @@ fn valid_decider(v: &str) -> Option<String> {
     matches!(v.as_str(), "auto" | "jev" | "laya" | "off").then_some(v)
 }
 
+/// `<data dir>/jobs`, set once at boot. A `--data-dir` override moves the
+/// jobs too, so a test daemon never sees (or touches) the real queue.
+static JOBS_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 fn jobs_root() -> PathBuf {
-    crate::provision::root().join("jobs")
+    JOBS_ROOT
+        .get()
+        .cloned()
+        .unwrap_or_else(|| crate::provision::root().join("jobs"))
 }
 
 impl AppState {
@@ -1343,7 +1406,8 @@ async fn snapshot(st: &AppState) -> serde_json::Value {
         "jobs": records,
         "settings": settings,
         "models": models,
-        "health": probe_health(),
+        "health": health().await,
+        "mcp": mcp::public(st).await,
     })
 }
 
@@ -1354,23 +1418,43 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             let data = snapshot(&st).await;
             vec![ok(id, Some(data))]
         }
-        Cmd::JobStart { source, options } => {
+        Cmd::JobStart {
+            source,
+            options,
+            origin,
+        } => {
             if crate::fetch::is_url(&source) {
-                let record = start_url_job(&st, source.trim().to_string(), options).await;
+                let record = start_url_job(&st, source.trim().to_string(), options, origin).await;
                 return vec![ok(id, Some(serde_json::json!({ "job": record })))];
             }
-            match start_job(&st, source, options).await {
+            match start_job(&st, source, options, origin).await {
                 Ok(record) => vec![ok(id, Some(serde_json::json!({ "job": record })))],
                 Err(e) => vec![err(id, e)],
             }
         }
-        Cmd::JobStartUrl { url, options } => {
+        Cmd::JobStartUrl {
+            url,
+            options,
+            origin,
+        } => {
             if !crate::fetch::is_url(&url) {
                 return vec![err(id, "not a link (http:// or https://)")];
             }
-            let record = start_url_job(&st, url.trim().to_string(), options).await;
+            let record = start_url_job(&st, url.trim().to_string(), options, origin).await;
             vec![ok(id, Some(serde_json::json!({ "job": record })))]
         }
+        Cmd::McpState => vec![ok(id, Some(mcp::public(&st).await))],
+        Cmd::McpRotateToken => {
+            mcp::rotate_token(&st).await;
+            vec![ok(id, Some(mcp::public(&st).await))]
+        }
+        Cmd::McpInstall { client, remove } => match mcp::install(&st, &client, remove).await {
+            Ok(path) => {
+                mcp::broadcast(&st).await;
+                vec![ok(id, Some(serde_json::json!({ "path": path })))]
+            }
+            Err(e) => vec![err(id, e)],
+        },
         Cmd::Diagnostics => {
             let text = diagnostics(&st).await;
             let dir = st.data_dir.join("logs");
@@ -1557,9 +1641,22 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                     .take(50)
                     .collect();
             }
+            let mcp_before = (s.mcp_on, s.mcp_port);
+            if let Some(v) = patch.get("mcp_on").and_then(|v| v.as_bool()) {
+                s.mcp_on = v;
+            }
+            if let Some(v) = patch.get("mcp_port").and_then(|v| v.as_u64()) {
+                if (1024..=65535).contains(&v) {
+                    s.mcp_port = v as u16;
+                }
+            }
+            let mcp_changed = mcp_before != (s.mcp_on, s.mcp_port);
             let pub_ = s.public();
             st.save_settings(&s);
             drop(s);
+            if mcp_changed {
+                mcp::restart(&st).await;
+            }
             vec![ok(id, Some(serde_json::json!(pub_)))]
         }
         Cmd::ModelsState => {
@@ -1672,7 +1769,7 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 });
                 let _ = st2.bus.send(ServerMsg::Ev {
                     ev: Event::Health {
-                        health: probe_health(),
+                        health: health().await,
                     },
                 });
             });
@@ -1707,7 +1804,7 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 Err(e) => vec![err(id, e)],
             }
         }
-        Cmd::HealthGet => vec![ok(id, Some(serde_json::json!(probe_health())))],
+        Cmd::HealthGet => vec![ok(id, Some(serde_json::json!(health().await)))],
         Cmd::OrModels { refresh } => match or_models(&st, refresh).await {
             Ok(v) => vec![ok(id, Some(v))],
             Err(e) => vec![err(id, e)],
@@ -1845,6 +1942,7 @@ async fn start_job(
     st: &Arc<AppState>,
     source: String,
     options: JobOptions,
+    origin: Option<String>,
 ) -> Result<JobRecord, String> {
     let src = PathBuf::from(&source);
     if !src.is_file() {
@@ -1869,6 +1967,7 @@ async fn start_job(
         out_dir,
         duration_s: probe.duration_s.unwrap_or(0.0),
         url: None,
+        origin,
     };
     st.persist_job(&record);
     {
@@ -1891,7 +1990,12 @@ async fn start_job(
 
 /// A job on a link: it shows at once (downloading), then queues like any
 /// other once the video is on disk.
-async fn start_url_job(st: &Arc<AppState>, url: String, options: JobOptions) -> JobRecord {
+async fn start_url_job(
+    st: &Arc<AppState>,
+    url: String,
+    options: JobOptions,
+    origin: Option<String>,
+) -> JobRecord {
     let job_id = st.next_id("job");
     let out_dir = st.job_path(&job_id).display().to_string();
     let record = JobRecord {
@@ -1906,6 +2010,7 @@ async fn start_url_job(st: &Arc<AppState>, url: String, options: JobOptions) -> 
         out_dir,
         duration_s: 0.0,
         url: Some(url),
+        origin,
     };
     st.persist_job(&record);
     {
@@ -2359,6 +2464,7 @@ pub async fn run_serve(
 ) -> anyhow::Result<()> {
     let data_dir = data_dir.unwrap_or_else(crate::provision::root);
     std::fs::create_dir_all(&data_dir)?;
+    let _ = JOBS_ROOT.set(data_dir.join("jobs"));
     std::fs::create_dir_all(jobs_root())?;
     let token = token.filter(|t| !t.is_empty()).unwrap_or_else(|| {
         // Per-boot token: local-only auth without stored secrets.
@@ -2374,11 +2480,13 @@ pub async fn run_serve(
         worker: Semaphore::new(1),
         bus,
         id_counter: AtomicU64::new(1),
+        mcp: mcp::Mcp::default(),
     };
     st.settings = Mutex::new(st.load_settings());
     st.jobs = Mutex::new(reload_jobs());
     let st = Arc::new(st);
     tokio::spawn(watch::run(st.clone()));
+    mcp::restart(&st).await;
 
     let app = axum::Router::new()
         .route("/ws", get(ws_handler))

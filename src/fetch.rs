@@ -394,10 +394,11 @@ mod tests {
         let tool = d.path().join("yt-dlp.exe");
         let stamp = stamp_for(&tool);
         assert_eq!(stamp, d.path().join("yt-dlp.checked"));
-        let now = SystemTime::now();
         // Never checked.
-        assert!(is_stale(&stamp, UPDATE_EVERY, now));
+        assert!(is_stale(&stamp, UPDATE_EVERY, SystemTime::now()));
         std::fs::write(&stamp, b"").unwrap();
+        // Read the clock after the write: its mtime must not be "future".
+        let now = SystemTime::now();
         assert!(!is_stale(&stamp, UPDATE_EVERY, now));
         assert!(!is_stale(&stamp, UPDATE_JUST_RAN, now));
         // Four days on it is due again.

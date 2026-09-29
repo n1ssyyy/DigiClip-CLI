@@ -29,6 +29,17 @@ fn main() -> Result<()> {
     use tracing_subscriber::util::SubscriberInitExt;
 
     let args = Args::parse();
+    if args.mcp {
+        // stdout carries the protocol: logs go to stderr only.
+        tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_target(false)
+            .without_time()
+            .init();
+        return digiclip_rs::serve::mcp::run_bridge(args.data_dir.clone());
+    }
     let console = tracing_subscriber::fmt::layer()
         .with_target(false)
         .without_time();
