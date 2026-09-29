@@ -15,7 +15,7 @@
 //! absent — the engine has no suspend points, so the UI offers
 //! cancel/retry/remove instead.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -143,12 +143,20 @@ pub struct JobOptions {
 }
 
 /// Persisted server settings (secrets stay server-side; the UI only ever
-/// sees `key_set`).
+/// sees `key_set` / `ai_keys_set`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Settings {
     openrouter_key: Option<String>,
     openrouter_model: Option<String>,
+    /// Clip AI provider (an id from `providers::PROVIDERS`).
+    ai_provider: String,
+    /// Keys, models and addresses of the providers other than OpenRouter
+    /// (which keeps `openrouter_key` / `openrouter_model`). Keys never
+    /// leave the server; addresses only exist for `base_editable` ones.
+    ai_keys: BTreeMap<String, String>,
+    ai_models: BTreeMap<String, String>,
+    ai_base_urls: BTreeMap<String, String>,
     stt_model: String,
     /// Spoken language for transcription: a whisper code or `auto`.
     stt_lang: String,
@@ -188,6 +196,10 @@ impl Default for Settings {
         Self {
             openrouter_key: None,
             openrouter_model: None,
+            ai_provider: "openrouter".into(),
+            ai_keys: BTreeMap::new(),
+            ai_models: BTreeMap::new(),
+            ai_base_urls: BTreeMap::new(),
             stt_model: "base.en".into(),
             stt_lang: "en".into(),
             gpu: true,
@@ -212,6 +224,13 @@ impl Default for Settings {
 struct SettingsPublic {
     key_set: bool,
     openrouter_model: Option<String>,
+    ai_provider: String,
+    /// Provider ids that have a key saved (OpenRouter included).
+    ai_keys_set: Vec<String>,
+    /// Chosen model per provider (OpenRouter included).
+    ai_models: BTreeMap<String, String>,
+    ai_base_urls: BTreeMap<String, String>,
+    ai_providers: Vec<serde_json::Value>,
     stt_model: String,
     stt_lang: String,
     gpu: bool,
@@ -229,11 +248,174 @@ struct SettingsPublic {
     mcp_port: u16,
 }
 
+fn nonempty(v: Option<&String>) -> Option<String> {
+    v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 impl Settings {
+    /// The saved key for a provider, if any.
+    fn ai_key(&self, id: &str) -> Option<String> {
+        if id == "openrouter" {
+            nonempty(self.openrouter_key.as_ref())
+        } else {
+            nonempty(self.ai_keys.get(id))
+        }
+    }
+
+    /// The chosen model for a provider, if any.
+    fn ai_model(&self, id: &str) -> Option<String> {
+        if id == "openrouter" {
+            nonempty(self.openrouter_model.as_ref())
+        } else {
+            nonempty(self.ai_models.get(id))
+        }
+    }
+
+    /// The address override for a provider (only editable ones have one).
+    fn ai_base(&self, id: &str) -> Option<String> {
+        if crate::providers::provider(id).is_some_and(|p| p.base_editable) {
+            nonempty(self.ai_base_urls.get(id))
+        } else {
+            None
+        }
+    }
+
+    fn set_ai_model(&mut self, id: &str, model: Option<String>) {
+        if id == "openrouter" {
+            self.openrouter_model = model;
+        } else if let Some(m) = model {
+            self.ai_models.insert(id.to_string(), m);
+        } else {
+            self.ai_models.remove(id);
+        }
+    }
+
+    /// The provider jobs run with (a stale or unknown id means OpenRouter).
+    fn ai_active(&self) -> &'static crate::providers::Provider {
+        crate::providers::provider(&self.ai_provider)
+            .or_else(|| crate::providers::provider("openrouter"))
+            .expect("openrouter is in the registry")
+    }
+
+    /// Apply the `ai_*` parts of a settings patch. Returns the providers
+    /// whose model list is worth fetching now (a key was set, the active
+    /// provider changed, or an address changed).
+    fn apply_ai_patch(&mut self, patch: &serde_json::Value) -> Vec<String> {
+        use serde_json::Value;
+        let mut refresh: Vec<String> = Vec::new();
+        let mut want = |id: &str| {
+            if !refresh.iter().any(|r| r == id) {
+                refresh.push(id.to_string());
+            }
+        };
+        // Legacy OpenRouter key: a new one deserves a fresh list too.
+        if matches!(patch.get("openrouter_key"), Some(Value::String(v)) if !v.trim().is_empty()) {
+            want("openrouter");
+        }
+        if let Some(Value::Object(keys)) = patch.get("ai_keys") {
+            for (id, v) in keys {
+                if crate::providers::provider(id).is_none() {
+                    continue;
+                }
+                match v {
+                    Value::String(k) if !k.trim().is_empty() => {
+                        if id == "openrouter" {
+                            self.openrouter_key = Some(k.trim().to_string());
+                        } else {
+                            self.ai_keys.insert(id.clone(), k.trim().to_string());
+                        }
+                        want(id);
+                    }
+                    Value::Null => {
+                        if id == "openrouter" {
+                            self.openrouter_key = None;
+                        } else {
+                            self.ai_keys.remove(id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(Value::Object(models)) = patch.get("ai_models") {
+            for (id, v) in models {
+                if crate::providers::provider(id).is_none() {
+                    continue;
+                }
+                if let Value::String(m) = v {
+                    let m = m.trim();
+                    self.set_ai_model(id, (!m.is_empty()).then(|| m.to_string()));
+                }
+            }
+        }
+        if let Some(Value::Object(bases)) = patch.get("ai_base_urls") {
+            for (id, v) in bases {
+                if !crate::providers::provider(id).is_some_and(|p| p.base_editable) {
+                    continue;
+                }
+                let before = self.ai_base_urls.get(id).cloned();
+                match v {
+                    Value::String(u) => {
+                        let u = u.trim().trim_end_matches('/');
+                        if u.is_empty() {
+                            self.ai_base_urls.remove(id);
+                        } else if u.starts_with("http://") || u.starts_with("https://") {
+                            self.ai_base_urls.insert(id.clone(), u.to_string());
+                        }
+                    }
+                    Value::Null => {
+                        self.ai_base_urls.remove(id);
+                    }
+                    _ => {}
+                }
+                if self.ai_base_urls.get(id) != before.as_ref() {
+                    want(id);
+                }
+            }
+        }
+        if let Some(id) = patch.get("ai_provider").and_then(Value::as_str) {
+            if crate::providers::provider(id).is_some() && id != self.ai_provider {
+                self.ai_provider = id.to_string();
+                want(id);
+            }
+        }
+        refresh
+    }
+
     fn public(&self) -> SettingsPublic {
+        let providers = crate::providers::PROVIDERS;
         SettingsPublic {
             key_set: self.openrouter_key.as_ref().is_some_and(|k| !k.is_empty()),
             openrouter_model: self.openrouter_model.clone(),
+            ai_provider: self.ai_provider.clone(),
+            ai_keys_set: providers
+                .iter()
+                .filter(|p| self.ai_key(p.id).is_some())
+                .map(|p| p.id.to_string())
+                .collect(),
+            ai_models: providers
+                .iter()
+                .filter_map(|p| Some((p.id.to_string(), self.ai_model(p.id)?)))
+                .collect(),
+            ai_base_urls: providers
+                .iter()
+                .filter_map(|p| Some((p.id.to_string(), self.ai_base(p.id)?)))
+                .collect(),
+            ai_providers: providers
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "label": p.label,
+                        "needs_key": p.key.as_str(),
+                        "key_url": p.key_url,
+                        "default_base": p.base_url,
+                        "base_editable": p.base_editable,
+                        "local": p.local,
+                        "default_model": p.default_model,
+                    })
+                })
+                .collect(),
             stt_model: self.stt_model.clone(),
             stt_lang: self.stt_lang.clone(),
             gpu: self.gpu,
@@ -527,6 +709,14 @@ enum Cmd {
         id: String,
     },
     HealthGet,
+    /// Model list of a Clip AI provider (default: the active one).
+    AiModels {
+        #[serde(default)]
+        provider: Option<String>,
+        #[serde(default)]
+        refresh: bool,
+    },
+    /// Older spelling of `ai_models` for OpenRouter.
     OrModels {
         #[serde(default)]
         refresh: bool,
@@ -649,6 +839,11 @@ enum Event {
         tone: String,
         title: String,
         body: String,
+    },
+    /// Settings changed outside a `settings_set` (a model was picked
+    /// after a fetch).
+    Settings {
+        settings: SettingsPublic,
     },
     /// MCP server state changed (see [`mcp::public`]).
     Mcp {
@@ -915,13 +1110,18 @@ fn args_for(
         o.model.clone().unwrap_or_else(|| s.stt_model.clone()),
     );
     flag(&mut argv, "--gpu", o.gpu.unwrap_or(s.gpu).to_string());
-    let key = s.openrouter_key.clone().filter(|k| !k.is_empty());
-    if let Some(k) = key {
+    // Clip AI: the active provider's address, key and model. The scoring
+    // model is account-level (owned by settings); jobs don't override it,
+    // so the argv builder stays total over JobOptions.
+    let ai = s.ai_active().id;
+    flag(&mut argv, "--ai-provider", ai.to_string());
+    if let Some(b) = s.ai_base(ai) {
+        flag(&mut argv, "--ai-base-url", b);
+    }
+    if let Some(k) = s.ai_key(ai) {
         flag(&mut argv, "--openrouter-key", k);
     }
-    // The scoring model is account-level (owned by settings); jobs don't
-    // override it, so the argv builder stays total over JobOptions.
-    if let Some(m) = s.openrouter_model.clone().filter(|m| !m.is_empty()) {
+    if let Some(m) = s.ai_model(ai) {
         flag(&mut argv, "--openrouter-model", m);
     }
     if let Some(k) = s.jev_key.clone().filter(|k| !k.is_empty()) {
@@ -1564,6 +1764,7 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
         }
         Cmd::SettingsSet { patch } => {
             let mut s = st.settings.lock().await;
+            let refresh = s.apply_ai_patch(&patch);
             if let Some(v) = patch.get("openrouter_key").and_then(|v| v.as_str()) {
                 if !v.is_empty() {
                     s.openrouter_key = Some(v.to_string());
@@ -1655,6 +1856,16 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             let pub_ = s.public();
             st.save_settings(&s);
             drop(s);
+            // A new key, provider or address: fetch that provider's models
+            // now (this also picks one when none is set yet).
+            for pid in refresh {
+                let st2 = st.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = ai_models(&st2, Some(pid.clone()), true).await {
+                        tracing::info!("model list for {pid}: {e}");
+                    }
+                });
+            }
             if mcp_changed {
                 mcp::restart(&st).await;
             }
@@ -1806,10 +2017,16 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             }
         }
         Cmd::HealthGet => vec![ok(id, Some(serde_json::json!(health().await)))],
-        Cmd::OrModels { refresh } => match or_models(&st, refresh).await {
+        Cmd::AiModels { provider, refresh } => match ai_models(&st, provider, refresh).await {
             Ok(v) => vec![ok(id, Some(v))],
             Err(e) => vec![err(id, e)],
         },
+        Cmd::OrModels { refresh } => {
+            match ai_models(&st, Some("openrouter".into()), refresh).await {
+                Ok(v) => vec![ok(id, Some(v))],
+                Err(e) => vec![err(id, e)],
+            }
+        }
         Cmd::ClipKit { job, rank } => {
             let jobs = st.jobs.lock().await;
             match jobs.get(&job) {
@@ -2192,54 +2409,158 @@ async fn queue_redo(
     Ok(())
 }
 
-/// OpenRouter model catalog (for the model picker), cached 24h.
-async fn or_models(st: &AppState, refresh: bool) -> anyhow::Result<serde_json::Value> {
-    let cache = st.data_dir.join("or_models.json");
-    if !refresh {
-        if let Ok(txt) = std::fs::read_to_string(&cache) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                let age_ok = v
-                    .get("fetched_ms")
+/// Model list of a Clip AI provider, for the model picker. Cached per
+/// provider for 24h (local and custom ones are always asked live). When
+/// the chosen model isn't offered (or none is chosen yet) one is picked
+/// and saved. Reply: `{provider, models:[{id,name}], fetched_ms, picked}`;
+/// `picked` is the model that was just saved, or null.
+async fn ai_models(
+    st: &AppState,
+    provider: Option<String>,
+    refresh: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let settings = st.settings.lock().await.clone();
+    let pid = provider
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| settings.ai_provider.clone());
+    let p = crate::providers::provider(&pid)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider [{pid}]"))?;
+    let base = settings
+        .ai_base(p.id)
+        .unwrap_or_else(|| p.base_url.to_string());
+    let base = base.trim_end_matches('/').to_string();
+    if base.is_empty() {
+        anyhow::bail!(
+            "set a base URL for {}",
+            p.label.split(" (").next().unwrap_or(p.label)
+        );
+    }
+    let key = settings.ai_key(p.id);
+    if p.needs_key() && key.is_none() {
+        anyhow::bail!("no key saved for {}", p.label);
+    }
+
+    let live = p.local || p.id == "custom";
+    let cache = st.data_dir.join("ai_models").join(format!("{}.json", p.id));
+    let cached = (!refresh && !live)
+        .then(|| std::fs::read_to_string(&cache).ok())
+        .flatten()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(|v| {
+            v.get("base").and_then(|b| b.as_str()) == Some(base.as_str())
+                && v.get("fetched_ms")
                     .and_then(|m| m.as_u64())
-                    .is_some_and(|m| now_ms().saturating_sub(m) < 24 * 3600 * 1000);
-                if age_ok {
-                    return Ok(v);
-                }
+                    .is_some_and(|m| now_ms().saturating_sub(m) < 24 * 3600 * 1000)
+        });
+    let (models, fetched_ms) = match cached {
+        Some(v) => (
+            serde_json::from_value::<Vec<serde_json::Value>>(v["models"].clone())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("id")?.as_str()?.to_string();
+                    let name = m.get("name").and_then(|n| n.as_str()).unwrap_or(&id);
+                    Some(crate::providers::Model {
+                        name: name.to_string(),
+                        id,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            v["fetched_ms"].as_u64().unwrap_or(0),
+        ),
+        None => {
+            let models = fetch_models(p, &base, key.as_deref()).await?;
+            let fetched = now_ms();
+            if !live {
+                let v = serde_json::json!({
+                    "provider": p.id,
+                    "base": base,
+                    "fetched_ms": fetched,
+                    "models": models_json(&models),
+                });
+                let _ = std::fs::create_dir_all(st.data_dir.join("ai_models"));
+                let _ =
+                    std::fs::write(&cache, serde_json::to_string_pretty(&v).unwrap_or_default());
+            }
+            (models, fetched)
+        }
+    };
+
+    // Keep the chosen model valid; the settings are re-read under the
+    // lock, since the user may have changed them during the fetch.
+    let mut picked = None;
+    {
+        let mut s = st.settings.lock().await;
+        let current = s.ai_model(p.id);
+        if let Some(m) = crate::providers::pick_model(p, current.as_deref(), &models) {
+            if current.as_deref() != Some(m.as_str()) {
+                s.set_ai_model(p.id, Some(m.clone()));
+                st.save_settings(&s);
+                let _ = st.bus.send(ServerMsg::Ev {
+                    ev: Event::Settings {
+                        settings: s.public(),
+                    },
+                });
+                picked = Some(m);
             }
         }
     }
-    let settings = st.settings.lock().await.clone();
-    let key = settings
-        .openrouter_key
-        .clone()
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("no OpenRouter key saved"))?;
-    let base = std::env::var("OPENROUTER_BASE_URL")
-        .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into());
-    let resp = reqwest::Client::new()
-        .get(format!("{base}/models"))
-        .bearer_auth(key)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("OpenRouter models: HTTP {}", resp.status());
-    }
-    let data: serde_json::Value = resp.json().await?;
-    let models: Vec<serde_json::Value> = data
-        .get("data")
-        .and_then(|d| d.as_array())
-        .cloned()
-        .unwrap_or_default()
+    Ok(serde_json::json!({
+        "provider": p.id,
+        "models": models_json(&models),
+        "fetched_ms": fetched_ms,
+        "picked": picked,
+    }))
+}
+
+fn models_json(models: &[crate::providers::Model]) -> Vec<serde_json::Value> {
+    models
         .iter()
-        .filter_map(|m| {
-            let mid = m.get("id")?.as_str()?;
-            Some(serde_json::json!({ "id": mid, "name": m.get("name").and_then(|n| n.as_str()).unwrap_or(mid) }))
-        })
-        .collect();
-    let v = serde_json::json!({ "models": models, "fetched_ms": now_ms() });
-    let _ = std::fs::create_dir_all(&st.data_dir);
-    let _ = std::fs::write(&cache, serde_json::to_string_pretty(&v).unwrap_or_default());
-    Ok(v)
+        .map(|m| serde_json::json!({ "id": m.id, "name": m.name }))
+        .collect()
+}
+
+/// `GET {base}/models` with the provider's auth, in plain-words errors.
+async fn fetch_models(
+    p: &crate::providers::Provider,
+    base: &str,
+    key: Option<&str>,
+) -> anyhow::Result<Vec<crate::providers::Model>> {
+    use crate::providers::ModelsAuth;
+    let timeout = if p.local { 4 } else { 10 };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout))
+        .build()?;
+    let mut req = client.get(format!("{base}/models"));
+    if let Some(k) = key {
+        req = match p.models_auth {
+            ModelsAuth::Bearer => req.bearer_auth(k),
+            ModelsAuth::Anthropic => req
+                .header("x-api-key", k)
+                .header("anthropic-version", "2023-06-01"),
+        };
+    }
+    let resp = req.send().await.map_err(|e| {
+        if p.local || p.id == "custom" {
+            anyhow::anyhow!("couldn't reach {} at {base} — is it running?", p.label)
+        } else if e.is_timeout() {
+            anyhow::anyhow!("{} took too long to answer", p.label)
+        } else {
+            anyhow::anyhow!("couldn't reach {} at {base}", p.label)
+        }
+    })?;
+    let status = resp.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        anyhow::bail!("{} refused the key (HTTP {})", p.label, status.as_u16());
+    }
+    if !status.is_success() {
+        anyhow::bail!("{} model list: HTTP {}", p.label, status.as_u16());
+    }
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|_| anyhow::anyhow!("{} sent a model list DigiClip can't read", p.label))?;
+    Ok(crate::providers::parse_models(p, &data))
 }
 
 // ---------------------------------------------------------------------------
@@ -2676,6 +2997,233 @@ mod tests {
         let a = args_for(&src, &out, &o, &s).unwrap();
         assert_eq!(a.openrouter_key.as_deref(), Some("sk-test"));
         assert_eq!(a.openrouter_model.as_deref(), Some("x/y"));
+    }
+
+    #[test]
+    fn active_provider_reaches_args() {
+        let (src, out, o, mut s) = opts();
+        // Untouched: OpenRouter, nothing extra.
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.ai_provider, "openrouter");
+        assert!(a.ai_base_url.is_none() && a.openrouter_key.is_none());
+        // Another provider carries its own key, model and address, not
+        // OpenRouter's.
+        s.openrouter_key = Some("sk-or-test".into());
+        s.openrouter_model = Some("or/model".into());
+        s.apply_ai_patch(&serde_json::json!({
+            "ai_provider": "ollama",
+            "ai_models": { "ollama": "llama3:8b", "openai": "gpt-5-mini" },
+            "ai_base_urls": { "ollama": "http://10.0.0.5:11434/v1/" },
+            "ai_keys": { "openai": "sk-openai-test" },
+        }));
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.ai_provider, "ollama");
+        assert_eq!(a.ai_base_url.as_deref(), Some("http://10.0.0.5:11434/v1"));
+        assert_eq!(a.openrouter_model.as_deref(), Some("llama3:8b"));
+        assert!(a.openrouter_key.is_none());
+        // A keyed provider passes its key.
+        s.apply_ai_patch(&serde_json::json!({ "ai_provider": "openai" }));
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.ai_provider, "openai");
+        assert_eq!(a.openrouter_key.as_deref(), Some("sk-openai-test"));
+        assert_eq!(a.openrouter_model.as_deref(), Some("gpt-5-mini"));
+        assert!(a.ai_base_url.is_none());
+    }
+
+    #[test]
+    fn ai_patch_round_trip() {
+        let mut s = Settings::default();
+        let refresh = s.apply_ai_patch(&serde_json::json!({
+            "ai_provider": "anthropic",
+            "ai_keys": { "anthropic": "  sk-ant-secret  ", "openrouter": "sk-or-secret", "bogus": "x" },
+            "ai_models": { "anthropic": "claude-sonnet-5", "openrouter": "a/b", "bogus": "m" },
+        }));
+        assert_eq!(s.ai_provider, "anthropic");
+        assert_eq!(s.ai_keys.get("anthropic").unwrap(), "sk-ant-secret");
+        assert!(!s.ai_keys.contains_key("bogus") && !s.ai_keys.contains_key("openrouter"));
+        assert_eq!(s.openrouter_key.as_deref(), Some("sk-or-secret"));
+        assert_eq!(s.openrouter_model.as_deref(), Some("a/b"));
+        assert!(!s.ai_models.contains_key("bogus") && !s.ai_models.contains_key("openrouter"));
+        // Every changed provider gets a model refresh, once each.
+        let mut r = refresh.clone();
+        r.sort();
+        assert_eq!(r, ["anthropic", "openrouter"]);
+
+        // Public output: no secret anywhere, but the facts the UI needs.
+        let p = s.public();
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("secret"));
+        assert_eq!(p.ai_provider, "anthropic");
+        assert_eq!(p.ai_keys_set, ["openrouter", "anthropic"]);
+        assert_eq!(p.ai_models["openrouter"], "a/b");
+        assert_eq!(p.ai_models["anthropic"], "claude-sonnet-5");
+        assert_eq!(p.ai_providers.len(), crate::providers::PROVIDERS.len());
+        assert_eq!(p.ai_providers[0]["id"], "openrouter");
+        assert_eq!(p.ai_providers[0]["needs_key"], "required");
+        assert_eq!(p.ai_providers[5]["needs_key"], "none");
+        assert_eq!(p.ai_providers[5]["base_editable"], true);
+        assert!(p.key_set);
+
+        // null clears keys; an empty model clears the model; blank keys
+        // and unknown providers are ignored.
+        let refresh = s.apply_ai_patch(&serde_json::json!({
+            "ai_keys": { "anthropic": null, "openrouter": null },
+            "ai_models": { "anthropic": "", "openrouter": "" },
+        }));
+        assert!(refresh.is_empty());
+        assert!(s.ai_keys.is_empty() && s.openrouter_key.is_none());
+        assert!(s.ai_models.is_empty() && s.openrouter_model.is_none());
+        s.apply_ai_patch(&serde_json::json!({
+            "ai_keys": { "openai": "   " },
+            "ai_provider": "nope",
+        }));
+        assert!(s.ai_keys.is_empty());
+        assert_eq!(s.ai_provider, "anthropic");
+    }
+
+    #[test]
+    fn ai_base_urls_are_checked() {
+        let mut s = Settings::default();
+        // Only editable providers, only http(s), no trailing slash.
+        let r = s.apply_ai_patch(&serde_json::json!({
+            "ai_base_urls": {
+                "ollama": "http://localhost:9999/v1/",
+                "custom": "ftp://nope",
+                "lm_studio": "not a url",
+                "openai": "https://evil.example/v1",
+            },
+        }));
+        assert_eq!(r, ["ollama"]);
+        assert_eq!(s.ai_base_urls.len(), 1);
+        assert_eq!(s.ai_base("ollama").unwrap(), "http://localhost:9999/v1");
+        assert!(s.ai_base("openai").is_none());
+        // Unchanged: no refresh. Null clears.
+        assert!(s
+            .apply_ai_patch(
+                &serde_json::json!({ "ai_base_urls": { "ollama": "http://localhost:9999/v1" } })
+            )
+            .is_empty());
+        let r = s.apply_ai_patch(&serde_json::json!({ "ai_base_urls": { "ollama": null } }));
+        assert_eq!(r, ["ollama"]);
+        assert!(s.ai_base_urls.is_empty());
+        assert!(s.public().ai_base_urls.is_empty());
+    }
+
+    #[test]
+    fn old_settings_files_still_load() {
+        let s: Settings = serde_json::from_str(
+            r#"{"openrouter_key":"sk-old","openrouter_model":"x/y","clips_count":5}"#,
+        )
+        .unwrap();
+        assert_eq!(s.ai_provider, "openrouter");
+        assert!(s.ai_keys.is_empty() && s.ai_models.is_empty() && s.ai_base_urls.is_empty());
+        assert_eq!(s.ai_key("openrouter").as_deref(), Some("sk-old"));
+        assert_eq!(s.ai_model("openrouter").as_deref(), Some("x/y"));
+        assert_eq!(s.clips_count, 5);
+        assert_eq!(s.public().ai_keys_set, ["openrouter"]);
+    }
+
+    /// One-shot loopback HTTP server: answers once, hands back the request.
+    async fn mock_http(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", l.local_addr().unwrap());
+        let h = tokio::spawn(async move {
+            let (mut c, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = c.read(&mut buf).await.unwrap();
+            let resp = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            c.write_all(resp.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_lowercase()
+        });
+        (base, h)
+    }
+
+    #[tokio::test]
+    async fn model_fetch_auth_and_errors() {
+        use crate::providers::provider;
+        // Anthropic: its own headers, display names, no Bearer.
+        let (base, h) = mock_http(
+            "200 OK",
+            r#"{"data":[{"id":"claude-sonnet-5","display_name":"Claude Sonnet 5"}]}"#,
+        )
+        .await;
+        let m = fetch_models(provider("anthropic").unwrap(), &base, Some("sk-ant-x"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (m[0].id.as_str(), m[0].name.as_str()),
+            ("claude-sonnet-5", "Claude Sonnet 5")
+        );
+        let req = h.await.unwrap();
+        assert!(req.starts_with("get /v1/models "));
+        assert!(
+            req.contains("x-api-key: sk-ant-x") && req.contains("anthropic-version: 2023-06-01")
+        );
+        assert!(!req.contains("authorization"));
+        // Everyone else: Bearer; a keyless local provider sends nothing.
+        let (base, h) = mock_http("200 OK", r#"[{"id":"m1"}]"#).await;
+        let m = fetch_models(provider("together").unwrap(), &base, Some("k1"))
+            .await
+            .unwrap();
+        assert_eq!(m[0].id, "m1");
+        assert!(h.await.unwrap().contains("authorization: bearer k1"));
+        let (base, h) = mock_http("200 OK", r#"{"models":[{"name":"llama3:8b"}]}"#).await;
+        let m = fetch_models(provider("ollama").unwrap(), &base, None)
+            .await
+            .unwrap();
+        assert_eq!(m[0].id, "llama3:8b");
+        let req = h.await.unwrap();
+        assert!(!req.contains("authorization") && !req.contains("x-api-key"));
+        // Plain-words errors.
+        let (base, _h) = mock_http("401 Unauthorized", "{}").await;
+        let e = fetch_models(provider("openai").unwrap(), &base, Some("bad"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "OpenAI refused the key (HTTP 401)");
+        let (base, _h) = mock_http("500 Internal Server Error", "{}").await;
+        let e = fetch_models(provider("groq").unwrap(), &base, Some("k"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "Groq model list: HTTP 500");
+        // Nothing listening: the local wording.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}/v1", l.local_addr().unwrap());
+        drop(l);
+        let e = fetch_models(provider("ollama").unwrap(), &dead, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("couldn't reach Ollama (this PC) at {dead} — is it running?")
+        );
+    }
+
+    #[test]
+    fn ai_models_wire_names() {
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"id":1,"cmd":"ai_models","provider":"groq","refresh":true}"#)
+                .unwrap();
+        assert!(matches!(
+            m.cmd,
+            Cmd::AiModels { provider: Some(ref p), refresh: true } if p == "groq"
+        ));
+        let m: ClientMsg = serde_json::from_str(r#"{"id":2,"cmd":"ai_models"}"#).unwrap();
+        assert!(matches!(
+            m.cmd,
+            Cmd::AiModels {
+                provider: None,
+                refresh: false
+            }
+        ));
+        let m: ClientMsg = serde_json::from_str(r#"{"id":3,"cmd":"or_models"}"#).unwrap();
+        assert!(matches!(m.cmd, Cmd::OrModels { refresh: false }));
     }
 
     #[test]

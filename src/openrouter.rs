@@ -1,4 +1,6 @@
-//! OpenRouter clip-scoring client.
+//! LLM clip-scoring client. The module keeps its OpenRouter name, but it
+//! now serves every OpenAI-compatible provider in `providers.rs`
+//! (OpenAI, Anthropic, Gemini, Ollama, Groq, custom...).
 //!
 //! Port of `OpenRouterClient.php` with the Windows failure fixed:
 //! the old PHP build often failed clip-picking because (a) no key was
@@ -9,53 +11,92 @@
 //! This client: explicit `has_key()`, `submit_clips` tool call first,
 //! ```json content fallback, markdown-extracted-JSON fallback, 300s
 //! default timeout, 2 retries, offline heuristic fallback signalled
-//! to the caller instead of hard-failing.
+//! to the caller instead of hard-failing. Providers that reject
+//! `tool_choice` (or tools) are retried without them.
 
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Registry id (`openrouter`, `openai`, `ollama`...).
+    pub provider: String,
+    /// Name for messages.
+    pub label: String,
     pub base_url: String,
     pub key: Option<String>,
     pub model: String,
     pub timeout_s: u64,
+    /// The provider refuses requests without a key.
+    pub needs_key: bool,
     #[allow(dead_code)]
     pub token_cap: usize,
 }
 
 impl Config {
     pub fn from_env(model_override: Option<String>, key_override: Option<String>) -> Self {
-        let key = key_override.filter(|k| !k.trim().is_empty()).or_else(|| {
-            std::env::var("OPENROUTER_API_KEY")
-                .ok()
-                .filter(|k| !k.trim().is_empty())
-        });
-        let model = model_override
-            .filter(|m| !m.trim().is_empty())
+        Self::for_provider("openrouter", None, model_override, key_override)
+    }
+
+    /// Settings for one provider. Overrides win, then the provider's key
+    /// env var, then (OpenRouter only) the legacy `OPENROUTER_*` vars,
+    /// then the registry defaults. An unknown id falls back to OpenRouter.
+    pub fn for_provider(
+        provider_id: &str,
+        base_override: Option<String>,
+        model_override: Option<String>,
+        key_override: Option<String>,
+    ) -> Self {
+        let p = crate::providers::provider(provider_id)
+            .or_else(|| crate::providers::provider("openrouter"))
+            .expect("openrouter is in the registry");
+        let or = p.id == "openrouter";
+        let nonempty =
+            |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let base_url = nonempty(base_override)
             .or_else(|| {
-                std::env::var("OPENROUTER_MODEL")
-                    .ok()
-                    .filter(|m| !m.trim().is_empty())
+                if or {
+                    env_nonempty("OPENROUTER_BASE_URL")
+                } else {
+                    None
+                }
             })
-            .unwrap_or_else(|| DEFAULT_MODEL.into());
+            .unwrap_or_else(|| p.base_url.to_string());
+        let key = nonempty(key_override).or_else(|| p.key_env.and_then(env_nonempty));
+        let model = nonempty(model_override)
+            .or_else(|| {
+                if or {
+                    env_nonempty("OPENROUTER_MODEL")
+                } else {
+                    None
+                }
+            })
+            .or_else(|| p.default_model.map(str::to_string))
+            .unwrap_or_default();
         let timeout_s = std::env::var("OPENROUTER_TIMEOUT_S")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
         Self {
-            base_url: std::env::var("OPENROUTER_BASE_URL")
-                .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into()),
+            provider: p.id.to_string(),
+            label: p.label.to_string(),
+            base_url,
             key,
             model,
             timeout_s,
+            needs_key: p.needs_key(),
             token_cap: 120_000,
         }
     }
 
+    /// Ready to call the model: a key when the provider wants one, and a
+    /// model to ask for.
     pub fn has_key(&self) -> bool {
-        self.key.as_ref().is_some_and(|k| !k.trim().is_empty())
+        let key = self.key.as_ref().is_some_and(|k| !k.trim().is_empty());
+        (key || !self.needs_key) && !self.model.is_empty()
     }
 }
 
@@ -190,27 +231,56 @@ fn extract_json_candidates(text: &str) -> Option<Vec<RawClip>> {
     None
 }
 
+/// A non-success HTTP status, so callers can tell "this provider doesn't
+/// take that parameter" (4xx) from auth, rate limits and outages.
+#[derive(Debug)]
+struct HttpError {
+    status: u16,
+    msg: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// A 4xx that a different request shape might fix. Auth and rate limits
+/// are not that.
+fn is_shape_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<HttpError>()
+        .is_some_and(|h| (400..500).contains(&h.status) && ![401, 403, 429].contains(&h.status))
+}
+
 /// POST one chat completion: 3 attempts on transport errors, 429 and 5xx;
 /// auth and other 4xx fail at once. Returns the parsed response.
 async fn post(cfg: &Config, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
-    let key = cfg.key.clone().ok_or_else(|| {
-        anyhow::anyhow!("OPENROUTER_API_KEY is not set — use the heuristic scorer.")
-    })?;
+    let label = &cfg.label;
+    let key = cfg.key.clone().filter(|k| !k.trim().is_empty());
+    if key.is_none() && cfg.needs_key {
+        anyhow::bail!("no key saved for {label} — add one in Settings → Clip AI.");
+    }
+    if cfg.base_url.trim().is_empty() {
+        anyhow::bail!("no address set for {label} — add one in Settings → Clip AI.");
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(cfg.timeout_s))
         .build()?;
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let mut last_err = String::new();
     for attempt in 1..=3 {
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {key}"))
-            .header("HTTP-Referer", "https://digiclip.app")
-            .header("X-Title", "DigiClip")
-            .json(body)
-            .send()
-            .await;
-        let resp = match resp {
+        let mut req = client.post(&url).json(body);
+        if let Some(k) = &key {
+            req = req.header("Authorization", format!("Bearer {k}"));
+        }
+        if cfg.provider == "openrouter" {
+            req = req
+                .header("HTTP-Referer", "https://digiclip.app")
+                .header("X-Title", "DigiClip");
+        }
+        let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
                 last_err = format!("request failed (attempt {attempt}/3): {e}");
@@ -221,47 +291,91 @@ async fn post(cfg: &Config, body: &serde_json::Value) -> anyhow::Result<serde_js
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            anyhow::bail!("OpenRouter refused the key (HTTP {status}). Check OPENROUTER_API_KEY.");
+            return Err(HttpError {
+                status: status.as_u16(),
+                msg: format!(
+                    "{label} refused the key (HTTP {status}). Check the key in Settings → Clip AI."
+                ),
+            }
+            .into());
         }
         if status.as_u16() == 429 {
-            last_err = format!("OpenRouter rate-limited (HTTP 429, attempt {attempt}/3)");
+            last_err = format!("{label} rate-limited (HTTP 429, attempt {attempt}/3)");
             tracing::warn!("{last_err}");
             tokio::time::sleep(std::time::Duration::from_secs(5 * attempt as u64)).await;
             continue;
         }
         if !status.is_success() {
             last_err = format!(
-                "OpenRouter HTTP {status}: {}",
+                "{label} HTTP {status}: {}",
                 text.chars().take(300).collect::<String>()
             );
             tracing::warn!("{last_err}");
             if status.is_server_error() {
                 continue;
             }
-            anyhow::bail!("{last_err}");
+            return Err(HttpError {
+                status: status.as_u16(),
+                msg: last_err,
+            }
+            .into());
         }
         return serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("OpenRouter returned non-JSON: {e}"));
+            .map_err(|e| anyhow::anyhow!("{label} returned non-JSON: {e}"));
     }
-    anyhow::bail!("OpenRouter failed after retries: {last_err}")
+    anyhow::bail!("{label} failed after retries: {last_err}")
 }
 
-/// Analyze via OpenRouter. Returns Err on transport/4xx/5xx — caller falls
-/// back to the heuristic scorer (except auth errors, which are reported).
-pub async fn analyze(cfg: &Config, system: &str, user: &str) -> anyhow::Result<AnalyzeResult> {
-    let body = serde_json::json!({
+/// Appended to the system prompt when the provider takes no tools at all.
+const JSON_ONLY: &str =
+    r#"Reply with only a JSON object {"clips":[...]} matching the submit_clips schema."#;
+
+/// The clip-picking request at one of three shapes: 0 forces the
+/// `submit_clips` tool, 1 offers it without forcing, 2 has no tools and
+/// asks for plain JSON.
+fn analyze_body(cfg: &Config, system: &str, user: &str, shape: u8) -> serde_json::Value {
+    let system = if shape >= 2 {
+        format!("{system}\n\n{JSON_ONLY}")
+    } else {
+        system.to_string()
+    };
+    let mut body = serde_json::json!({
         "model": cfg.model,
         "temperature": 0.3,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "tools": [tool_schema()],
-        "tool_choice": {"type": "function", "function": {"name": "submit_clips"}},
     });
+    if shape < 2 {
+        body["tools"] = serde_json::json!([tool_schema()]);
+    }
+    if shape == 0 {
+        body["tool_choice"] =
+            serde_json::json!({"type": "function", "function": {"name": "submit_clips"}});
+    }
+    body
+}
+
+/// Analyze via the configured provider. Returns Err on transport/4xx/5xx —
+/// caller falls back to the heuristic scorer (except auth errors, which
+/// are reported).
+pub async fn analyze(cfg: &Config, system: &str, user: &str) -> anyhow::Result<AnalyzeResult> {
+    let mut shape = 0u8;
     // A reply with neither a tool call nor content is retried.
     for _ in 0..2 {
-        let v = post(cfg, &body).await?;
+        // Some providers 4xx on `tool_choice`, or on tools altogether:
+        // step down a shape and ask again.
+        let v = loop {
+            match post(cfg, &analyze_body(cfg, system, user, shape)).await {
+                Ok(v) => break v,
+                Err(e) if shape < 2 && is_shape_error(&e) => {
+                    tracing::warn!("{e} — retrying with a simpler request");
+                    shape += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         // Tool call first.
         if let Some(args_s) = v
             .pointer("/choices/0/message/tool_calls/0/function/arguments")
@@ -312,9 +426,9 @@ pub async fn analyze(cfg: &Config, system: &str, user: &str) -> anyhow::Result<A
                 content.chars().take(300).collect::<String>()
             );
         }
-        tracing::warn!("OpenRouter response had no tool call and no content");
+        tracing::warn!("{} response had no tool call and no content", cfg.label);
     }
-    anyhow::bail!("OpenRouter response had no tool call and no content")
+    anyhow::bail!("{} response had no tool call and no content", cfg.label)
 }
 
 /// First JSON object in a model reply: bare, fenced, or embedded in prose.
@@ -425,5 +539,61 @@ Done.";
         c.scores = None;
         let out = normalize_scores(vec![c]);
         assert!(out[0].scores.is_none());
+    }
+
+    #[test]
+    fn keyless_provider_is_ready_with_a_model() {
+        let c = Config::for_provider("ollama", None, Some("llama3:8b".into()), None);
+        assert!(!c.needs_key && c.key.is_none());
+        assert!(c.has_key());
+        // Nothing chosen yet: not ready.
+        let c = Config::for_provider("ollama", None, None, None);
+        assert!(!c.has_key());
+        // Key-only providers need both.
+        let c = Config::for_provider("openai", None, None, Some(" sk-x ".into()));
+        assert_eq!(c.key.as_deref(), Some("sk-x"));
+        assert_eq!(c.model, "gpt-5-mini");
+        assert!(c.has_key());
+        let c = Config::for_provider("deepseek", None, Some("m".into()), Some("  ".into()));
+        assert!(c.needs_key && c.key.is_none() && !c.has_key());
+    }
+
+    #[test]
+    fn base_override_and_custom_provider() {
+        let c = Config::for_provider(
+            "ollama",
+            Some("http://10.0.0.5:11434/v1".into()),
+            None,
+            None,
+        );
+        assert_eq!(c.base_url, "http://10.0.0.5:11434/v1");
+        let c = Config::for_provider("ollama", None, None, None);
+        assert_eq!(c.base_url, "http://localhost:11434/v1");
+        let c = Config::for_provider("custom", None, Some("m".into()), None);
+        assert!(c.base_url.is_empty() && !c.needs_key);
+        let c = Config::for_provider("bogus", None, None, Some("k".into()));
+        assert_eq!(c.provider, "openrouter");
+    }
+
+    #[test]
+    fn analyze_shapes_step_down() {
+        let c = Config::for_provider("openai", None, Some("m".into()), Some("k".into()));
+        let b0 = analyze_body(&c, "sys", "usr", 0);
+        assert!(b0["tools"].is_array() && b0["tool_choice"].is_object());
+        let b1 = analyze_body(&c, "sys", "usr", 1);
+        assert!(b1["tools"].is_array() && b1.get("tool_choice").is_none());
+        let b2 = analyze_body(&c, "sys", "usr", 2);
+        assert!(b2.get("tools").is_none() && b2.get("tool_choice").is_none());
+        let sys = b2["messages"][0]["content"].as_str().unwrap();
+        assert!(sys.starts_with("sys") && sys.ends_with(JSON_ONLY));
+        let soft = |s: u16| {
+            is_shape_error(&anyhow::Error::new(HttpError {
+                status: s,
+                msg: String::new(),
+            }))
+        };
+        assert!(soft(400) && soft(404) && soft(422));
+        assert!(!soft(401) && !soft(403) && !soft(429) && !soft(500));
+        assert!(!is_shape_error(&anyhow::anyhow!("boom")));
     }
 }

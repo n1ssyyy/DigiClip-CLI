@@ -1414,6 +1414,16 @@ async fn call_tool(
                 detail: None,
             })
         }
+        "list_ai_models" => Ok(out_json(
+            &run(
+                st,
+                Cmd::AiModels {
+                    provider: args["provider"].as_str().map(str::to_string),
+                    refresh: args["refresh"].as_bool().unwrap_or(false),
+                },
+            )
+            .await?,
+        )),
         "list_openrouter_models" => Ok(out_json(
             &run(
                 st,
@@ -1550,13 +1560,14 @@ fn tools() -> Vec<Value> {
         t("get_clip_kit", "Posting kit", "The clip's posting kit: caption text, hashtags and posting notes.", json!({ "job": job, "rank": rank }), &["job", "rank"], &read),
         t("get_clip_preview", "Clip preview", "The clip's poster frame as an image, plus its video path.", json!({ "job": job, "rank": rank }), &["job", "rank"], &read),
         t("get_settings", "Settings", "Saved settings and presets (API keys only show as set/not set).", json!({}), &[], &read),
-        t("update_settings", "Change settings", "Change settings with a partial patch, e.g. {\"clips_count\": 5, \"caption_default\": \"hormozi\", \"presets\": [...], \"watch_dir\": \"D:/videos\", \"watch_on\": true}. Keys (openrouter_key, jev_key) are write-only; null clears them.", json!({
+        t("update_settings", "Change settings", "Change settings with a partial patch, e.g. {\"clips_count\": 5, \"caption_default\": \"hormozi\", \"presets\": [...], \"watch_dir\": \"D:/videos\", \"watch_on\": true}. Clip AI: {\"ai_provider\": \"openai\", \"ai_keys\": {\"openai\": \"sk-...\"}, \"ai_models\": {\"openai\": \"gpt-5-mini\"}, \"ai_base_urls\": {\"ollama\": \"http://localhost:11434/v1\"}} (see list_ai_models for the provider ids; ai_base_urls only for ollama, lm_studio and custom). Keys (ai_keys, openrouter_key, jev_key) are write-only; null clears them.", json!({
             "patch": { "type": "object" },
         }), &["patch"], &write),
         t("list_models", "Models", "Speech models and the Laya judge: size, downloaded, download progress.", json!({}), &[], &read),
         t("download_model", "Download a model", "Download a model by id (see list_models).", json!({ "model": { "type": "string" } }), &["model"], &json!({ "readOnlyHint": false, "destructiveHint": false, "openWorldHint": true })),
         t("delete_model", "Delete a model", "Delete a downloaded model by id.", json!({ "model": { "type": "string" } }), &["model"], &json!({ "readOnlyHint": false, "destructiveHint": true, "openWorldHint": false })),
-        t("list_openrouter_models", "OpenRouter models", "Models available for clip scoring via OpenRouter.", json!({ "refresh": { "type": "boolean" } }), &[], &json!({ "readOnlyHint": true, "openWorldHint": true })),
+        t("list_ai_models", "Clip AI models", "Models a Clip AI provider offers for clip scoring (fetched live, cached 24h). Provider ids: openrouter, openai, anthropic, gemini, ollama_cloud, ollama, lm_studio, groq, mistral, deepseek, xai, together, fireworks, cerebras, custom. Defaults to the active provider (see get_settings: ai_provider, ai_providers).", json!({ "provider": { "type": "string" }, "refresh": { "type": "boolean" } }), &[], &json!({ "readOnlyHint": false, "idempotentHint": true, "openWorldHint": true })),
+        t("list_openrouter_models", "OpenRouter models", "Models available for clip scoring via OpenRouter (same as list_ai_models with provider openrouter).", json!({ "refresh": { "type": "boolean" } }), &[], &json!({ "readOnlyHint": true, "openWorldHint": true })),
         t("export_diagnostics", "Export diagnostics", "Write a diagnostics bundle (keys redacted) and return its path.", json!({}), &[], &write),
         t("show_in_app", "Show in DigiClip", "Bring the DigiClip window up on a job and/or a page (home, settings, health, mcp).", json!({
             "job": job,
@@ -1868,6 +1879,7 @@ mod tests {
             .unwrap();
         let tools = list["result"]["tools"].as_array().unwrap();
         assert!(tools.len() >= 20);
+        assert!(tools.iter().any(|t| t["name"] == "list_ai_models"));
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
         }
