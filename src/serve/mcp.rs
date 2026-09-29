@@ -25,6 +25,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+use super::mcp_apps as apps;
 use super::{
     handle_cmd, health, now_ms, AppState, ClientMsg, Cmd, Event, JobOptions, JobRecord, JobStatus,
     ServerMsg,
@@ -353,137 +354,52 @@ fn copy_bridge(dir: &Path) -> Option<PathBuf> {
 // AI app configs
 // ---------------------------------------------------------------------------
 
-fn claude_desktop_configs() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(c) = dirs::config_dir() {
-        out.push(c.join("Claude"));
-    }
-    // The Microsoft Store build keeps its own copy under the package.
-    #[cfg(windows)]
-    if let Some(local) = dirs::data_local_dir() {
-        if let Ok(rd) = std::fs::read_dir(local.join("Packages")) {
-            for e in rd.flatten() {
-                if e.file_name().to_string_lossy().starts_with("Claude_") {
-                    out.push(e.path().join("LocalCache").join("Roaming").join("Claude"));
-                }
-            }
-        }
-    }
-    out.into_iter()
-        .filter(|d| d.is_dir())
-        .map(|d| d.join("claude_desktop_config.json"))
-        .collect()
-}
-
-fn cursor_config() -> Option<PathBuf> {
-    let d = dirs::home_dir()?.join(".cursor");
-    d.is_dir().then(|| d.join("mcp.json"))
-}
-
 fn claude_code_config() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".claude.json"))
 }
 
-/// `claude` on PATH (npm installs a `.cmd` shim on Windows).
-fn claude_cli() -> Option<PathBuf> {
-    let names: &[&str] = if cfg!(windows) {
-        &["claude.exe", "claude.cmd"]
-    } else {
-        &["claude"]
-    };
-    let mut dirs_: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    if let Some(h) = dirs::home_dir() {
-        dirs_.push(h.join(".local").join("bin"));
-        dirs_.push(h.join(".claude").join("local"));
-    }
-    dirs_
-        .iter()
-        .flat_map(|d| names.iter().map(move |n| d.join(n)))
-        .find(|p| p.is_file())
-}
-
-/// The `digiclip` entry of an MCP config file, if any.
-fn entry_in(path: &Path) -> Option<Value> {
-    let txt = std::fs::read_to_string(path).ok()?;
-    let v: Value = serde_json::from_str(&txt).ok()?;
-    v.get("mcpServers")?.get("digiclip").cloned()
-}
-
-fn entry_state(paths: &[PathBuf], bridge: Option<&Path>) -> (bool, bool) {
-    let entries: Vec<Value> = paths.iter().filter_map(|p| entry_in(p)).collect();
-    let current = entries.iter().any(|e| {
-        bridge.is_some_and(|b| e["command"].as_str() == Some(&b.display().to_string()))
-            || e["url"].is_string()
-    });
-    (!entries.is_empty(), current)
-}
-
+/// Found / added / current for every app DigiClip knows (see `mcp_apps`).
 async fn refresh_installed(st: &AppState) {
     let bridge = st.mcp.with(|m| m.bridge.clone());
     let v = tokio::task::spawn_blocking(move || {
-        let b = bridge.as_deref();
-        let desk = claude_desktop_configs();
-        let (d_in, d_cur) = entry_state(&desk, b);
-        let cur = cursor_config();
-        let (c_in, c_cur) = entry_state(cur.as_slice(), b);
-        let cc = claude_code_config();
-        let cli = claude_cli();
-        let (k_in, k_cur) = entry_state(cc.as_slice(), b);
-        let show = |p: &[PathBuf]| p.iter().map(|p| p.display().to_string()).collect::<Vec<_>>();
-        json!({
-            "claude_desktop": { "found": !desk.is_empty(), "added": d_in, "current": d_cur, "paths": show(&desk) },
-            "cursor": { "found": cur.is_some(), "added": c_in, "current": c_cur, "paths": show(cur.as_slice()) },
-            "claude_code": {
-                "found": cli.is_some(),
-                "added": k_in,
-                "current": k_cur,
-                "paths": cli.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            },
-        })
+        let exe = bridge.as_ref().map(|b| b.display().to_string());
+        let mut out = serde_json::Map::new();
+        for app in apps::APPS {
+            let (found, paths) = apps::locate(app.id);
+            // Claude Code: the CLI is what we run, its file is what we read.
+            let read: Vec<PathBuf> = match app.format {
+                apps::Format::ClaudeCli => claude_code_config().into_iter().collect(),
+                _ => paths.clone(),
+            };
+            let probe = match app.format {
+                apps::Format::ClaudeCli => apps::App {
+                    id: app.id,
+                    format: apps::Format::Json {
+                        key: "mcpServers",
+                        shape: apps::Shape::Std,
+                    },
+                },
+                f => apps::App {
+                    id: app.id,
+                    format: f,
+                },
+            };
+            let (added, current) = apps::state(&probe, &read, exe.as_deref());
+            out.insert(
+                app.id.into(),
+                json!({
+                    "found": found,
+                    "added": added,
+                    "current": current,
+                    "paths": paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                }),
+            );
+        }
+        Value::Object(out)
     })
     .await
     .unwrap_or(Value::Null);
     st.mcp.with(|m| m.installed = v);
-}
-
-/// Put `mcpServers.digiclip` into (or take it out of) one JSON config,
-/// keeping everything else as it was.
-fn merge_config(path: &Path, entry: Option<&Value>) -> Result<(), String> {
-    let mut root: Value = match std::fs::read_to_string(path) {
-        Ok(t) if !t.trim().is_empty() => serde_json::from_str(&t).map_err(|e| {
-            format!(
-                "{} isn't valid JSON ({e}); fix it or add DigiClip by hand",
-                path.display()
-            )
-        })?,
-        _ => json!({}),
-    };
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| format!("{} isn't a JSON object", path.display()))?;
-    let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
-    let servers = servers
-        .as_object_mut()
-        .ok_or_else(|| format!("mcpServers in {} isn't an object", path.display()))?;
-    match entry {
-        Some(e) => {
-            servers.insert("digiclip".into(), e.clone());
-        }
-        None => {
-            if servers.remove("digiclip").is_none() {
-                return Ok(());
-            }
-        }
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let txt = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.digiclip-tmp");
-    std::fs::write(&tmp, txt + "\n").map_err(|e| format!("{}: {e}", path.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 async fn run_claude(cli: &Path, args: &[&str]) -> Result<String, String> {
@@ -515,68 +431,43 @@ pub(super) async fn install(
     remove: bool,
 ) -> Result<String, String> {
     let bridge = st.mcp.with(|m| m.bridge.clone());
-    let entry = match (&bridge, remove) {
+    let exe = match (&bridge, remove) {
         (_, true) => None,
-        (Some(b), false) => Some(json!({ "command": b.display().to_string(), "args": ["--mcp"] })),
+        (Some(b), false) => Some(b.display().to_string()),
         (None, false) => return Err("the MCP bridge couldn't be set up (see the log)".into()),
     };
-    let res = match client {
-        "claude_desktop" => {
-            let paths = claude_desktop_configs();
-            if paths.is_empty() {
-                Err("Claude Desktop isn't installed for this user".to_string())
-            } else {
-                let paths2 = paths.clone();
-                let e = entry.clone();
-                tokio::task::spawn_blocking(move || {
-                    paths2.iter().try_for_each(|p| merge_config(p, e.as_ref()))
-                })
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r)
-                .map(|_| {
-                    paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-            }
+    let Some(app) = apps::app(client) else {
+        return Err(format!("unknown app [{client}]"));
+    };
+    let (found, paths) = apps::locate(client);
+    let res = if !found || paths.is_empty() {
+        Err("that app isn't installed for this user".to_string())
+    } else if app.format == apps::Format::ClaudeCli {
+        let cli = paths[0].clone();
+        // `add` refuses an existing name: drop the old one first.
+        let _ = run_claude(&cli, &["mcp", "remove", "--scope", "user", "digiclip"]).await;
+        match &exe {
+            Some(b) => run_claude(
+                &cli,
+                &[
+                    "mcp", "add", "--scope", "user", "digiclip", "--", b, "--mcp",
+                ],
+            )
+            .await
+            .map(|_| "~/.claude.json".to_string()),
+            None => Ok("~/.claude.json".to_string()),
         }
-        "cursor" => match cursor_config() {
-            None => Err("Cursor isn't installed for this user".to_string()),
-            Some(p) => {
-                let e = entry.clone();
-                let p2 = p.clone();
-                tokio::task::spawn_blocking(move || merge_config(&p2, e.as_ref()))
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|r| r)
-                    .map(|_| p.display().to_string())
-            }
-        },
-        "claude_code" => match claude_cli() {
-            None => Err("the claude command isn't on PATH".to_string()),
-            Some(cli) => {
-                // `add` refuses an existing name: drop the old one first.
-                let _ = run_claude(&cli, &["mcp", "remove", "--scope", "user", "digiclip"]).await;
-                match &bridge {
-                    Some(b) if !remove => {
-                        let b = b.display().to_string();
-                        run_claude(
-                            &cli,
-                            &[
-                                "mcp", "add", "--scope", "user", "digiclip", "--", &b, "--mcp",
-                            ],
-                        )
-                        .await
-                        .map(|_| "~/.claude.json".to_string())
-                    }
-                    _ => Ok("~/.claude.json".to_string()),
-                }
-            }
-        },
-        other => Err(format!("unknown app [{other}]")),
+    } else {
+        let shown = paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::task::spawn_blocking(move || apps::apply(app, &paths, exe.as_deref()))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r)
+            .map(|_| shown)
     };
     refresh_installed(st).await;
     res
@@ -643,6 +534,37 @@ async fn authorized(st: &AppState, headers: &HeaderMap) -> bool {
     !token.is_empty() && got.trim() == token
 }
 
+/// Substrings of an MCP client's self-reported name, and what to call it.
+const KNOWN_CLIENTS: &[(&str, &str)] = &[
+    ("cursor", "Cursor"),
+    ("windsurf", "Windsurf"),
+    ("devin", "Windsurf"),
+    ("vscode", "VS Code"),
+    ("visual studio code", "VS Code"),
+    ("codex", "Codex"),
+    ("opencode", "OpenCode"),
+    ("hermes", "Hermes"),
+    ("gemini", "Gemini CLI"),
+    ("qwen", "Qwen Code"),
+    ("zed", "Zed"),
+    ("copilot", "Copilot"),
+    ("roo", "Roo Code"),
+    ("cline", "Cline"),
+    ("kilo", "Kilo Code"),
+    ("continue", "Continue"),
+    ("goose", "Goose"),
+    ("kiro", "Kiro"),
+    ("amp", "Amp"),
+    ("lm studio", "LM Studio"),
+    ("lmstudio", "LM Studio"),
+    ("factory", "Factory"),
+    ("droid", "Factory"),
+    ("augment", "Augment"),
+    ("auggie", "Augment"),
+    ("jan", "Jan"),
+    ("anythingllm", "AnythingLLM"),
+];
+
 /// A friendly name for the activity feed.
 fn client_label(info: &Value) -> String {
     if let Some(t) = info["title"].as_str().filter(|t| !t.trim().is_empty()) {
@@ -654,12 +576,16 @@ fn client_label(info: &Value) -> String {
         "Claude Code".into()
     } else if l.starts_with("claude") {
         "Claude".into()
-    } else if l.contains("cursor") {
-        "Cursor".into()
-    } else if l.contains("windsurf") {
-        "Windsurf".into()
-    } else if l.contains("vscode") || l.contains("visual studio code") {
-        "VS Code".into()
+    } else if let Some(&(_, label)) = KNOWN_CLIENTS.iter().find(|(k, _)| {
+        // Short names only as whole words ("amp", not "example").
+        if k.len() > 4 {
+            l.contains(k)
+        } else {
+            l.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w == *k)
+        }
+    }) {
+        label.into()
     } else if name.is_empty() {
         "AI app".into()
     } else {
@@ -1987,6 +1913,15 @@ mod tests {
         assert_eq!(feed[0]["state"], "error");
         assert_eq!(feed[2]["state"], "ok");
         assert_eq!(feed[2]["client"], "Claude");
+        for (name, want) in [
+            ("codex-mcp-client", "Codex"),
+            ("amp", "Amp"),
+            ("example-client", "example-client"),
+            ("Zed", "Zed"),
+            ("authorized-thing", "authorized-thing"),
+        ] {
+            assert_eq!(client_label(&json!({ "name": name })), want);
+        }
         // MCP can't switch itself off.
         let r = rpc(
             &st,
@@ -2025,25 +1960,23 @@ mod tests {
             r#"{"globalShortcut":"x","mcpServers":{"other":{"command":"o"}}}"#,
         )
         .unwrap();
-        let e = json!({ "command": "C:/b/digiclip-mcp.exe", "args": ["--mcp"] });
-        merge_config(&p, Some(&e)).unwrap();
+        let e = apps::json_entry(apps::Shape::Std, "C:/b/digiclip-mcp.exe");
+        let app = apps::app("claude_desktop").unwrap();
+        apps::json_edit(&p, "mcpServers", Some(&e)).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v["globalShortcut"], "x");
         assert_eq!(v["mcpServers"]["other"]["command"], "o");
         assert_eq!(v["mcpServers"]["digiclip"]["args"][0], "--mcp");
         assert_eq!(
-            entry_state(
-                std::slice::from_ref(&p),
-                Some(Path::new("C:/b/digiclip-mcp.exe"))
-            ),
+            apps::state(app, std::slice::from_ref(&p), Some("C:/b/digiclip-mcp.exe")),
             (true, true)
         );
-        merge_config(&p, None).unwrap();
+        apps::json_edit(&p, "mcpServers", None).unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert!(v["mcpServers"].get("digiclip").is_none());
         // Broken JSON is never overwritten.
         std::fs::write(&p, "{ nope").unwrap();
-        assert!(merge_config(&p, Some(&e)).is_err());
+        assert!(apps::json_edit(&p, "mcpServers", Some(&e)).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{ nope");
         let _ = std::fs::remove_dir_all(&dir);
     }
