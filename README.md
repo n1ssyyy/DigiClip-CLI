@@ -51,13 +51,13 @@ digiclip podcast.mp4
 ## ⚡ Why it rips
 
 - 🎙️ **Transcribes offline.** whisper.cpp is compiled right in — word-level timing, no Python, no upload. Got a GPU? Plug in the Vulkan sidecar.
-- 🎯 **Picks like an editor.** An [OpenRouter](https://openrouter.ai) model of your choice ranks every moment for hook and payoff; a built-in scorer covers you offline. A System One model then re-judges each candidate with calibrated odds (hook, standalone, complete, value, shareability): TypeSafe's hosted **Jev**, or **Laya** running locally on your CPU.
+- 🎯 **Picks like an editor.** A model of your choice ([OpenRouter](https://openrouter.ai), OpenAI, Anthropic, Gemini, Ollama, Groq and more) ranks every moment for hook and payoff; a built-in scorer covers you offline. A System One model then re-judges each candidate with calibrated odds (hook, standalone, complete, value, shareability): TypeSafe's hosted **Jev**, or **Laya** running locally on your CPU.
 - 🎥 **Frames like a camera operator.** YuNet face tracking plus an offline camera planner: the shot locks off while the speaker stays put, follows a walking presenter in one smooth move, cuts (never whip-pans) between speakers, and lands every reframe on the source's own shot cuts.
 - ✂️ **Tightens the edit.** Dead air goes, filler words optionally too; every cut is placed in the quietest instant near the word edge, frame-aligned, with click-free audio joins. Loud lines get a punch-in zoom anchored on the face — every cut logged in `cut_plan.json`.
 - 💬 **Eight caption styles.** Karaoke, Hormozi, neon, beast and friends, burned in with libass.
 - 🧩 **Any platform, your brand.** 9:16, 4:5, 1:1 or 16:9 from the same source, with an optional headline, progress bar, corner logo and a music bed that ducks under the voice.
 - 🚀 **Renders in parallel, in sync.** A streaming decode → compose → encode pipeline, clips side by side on NVENC or VideoToolbox (libx264 fallback). A/V sync is exact by construction and loudness lands on −14 LUFS with a −1 dBTP ceiling.
-- 🔒 **Stays local.** Your video never leaves the disk; only clip scoring optionally calls OpenRouter or Jev (Laya never leaves the machine).
+- 🔒 **Stays local.** Your video never leaves the disk; only clip scoring optionally calls your chosen AI provider or Jev (Laya never leaves the machine).
 
 ```mermaid
 flowchart LR
@@ -130,8 +130,10 @@ digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked un
 
 | Variable / flag | Default | What it does |
 |---|---|---|
-| `OPENROUTER_API_KEY` / `--openrouter-key` | — | Unlocks LLM clip picking (without it, the offline scorer runs). |
-| `OPENROUTER_MODEL` / `--openrouter-model` | `nvidia/nemotron-3-ultra-550b-a55b:free` | Scoring model. |
+| `--ai-provider` | `openrouter` | Clip AI provider: `openrouter`, `openai`, `anthropic`, `gemini`, `ollama_cloud`, `ollama` (this PC), `lm_studio`, `groq`, `mistral`, `deepseek`, `xai`, `together`, `fireworks`, `cerebras` or `custom` (any OpenAI-compatible address). Serve setting: `ai_provider`. |
+| `--ai-base-url` | provider's own | Address for `ollama`, `lm_studio` and `custom`. |
+| `OPENROUTER_API_KEY` / `--openrouter-key` (`--ai-key`) | — | Key for the provider (its own variable is read too: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_API_KEY`, `GROQ_API_KEY`…). Local providers need none. Without a ready provider the offline scorer runs. |
+| `OPENROUTER_MODEL` / `--openrouter-model` (`--ai-model`) | provider's default (OpenRouter: `nvidia/nemotron-3-ultra-550b-a55b:free`) | Scoring model. The app fetches each provider's model list itself. |
 | `--decider` | `auto` | System One judge: `jev`, `laya`, `off`, or `auto` (Jev when a key is set, else Laya when downloaded and the talk is English). Serve setting: `decider`. |
 | `JEV_API_KEY` / `--jev-key` | — | Key for TypeSafe's Jev. `--jev-model` picks the model (default `jev-latest`). |
 | `--model` | `base.en` | Whisper model: `tiny.en`, `base.en`, `large-v3-turbo(-q5_0)`, `large-v3`. |

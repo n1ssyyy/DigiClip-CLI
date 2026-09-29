@@ -18,6 +18,7 @@ pub mod pipeline;
 pub mod process;
 pub mod progress;
 pub mod prompt;
+pub mod providers;
 pub mod provision;
 pub mod punch;
 pub mod redo;

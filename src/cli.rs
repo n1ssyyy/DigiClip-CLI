@@ -204,13 +204,25 @@ pub struct Args {
     #[arg(long = "gpu", default_value_t = true, action = clap::ArgAction::Set)]
     pub gpu: bool,
 
-    /// OpenRouter API key (or set OPENROUTER_API_KEY). Unset ->
-    /// offline heuristic scorer, no network call for scoring.
+    /// Clip AI provider: openrouter, openai, anthropic, gemini,
+    /// ollama_cloud, ollama, lm_studio, groq, mistral, deepseek, xai,
+    /// together, fireworks, cerebras or custom.
+    #[arg(long, default_value = "openrouter", value_parser = parse_provider)]
+    pub ai_provider: String,
+
+    /// Override the provider's API address (local and custom providers).
     #[arg(long)]
+    pub ai_base_url: Option<String>,
+
+    /// Clip AI API key for the provider (or its env var, e.g.
+    /// OPENROUTER_API_KEY). Unset on a provider that needs one ->
+    /// offline heuristic scorer, no network call for scoring.
+    #[arg(long, alias = "ai-key")]
     pub openrouter_key: Option<String>,
 
-    /// OpenRouter scoring model (or set OPENROUTER_MODEL).
-    #[arg(long)]
+    /// Clip AI scoring model (default: the provider's own; OpenRouter
+    /// also reads OPENROUTER_MODEL).
+    #[arg(long, alias = "ai-model")]
     pub openrouter_model: Option<String>,
 
     /// System One model that judges clip candidates (hook, stands alone,
@@ -254,8 +266,9 @@ pub struct Args {
     pub threads: Option<usize>,
 
     /// Vision model for no-face punch-in suggestions in smart mode
-    /// (or set OPENROUTER_VISION_MODEL). Only used when an OpenRouter
-    /// key is set; any failure keeps the wide fill.
+    /// (OpenRouter also reads OPENROUTER_VISION_MODEL; default: the
+    /// provider's vision model, else the scoring model). Only used when
+    /// Clip AI is ready; any failure keeps the wide fill.
     #[arg(long)]
     pub vision_model: Option<String>,
 
@@ -314,6 +327,18 @@ pub struct Args {
     /// the running DigiClip app, starting the app (hidden) if needed.
     #[arg(long, default_value_t = false)]
     pub mcp: bool,
+}
+
+fn parse_provider(s: &str) -> Result<String, String> {
+    let id = s.trim().to_ascii_lowercase();
+    if crate::providers::provider(&id).is_some() {
+        return Ok(id);
+    }
+    let all: Vec<&str> = crate::providers::PROVIDERS.iter().map(|p| p.id).collect();
+    Err(format!(
+        "unknown provider `{s}` (one of {})",
+        all.join(", ")
+    ))
 }
 
 fn parse_aspect(s: &str) -> Result<String, String> {

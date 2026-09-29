@@ -84,11 +84,12 @@ pub fn grab_frame(
     Ok(bytes)
 }
 
-/// Ask the vision model where to punch in. `transcript` is the words
+/// Ask the vision model where to punch in (`key` is None for keyless
+/// providers such as a local Ollama). `transcript` is the words
 /// spoken during the stretch. Returns None on any failure (stay wide).
 pub async fn suggest_focus(
     base_url: &str,
-    key: &str,
+    key: Option<&str>,
     model: &str,
     jpg: &[u8],
     transcript: &str,
@@ -120,15 +121,15 @@ pub async fn suggest_focus(
         .build()
         .ok()?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let resp = client
+    let mut req = client
         .post(&url)
-        .header("Authorization", format!("Bearer {key}"))
         .header("HTTP-Referer", "https://digiclip.app")
         .header("X-Title", "DigiClip")
-        .json(&body)
-        .send()
-        .await
-        .ok()?;
+        .json(&body);
+    if let Some(k) = key.filter(|k| !k.trim().is_empty()) {
+        req = req.header("Authorization", format!("Bearer {k}"));
+    }
+    let resp = req.send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }

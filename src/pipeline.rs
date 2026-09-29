@@ -549,7 +549,6 @@ async fn resolve_punches(
     if !ocfg.has_key() {
         return chunks;
     }
-    let key = ocfg.key.clone().unwrap();
     let mut out = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let wide = matches!(chunk.kind, ChunkKind::Wide);
@@ -566,8 +565,15 @@ async fn resolve_punches(
         let jpg = crate::vision::grab_frame(ffmpeg, source, (chunk.t0 + chunk.t1) / 2.0).ok();
         let focus = match jpg {
             Some(j) => {
-                crate::vision::suggest_focus(&ocfg.base_url, &key, vision_model, &j, &text, 60)
-                    .await
+                crate::vision::suggest_focus(
+                    &ocfg.base_url,
+                    ocfg.key.as_deref(),
+                    vision_model,
+                    &j,
+                    &text,
+                    60,
+                )
+                .await
             }
             None => None,
         };
@@ -981,15 +987,34 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     // --- framing: tracker session is lazy, reused across clips ------------
     // Tracking runs AFTER clip picking, scoped to picked ranges only.
     let mut tracker: Option<crate::track::Tracker> = None;
-    // OpenRouter config doubles for clip scoring and VLM punch-ins.
-    let ocfg = crate::openrouter::Config::from_env(
+    // The Clip AI provider config doubles for clip scoring and VLM punch-ins.
+    let ocfg = crate::openrouter::Config::for_provider(
+        &args.ai_provider,
+        args.ai_base_url.clone(),
         args.openrouter_model.clone(),
         args.openrouter_key.clone(),
     );
-    let vision_model = args.vision_model.clone().unwrap_or_else(|| {
-        std::env::var("OPENROUTER_VISION_MODEL")
-            .unwrap_or_else(|_| "google/gemini-2.5-flash".into())
-    });
+    // --vision-model, else (OpenRouter) its env var, else the provider's
+    // vision model, else whatever scores the clips.
+    let vision_model = args
+        .vision_model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| {
+            if ocfg.provider == "openrouter" {
+                std::env::var("OPENROUTER_VISION_MODEL")
+                    .ok()
+                    .filter(|m| !m.trim().is_empty())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            crate::providers::provider(&ocfg.provider)
+                .and_then(|p| p.vision_model)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| ocfg.model.clone());
 
     // --subs-lang: captions in another language. Picking and cuts stay on
     // the spoken words; everything drawn on screen uses these.

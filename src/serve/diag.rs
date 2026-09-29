@@ -121,14 +121,13 @@ pub(super) async fn diagnostics(st: &AppState) -> String {
         "\n== serve.log (last {LOG_TAIL} lines)\n{}\n",
         tail(&log, LOG_TAIL)
     );
-    redact(
-        &s,
-        &[
-            settings.openrouter_key.as_deref(),
-            settings.jev_key.as_deref(),
-            settings.mcp_token.as_deref(),
-        ],
-    )
+    let mut keys = vec![
+        settings.openrouter_key.as_deref(),
+        settings.jev_key.as_deref(),
+        settings.mcp_token.as_deref(),
+    ];
+    keys.extend(settings.ai_keys.values().map(|k| Some(k.as_str())));
+    redact(&s, &keys)
 }
 
 #[cfg(test)]
