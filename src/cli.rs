@@ -308,6 +308,12 @@ pub struct Args {
     /// root, i.e. %APPDATA%/digiclip on Windows).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+
+    /// MCP stdio bridge for AI apps (Claude Desktop, Cursor, Claude
+    /// Code…): relays JSON-RPC lines on stdin/stdout to the MCP server of
+    /// the running DigiClip app, starting the app (hidden) if needed.
+    #[arg(long, default_value_t = false)]
+    pub mcp: bool,
 }
 
 fn parse_aspect(s: &str) -> Result<String, String> {

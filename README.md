@@ -117,6 +117,15 @@ digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked un
 - **Focus.** The LLM is told the topic, the offline scorer boosts sentences that mention it, and every candidate that covers it ranks first. When nothing matches, the best clips overall are used.
 - **Batch.** Pass several files or a folder. Each video gets its own `<name>-digiclip/` folder, under `--out-dir` when given. If one video fails, the rest still run and the run exits with an error that lists the failures.
 
+### 🤖 Let Claude drive it (MCP)
+
+`digiclip --serve` also runs an [MCP](https://modelcontextprotocol.io) server, so Claude Desktop, Claude Code, Cursor or any MCP app can use DigiClip the way you do: start jobs from files or links with any preset or option, wait for them, read transcripts, retitle, re-cut or add clips, look at a clip's poster frame, grab the posting kit, change settings and manage models. 21 tools, and every call shows up live in the app.
+
+- **Stdio:** point the app at `digiclip --mcp`. It's a small bridge that forwards to the running engine and opens the DigiClip app if nothing's listening. The engine also keeps a copy at `<data>/mcp/digiclip-mcp(.exe)`, so updates never fight a running bridge.
+- **HTTP:** `http://127.0.0.1:47420/mcp` (streamable HTTP, JSON replies) with `Authorization: Bearer <token>`. Loopback only, browser origins other than localhost are refused.
+- `<data>/mcp/server.json` has the live port and token. In the app, the **AI apps** page adds DigiClip to Claude Desktop, Claude Code or Cursor in one click, and has the on/off switch, port and token.
+- Your API keys are write-only: tools can set them but never read them back.
+
 ## ⚙️ Tune it
 
 | Variable / flag | Default | What it does |

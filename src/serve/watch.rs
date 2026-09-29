@@ -116,7 +116,13 @@ pub(super) async fn run(st: Arc<AppState>) {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let (tone, title, body) = match start_job(&st, f.clone(), s.watch_options.clone()).await
+            let (tone, title, body) = match start_job(
+                &st,
+                f.clone(),
+                s.watch_options.clone(),
+                Some("watch".into()),
+            )
+            .await
             {
                 Ok(_) => {
                     tracing::info!("watch folder: started {f}");
