@@ -5,6 +5,7 @@
 //! caption block moved to the lower third (mid-frame would sit on the face).
 //! An optional headline is pinned at the top for the whole clip.
 
+use super::motion;
 use crate::look::{BoxLook, CaptionsLook, Case, HeadlineAnim, HeadlineLook};
 use crate::whisper::Word;
 
@@ -257,7 +258,7 @@ pub fn is_keyword(raw: &str, sentence_start: bool) -> bool {
     matches!(raw.trim().chars().next(), Some(c) if c.is_uppercase()) && t.len() > 1
 }
 
-fn ends_sentence(w: &str) -> bool {
+pub(super) fn ends_sentence(w: &str) -> bool {
     w.ends_with(['.', '!', '?', '…'])
 }
 
@@ -697,7 +698,17 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     let cap = o.captions.as_ref();
     // The Look's motion wins over the flat option.
     let anim = cap.and_then(|c| c.anim).unwrap_or(o.anim);
-    let moving = anim != Anim::Static;
+    // Word looks, an entrance or an exit in the Look: the word-level writer
+    // (`motion`) draws the captions. Without them the line writer below runs,
+    // exactly as it always did.
+    let word_level = cap.filter(|c| c.words.is_some() || c.enter.is_some() || c.exit.is_some());
+    let moving = match word_level {
+        Some(c) => {
+            let (en, ex) = motion::effective_motion(c, anim);
+            en.kind != crate::look::EnterKind::None || ex.kind != crate::look::ExitKind::None
+        }
+        None => anim != Anim::Static,
+    };
     // Words per line: the style's character budget stretches with the word
     // limit so a higher limit is reachable.
     let (max_w, max_c) = match cap.and_then(|c| c.max_words) {
@@ -856,7 +867,13 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     // invisible text under the real one); an opaque box needs neither.
     let soft_box = border == 3 && !outline.starts_with("&H00");
     let box_name = format!("{display}Box");
-    if soft_box {
+    // The word-level writer always draws the box as its own event(s).
+    let split_box = if word_level.is_some() {
+        border == 3
+    } else {
+        soft_box
+    };
+    if split_box {
         out.push_str(&row(
             display,
             &primary,
@@ -1022,6 +1039,42 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     let accent = cap
         .and_then(|c| c.accent)
         .map_or_else(|| accent_for(&name).to_string(), |c| c.ass(0));
+    if let Some(c) = word_level {
+        let cfg = motion::Cfg::resolve(
+            c,
+            anim,
+            motion::col_of_ass(&primary),
+            motion::col_of_ass(&secondary),
+            motion::col_of_ass(&accent),
+            k,
+        );
+        let alpha_of = |s: &str| u8::from_str_radix(s.get(2..4).unwrap_or("00"), 16).unwrap_or(0);
+        let geo = motion::Geo {
+            pw,
+            ph,
+            k,
+            alignment,
+            margin_v,
+            cap_l,
+            cap_r,
+            place: place.as_ref().map(|p| (p.x, p.y)),
+            font,
+            font_px,
+        };
+        let draw = motion::Draw {
+            text_style: display,
+            box_style: split_box.then(|| {
+                (
+                    box_name.as_str(),
+                    alpha_of(&outline),
+                    (shadow > 0.0).then(|| alpha_of(style.back)),
+                )
+            }),
+            caps,
+        };
+        out.push_str(&motion::events(&cfg, &geo, &draw, &lines, &spans, offset));
+        return out;
+    }
     let mut fresh = true; // next word opens a sentence (tracked across lines)
     for (line, &(t0, t1)) in lines.iter().zip(&spans) {
         let mut text = String::new();
@@ -2144,5 +2197,943 @@ mod tests {
             },
         );
         assert!(!ass.contains("Headline"));
+    }
+
+    // ---- Look: words, enter, exit -------------------------------------
+
+    /// The events of one word (the text after the tags), in file order.
+    fn ev<'a>(ass: &'a str, w: &str) -> Vec<&'a str> {
+        ass.lines()
+            .filter(|l| l.starts_with("Dialogue: 0,") && l.ends_with(&format!("}}{w}")))
+            .collect()
+    }
+
+    /// The override tags of an event.
+    fn tg(e: &str) -> &str {
+        let body = e.split_once(",,0,0,0,,{").map_or("", |x| x.1);
+        body.rsplit_once('}').map_or("", |x| x.0)
+    }
+
+    fn start(e: &str) -> &str {
+        e.split(',').nth(1).unwrap()
+    }
+
+    fn end(e: &str) -> &str {
+        e.split(',').nth(2).unwrap()
+    }
+
+    /// Where an event puts its word (the start of a move).
+    fn at(e: &str) -> (f64, f64) {
+        let t = tg(e);
+        let i = t
+            .find("\\pos(")
+            .map(|i| i + 5)
+            .or_else(|| t.find("\\move(").map(|i| i + 6));
+        let r = &t[i.expect("no position")..];
+        let mut p = r.split([',', ')']);
+        (
+            p.next().unwrap().parse().unwrap(),
+            p.next().unwrap().parse().unwrap(),
+        )
+    }
+
+    /// Where a move ends.
+    fn to(e: &str) -> (f64, f64) {
+        let r = tg(e).split("\\move(").nth(1).expect("no move");
+        let p: Vec<f64> = r
+            .split(')')
+            .next()
+            .unwrap()
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        (p[2], p[3])
+    }
+
+    /// A static look (lines keep the words' own spans) with word settings.
+    fn st(json: &str) -> String {
+        build_look("minimal", &format!(r#"{{"anim":"none",{json}}}"#))
+    }
+
+    #[test]
+    fn default_ass_is_byte_identical_for_every_style_and_empty_word_sections() {
+        // Hash and length of what HEAD wrote before the word model existed.
+        let ws: Vec<Word> =
+            "so I made 3 million dollars last year. Never stop building the best thing"
+                .split(' ')
+                .enumerate()
+                .map(|(i, w)| Word {
+                    w: w.into(),
+                    s: i as f64 * 0.4,
+                    e: i as f64 * 0.4 + 0.35,
+                    conf: Some(0.9),
+                })
+                .collect();
+        let anims = [
+            Anim::Pop,
+            Anim::Words,
+            Anim::Static,
+            Anim::Fade,
+            Anim::Slide,
+            Anim::Bounce,
+        ];
+        let head: &[(&str, usize, u64, usize)] = &[
+            ("karaoke", 0, 0x5f8e454ce390ec78, 1940),
+            ("karaoke", 1, 0x5a5249cb3a7606cd, 2246),
+            ("karaoke", 2, 0xfa03f6e607c4a1ed, 1153),
+            ("karaoke", 3, 0xd36bc11fc5008783, 1182),
+            ("karaoke", 4, 0x62070ba5fe3cadc3, 1322),
+            ("karaoke", 5, 0xddb2b8fa274b9d28, 2372),
+            ("hormozi", 0, 0xbb4f12555cbd4439, 1858),
+            ("hormozi", 1, 0xa5a5c4574fcf22cd, 2130),
+            ("hormozi", 2, 0x58625c6da271ec68, 1134),
+            ("hormozi", 3, 0xa71e96eaea180310, 1226),
+            ("hormozi", 4, 0xbdf898f37a42474a, 1400),
+            ("hormozi", 5, 0xbc525e3791b444a8, 2236),
+            ("minimal", 0, 0x613bbc0c9b432d08, 1750),
+            ("minimal", 1, 0x8aaca1953ddb57a6, 2096),
+            ("minimal", 2, 0x85c09e8fbc1e94d8, 1090),
+            ("minimal", 3, 0x5d5be388c1b446ca, 1120),
+            ("minimal", 4, 0xada9c9624185c51e, 1236),
+            ("minimal", 5, 0xb208782ded1a09ba, 2074),
+            ("beast", 0, 0xb3edaf485e211054, 1974),
+            ("beast", 1, 0xd74e839c6dda1ff8, 2246),
+            ("beast", 2, 0xe6eeef5d9ee1204f, 1221),
+            ("beast", 3, 0xb432cbeee4652a4d, 1217),
+            ("beast", 4, 0xdbd9e131e27380b7, 1391),
+            ("beast", 5, 0x087d3cb00f36d5d2, 2406),
+            ("neon", 0, 0xa2af98a0d854dd29, 1911),
+            ("neon", 1, 0x371f1c82269cbf9a, 2217),
+            ("neon", 2, 0xb46aee36f630bcb2, 1121),
+            ("neon", 3, 0xf242d9731e26d878, 1153),
+            ("neon", 4, 0x4189686735e5c330, 1293),
+            ("neon", 5, 0x31bc34f84f278527, 2343),
+            ("highlight", 0, 0x76f9b8178e415771, 1874),
+            ("highlight", 1, 0xb2a072fde39550f1, 2146),
+            ("highlight", 2, 0xcf5bd369ed64bad4, 1150),
+            ("highlight", 3, 0x286d00134297389c, 1242),
+            ("highlight", 4, 0xf67e9174e81ca2de, 1416),
+            ("highlight", 5, 0x9bfb542ba25f1bf4, 2252),
+            ("ghost", 0, 0x69c5fde3c802c709, 1738),
+            ("ghost", 1, 0xc57647296bd6af97, 2084),
+            ("ghost", 2, 0xfcde295efb4010d9, 1076),
+            ("ghost", 3, 0x989ffce9172be6ff, 1108),
+            ("ghost", 4, 0x6fc30d3f553a5d1f, 1224),
+            ("ghost", 5, 0x5fc0877808a4b0bf, 2062),
+            ("tiktok", 0, 0x7c85f1b8be168fd4, 1935),
+            ("tiktok", 1, 0xea74d6b2e0f45e23, 2241),
+            ("tiktok", 2, 0xb6a7ca024b3a9f21, 1147),
+            ("tiktok", 3, 0xe60d553e4287686d, 1177),
+            ("tiktok", 4, 0x2f0178aa484049dd, 1322),
+            ("tiktok", 5, 0xaec712a6209a45c2, 2367),
+        ];
+        // No look, and every way of saying "nothing": the empty sections, and
+        // sections whose every value is junk.
+        let nothing = [
+            None,
+            captions_of("{}"),
+            captions_of(r#"{"words":{}}"#),
+            captions_of(r#"{"enter":{},"exit":{}}"#),
+            captions_of(
+                r##"{"words":{"mode":"sideways","fill":"wipe","upcoming":{"color":"red","opacity":"half"},
+                    "keyword":{"scale":"big"},"attack_ease":"wobble","hold_ms":"x"},
+                    "enter":{"kind":"spin","ms":"x","ease":"wobble"},"exit":{"kind":"slide_left","ms":null}}"##,
+            ),
+        ];
+        assert_eq!(head.len(), 48);
+        for &(style, a, hash, len) in head {
+            for cap in &nothing {
+                let o = AssOpts {
+                    anim: anims[a],
+                    captions: cap.clone(),
+                    ..AssOpts::default()
+                };
+                let s = build_for(&ws, style, 0.0, &o);
+                assert_eq!((fnv(&s), s.len()), (hash, len), "{style} {a} {cap:?}\n{s}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_state_field_switches_at_the_words_start_and_back_at_its_end() {
+        // "I" is spoken from 0.40 to 0.75, in a static line that runs 0 to 1.55.
+        let one = |json: &str| {
+            let a = st(json);
+            let e = ev(&a, "I");
+            assert_eq!(e.len(), 1, "{a}");
+            tg(e[0]).to_string()
+        };
+        // Colour: unsung colour first, the active colour at the start, the
+        // spoken colour at the end.
+        let t = one(r##""words":{"active":{"color":"#FF0000"},"spoken":{"color":"#00FF00"}}"##);
+        assert!(t.contains("\\1c&HFFFFFF&"), "{t}");
+        assert!(t.contains("\\t(400,400,\\1c&H0000FF&)"), "{t}");
+        assert!(t.contains("\\t(750,750,\\1c&H00FF00&)"), "{t}");
+        // Upcoming colour.
+        let t = one(r##""words":{"upcoming":{"color":"#112233"}}"##);
+        assert!(t.contains("\\1c&H332211&"), "{t}");
+        // Opacity (0.5 -> alpha 0x80, 0.25 -> 0xBF).
+        let t = one(r#""words":{"upcoming":{"opacity":0.5},"spoken":{"opacity":0.25}}"#);
+        assert!(t.contains("\\alpha&H80&"), "{t}");
+        assert!(t.contains("\\t(400,400,\\alpha&H00&)"), "{t}");
+        assert!(t.contains("\\t(750,750,\\alpha&HBF&)"), "{t}");
+        // Active opacity under an opaque upcoming word.
+        let t = one(r#""words":{"active":{"opacity":0.5}}"#);
+        assert!(t.contains("\\t(400,400,\\alpha&H80&)"), "{t}");
+        // Scale.
+        let t = one(r#""words":{"upcoming":{"scale":0.8},"active":{"scale":1.2}}"#);
+        assert!(t.contains("\\fscx80\\fscy80"), "{t}");
+        assert!(t.contains("\\t(400,400,\\fscx120\\fscy120)"), "{t}");
+        assert!(t.contains("\\t(750,750,\\fscx100\\fscy100)"), "{t}");
+        let t = one(r#""words":{"spoken":{"scale":1.5}}"#);
+        assert!(t.contains("\\t(750,750,\\fscx150\\fscy150)"), "{t}");
+        // Blur (px at 1080 wide, a 1080-wide canvas here).
+        let t = one(r#""words":{"upcoming":{"blur":3},"spoken":{"blur":2}}"#);
+        assert!(t.contains("\\blur3"), "{t}");
+        assert!(t.contains("\\t(400,400,\\blur0)"), "{t}");
+        assert!(t.contains("\\t(750,750,\\blur2)"), "{t}");
+    }
+
+    #[test]
+    fn lift_and_rotate_move_only_the_active_word() {
+        // Lift 0.1 em of a 64 px face is 6.4 px up while "I" is active: the
+        // word sits at its slot, then 6.4 px higher from 0.40 to 0.75, then back.
+        let a = st(r#""words":{"active":{"lift":0.1}}"#);
+        let e = ev(&a, "I");
+        assert_eq!(e.len(), 3, "{a}");
+        let ys: Vec<f64> = e.iter().map(|l| at(l).1).collect();
+        assert!((ys[0] - ys[1] - 6.4).abs() < 0.11, "{ys:?}");
+        assert!((ys[0] - ys[2]).abs() < 0.11, "{ys:?}");
+        assert!(
+            start(e[1]) == "0:00:00.40" && end(e[1]) == "0:00:00.75",
+            "{a}"
+        );
+        // "so" lifts for its own span and then sits down: two pieces, the
+        // second at the slot, like the one before "I".
+        let so = ev(&a, "so");
+        assert_eq!(so.len(), 2, "{a}");
+        assert!((at(so[1]).1 - ys[0]).abs() < 0.11, "{a}");
+        // Negative lift goes down.
+        let a = st(r#""words":{"active":{"lift":-0.1}}"#);
+        let e = ev(&a, "I");
+        assert!(at(e[1]).1 > at(e[0]).1 + 6.0);
+        // Rotate is clockwise: ASS turns the other way.
+        // Tilt moves nothing, so it is a step inside the one event.
+        let a = st(r#""words":{"active":{"rotate":5}}"#);
+        let e = ev(&a, "I");
+        assert_eq!(e.len(), 1, "{a}");
+        assert!(tg(e[0]).contains("\\t(400,400,\\frz-5)"), "{a}");
+        assert!(tg(e[0]).contains("\\t(750,750,\\frz0)"), "{a}");
+        let a = st(r#""words":{"active":{"rotate":-3}}"#);
+        assert!(tg(ev(&a, "I")[0]).contains("\\t(400,400,\\frz3)"), "{a}");
+        // A word that starts the line is tilted from the first frame, and a
+        // keyword (which lights in its own colour) puts its tilt down too.
+        let a = st(r#""words":{"active":{"rotate":5}}"#);
+        assert!(tg(ev(&a, "so")[0]).contains("\\frz-5"), "{a}");
+        assert!(
+            tg(ev(&a, "million")[0]).contains("\\t(350,350,\\frz0)"),
+            "{a}"
+        );
+        // A gentle attack lifts in steps along a straight move.
+        let a = st(r#""words":{"attack_ms":200,"attack_ease":"linear","active":{"lift":0.1}}"#);
+        let e = ev(&a, "I");
+        assert!(tg(e[1]).starts_with("\\an5\\q2\\move("), "{a}");
+        let (y0, y1) = (at(e[1]).1, to(e[1]).1);
+        assert!(y1 < y0, "{y0} {y1}");
+        assert!(start(e[1]) == "0:00:00.40", "{a}");
+    }
+
+    #[test]
+    fn attack_hold_and_release_land_on_the_expected_centiseconds() {
+        // "I": starts 0.40, ends 0.75. Attack 200 ms from the start: 400..600.
+        // Hold 100 ms after the end: 850. Release 500 ms: 850..1350.
+        let json = r#""words":{"upcoming":{"opacity":0.5},"spoken":{"opacity":0.25},
+            "attack_ms":200,"attack_ease":"linear","hold_ms":100,"release_ms":500,"release_ease":"linear"}"#;
+        let a = st(json);
+        let e = ev(&a, "I");
+        assert_eq!(e.len(), 1, "{a}");
+        let t = tg(e[0]);
+        assert!(t.contains("\\t(400,600,\\alpha&H00&)"), "{t}");
+        assert!(t.contains("\\t(850,1350,\\alpha&HBF&)"), "{t}");
+        // The line (and its event) is cut at 1.55: a release past that is cut.
+        let e3 = ev(&a, "3");
+        assert!(end(e3[0]) == "0:00:01.55", "{a}");
+        assert!(!tg(e3[0]).contains("\\t(1550"), "{a}");
+        // "3" is the last word: its attack runs from its own start, and its
+        // release would only begin at the line's end, so it is never drawn.
+        assert!(tg(e3[0]).contains("\\t(1200,1400,\\alpha&H00&"), "{a}");
+        assert!(!tg(e3[0]).contains("&HBF&"), "{a}");
+        // The hold keeps the look past the word's end: no hold, release at 750.
+        let a = st(
+            r#""words":{"upcoming":{"opacity":0.5},"spoken":{"opacity":0.25},"release_ms":500,"release_ease":"linear"}"#,
+        );
+        assert!(tg(ev(&a, "I")[0]).contains("\\t(750,1250,\\alpha&HBF&)"));
+        // An attack longer than the word holds the release back until it is done.
+        let a = st(
+            r#""words":{"upcoming":{"opacity":0.5},"spoken":{"opacity":0.25},"attack_ms":400,"attack_ease":"linear","release_ms":100,"release_ease":"linear"}"#,
+        );
+        let t = tg(ev(&a, "I")[0]).to_string();
+        assert!(t.contains("\\t(400,800,\\alpha&H00&)"), "{t}");
+        assert!(t.contains("\\t(800,900,\\alpha&HBF&)"), "{t}");
+    }
+
+    #[test]
+    fn a_release_overlaps_the_next_words_attack() {
+        // "so" ends at 0.35 and trails for 600 ms; "I" is lit from 0.40.
+        let a = st(
+            r##""words":{"active":{"color":"#FF0000"},"spoken":{"color":"#00FF00"},"release_ms":600,"release_ease":"linear"}"##,
+        );
+        let so = tg(ev(&a, "so")[0]).to_string();
+        let i = tg(ev(&a, "I")[0]).to_string();
+        assert!(so.contains("\\t(350,950,\\1c&H00FF00&)"), "{so}");
+        assert!(i.contains("\\t(400,400,\\1c&H0000FF&)"), "{i}");
+        // Both are on screen over the same moments: events share the line's span.
+        assert_eq!(start(ev(&a, "so")[0]), start(ev(&a, "I")[0]));
+    }
+
+    #[test]
+    fn every_ease_is_an_acceleration_or_a_two_step_back() {
+        let run = |ease: &str| {
+            let a = st(&format!(
+                r##""words":{{"active":{{"color":"#FF0000","scale":1.2}},"spoken":{{"color":"#00FF00","scale":1}},
+                    "hold_ms":100,"release_ms":500,"release_ease":"{ease}"}}"##
+            ));
+            tg(ev(&a, "I")[0]).to_string()
+        };
+        let lin = run("linear");
+        assert!(
+            lin.contains("\\t(850,1350,\\fscx100\\fscy100\\1c&H00FF00&)"),
+            "{lin}"
+        );
+        let out = run("out");
+        assert!(
+            out.contains("\\t(850,1350,0.5,\\fscx100\\fscy100\\1c&H00FF00&)"),
+            "{out}"
+        );
+        let inn = run("in");
+        assert!(
+            inn.contains("\\t(850,1350,2,\\fscx100\\fscy100\\1c&H00FF00&)"),
+            "{inn}"
+        );
+        // Back: colour just eases out; the scale runs 10% past its target (98
+        // for 120 -> 100), 58% of the way, and settles.
+        let back = run("back");
+        assert!(back.contains("\\t(850,1350,0.5,\\1c&H00FF00&)"), "{back}");
+        assert!(
+            back.contains("\\t(850,1140,0.4,\\fscx98\\fscy98)"),
+            "{back}"
+        );
+        assert!(back.contains("\\t(1140,1350,\\fscx100\\fscy100)"), "{back}");
+        // The same on the way in.
+        let att = |ease: &str| {
+            let a = st(&format!(
+                r#""words":{{"upcoming":{{"opacity":0.5}},"attack_ms":200,"attack_ease":"{ease}"}}"#
+            ));
+            tg(ev(&a, "I")[0]).to_string()
+        };
+        assert!(att("linear").contains("\\t(400,600,\\alpha&H00&)"));
+        assert!(att("out").contains("\\t(400,600,0.5,\\alpha&H00&)"));
+        assert!(att("in").contains("\\t(400,600,2,\\alpha&H00&)"));
+        assert!(att("back").contains("\\t(400,600,0.5,\\alpha&H00&)"));
+        // Defaults: out on both.
+        assert!(att("wobble").contains("\\t(400,600,0.5,\\alpha&H00&)"));
+    }
+
+    #[test]
+    fn snap_turns_active_at_once_and_sweep_runs_across_the_word() {
+        // "I" is 350 ms long and starts 400 ms into its line.
+        let snap = st(r##""words":{"active":{"color":"#FF0000"}}"##);
+        assert!(!snap.contains("\\kf"), "{snap}");
+        let sweep = st(r##""words":{"fill":"sweep","active":{"color":"#FF0000"}}"##);
+        let t = tg(ev(&sweep, "I")[0]).to_string();
+        assert!(t.contains("\\1c&H0000FF&\\2c&HFFFFFF&\\k40\\kf35"), "{t}");
+        // The first word of a line starts its sweep at once.
+        assert!(
+            tg(ev(&sweep, "so")[0]).contains("\\2c&HFFFFFF&\\kf35"),
+            "{sweep}"
+        );
+        // Nothing to sweep when the colour does not change.
+        let same = st(r##""words":{"fill":"sweep","active":{"color":"#FFFFFF"}}"##);
+        let t = tg(ev(&same, "I")[0]).to_string();
+        assert!(!t.contains("\\kf") && !t.contains("\\2c"), "{t}");
+        // A sweep that is cut into moving slices keeps its place in the word.
+        let a = st(
+            r##""words":{"fill":"sweep","attack_ms":200,"attack_ease":"linear","active":{"color":"#FF0000","lift":0.1}}"##,
+        );
+        let e = ev(&a, "I");
+        // The piece after the 200 ms lift starts 200 ms into the sweep: it began
+        // 20 centiseconds ago.
+        assert!(e.iter().any(|l| tg(l).contains("\\k-20\\kf35")), "{a}");
+    }
+
+    #[test]
+    fn modes_all_build_and_single() {
+        let a = st(r#""words":{"mode":"all","upcoming":{"opacity":0.5}}"#);
+        assert_eq!(start(ev(&a, "I")[0]), "0:00:00.00");
+        // Build: a word has no event before it is spoken.
+        let b = st(r#""words":{"mode":"build"}"#);
+        assert_eq!(start(ev(&b, "so")[0]), "0:00:00.00");
+        assert_eq!(start(ev(&b, "I")[0]), "0:00:00.40");
+        assert_eq!(start(ev(&b, "made")[0]), "0:00:00.80");
+        assert_eq!(end(ev(&b, "made")[0]), "0:00:01.55");
+        // ...and it comes in at its own start (default attack: 80 ms from nothing).
+        assert!(tg(ev(&b, "I")[0]).contains("\\alpha&HFF&"), "{b}");
+        assert!(
+            tg(ev(&b, "I")[0]).contains("\\t(0,80,0.5,\\alpha&H00&)"),
+            "{b}"
+        );
+        // The slots are the line's whole layout from the start: "so" does not
+        // move when later words arrive.
+        let x_so: Vec<f64> = ev(&b, "so").iter().map(|l| at(l).0).collect();
+        assert!(x_so.iter().all(|x| (x - x_so[0]).abs() < 0.11), "{x_so:?}");
+        // Single: one word at a time, each up until the next one starts, all at
+        // the same spot.
+        let s = st(r#""words":{"mode":"single"}"#);
+        let (so, i, made) = (ev(&s, "so"), ev(&s, "I"), ev(&s, "made"));
+        assert_eq!((start(so[0]), end(so[0])), ("0:00:00.00", "0:00:00.40"));
+        assert_eq!((start(i[0]), end(i[0])), ("0:00:00.40", "0:00:00.80"));
+        assert_eq!(start(made[0]), "0:00:00.80");
+        assert_eq!(end(ev(&s, "3")[0]), "0:00:01.55");
+        assert!((at(so[0]).0 - at(i[0]).0).abs() < 0.11);
+        assert!((at(so[0]).1 - at(i[0]).1).abs() < 0.11);
+        // A spoken look that is invisible clears the word when its release ends.
+        let s = st(
+            r#""words":{"mode":"single","spoken":{"opacity":0},"release_ms":100,"release_ease":"linear"}"#,
+        );
+        assert_eq!(end(ev(&s, "so")[0]), "0:00:00.40");
+        let s = st(
+            r#""words":{"mode":"single","spoken":{"opacity":0},"release_ms":20,"release_ease":"linear"}"#,
+        );
+        assert_eq!(end(ev(&s, "so")[0]), "0:00:00.37");
+        // Only one word is ever on screen.
+        let s = st(r#""words":{"mode":"single"}"#);
+        let mut spans: Vec<(f64, f64)> = dialogues(&s)
+            .iter()
+            .map(|l| (stamp_secs(start(l)), stamp_secs(end(l))))
+            .collect();
+        spans.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for w in spans.windows(2) {
+            assert!(w[1].0 >= w[0].1 - 1e-9, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn keywords_light_in_their_colour_and_scale_by_the_keyword_scale() {
+        // "million" opens line 2 (spoken 1.60 to 1.95) and is a keyword.
+        let hd = |json: &str| {
+            let a = st(json);
+            tg(ev(&a, "million")[0]).to_string()
+        };
+        // The keyword colour (the style's accent: yellow) replaces the active
+        // colour, and is what stays once it is spoken.
+        let t = hd(r##""words":{"active":{"color":"#FF0000"}}"##);
+        assert!(t.contains("\\1c&H00FFFF&"), "{t}");
+        assert!(!t.contains("\\t("), "{t}");
+        // An ordinary word takes the active colour.
+        let a = st(r##""words":{"active":{"color":"#FF0000"}}"##);
+        assert!(
+            tg(ev(&a, "dollars")[0]).contains("\\t(400,400,\\1c&H0000FF&)"),
+            "{a}"
+        );
+        // The v1 accent is the default keyword colour; the v2 colour beats it.
+        let t = hd(r##""accent":"#00FF00","words":{"active":{"color":"#FF0000"}}"##);
+        assert!(t.contains("\\1c&H00FF00&"), "{t}");
+        let t = hd(
+            r##""accent":"#00FF00","words":{"keyword":{"color":"#FF00FF"},"active":{"color":"#FF0000"}}"##,
+        );
+        assert!(t.contains("\\1c&HFF00FF&"), "{t}");
+        // An explicit spoken colour wins over the keyword colour once spoken.
+        let t = hd(r##""words":{"spoken":{"color":"#888888"}}"##);
+        assert!(t.contains("\\t(350,350,\\1c&H888888&)"), "{t}");
+        // Keyword scale multiplies the active and spoken scales.
+        let t = hd(r#""words":{"keyword":{"scale":1.3}}"#);
+        assert!(t.contains("\\fscx130\\fscy130"), "{t}");
+        let t = hd(
+            r#""words":{"keyword":{"scale":1.5},"active":{"scale":1.2},"spoken":{"scale":0.8}}"#,
+        );
+        assert!(t.contains("\\fscx180\\fscy180"), "{t}");
+        assert!(t.contains("\\t(350,350,\\fscx120\\fscy120)"), "{t}");
+        // Today's bump stays with the pop entrance: 14% up, then back, when the
+        // word starts after the entrance has settled (and not with a keyword scale).
+        let bump = |json: &str| {
+            let a = build_look("minimal", json);
+            ev(&a, "3").iter().any(|l| tg(l).contains("\\fscx114"))
+        };
+        let a = build_look("minimal", r#"{"words":{"upcoming":{"opacity":0.9}}}"#);
+        // "3" starts 1200 ms in, and its event began at 200 ms: 90 up, 150 back.
+        assert!(
+            tg(ev(&a, "3").last().unwrap())
+                .contains("\\t(1000,1090,\\fscx114\\fscy114)\\t(1090,1240,\\fscx100\\fscy100)"),
+            "{a}"
+        );
+        assert!(!bump(r#"{"words":{"keyword":{"scale":1.1}}}"#));
+        assert!(!bump(
+            r#"{"anim":"fade","words":{"upcoming":{"opacity":0.9}}}"#
+        ));
+    }
+
+    #[test]
+    fn out_of_range_and_bad_word_values_fall_back() {
+        let same = |bad: &str, good: &str| {
+            assert_eq!(
+                build_look("minimal", &format!(r#"{{"words":{bad}}}"#)),
+                build_look("minimal", &format!(r#"{{"words":{good}}}"#)),
+                "{bad}"
+            );
+        };
+        same(
+            r#"{"upcoming":{"opacity":3}}"#,
+            r#"{"upcoming":{"opacity":1}}"#,
+        );
+        same(
+            r#"{"upcoming":{"opacity":-1}}"#,
+            r#"{"upcoming":{"opacity":0}}"#,
+        );
+        same(r#"{"active":{"scale":9}}"#, r#"{"active":{"scale":1.5}}"#);
+        same(r#"{"active":{"scale":0.1}}"#, r#"{"active":{"scale":0.5}}"#);
+        same(r#"{"upcoming":{"blur":99}}"#, r#"{"upcoming":{"blur":10}}"#);
+        same(
+            r#"{"active":{"lift":5,"rotate":99}}"#,
+            r#"{"active":{"lift":0.3,"rotate":10}}"#,
+        );
+        same(
+            r#"{"active":{"lift":-5,"rotate":-99}}"#,
+            r#"{"active":{"lift":-0.3,"rotate":-10}}"#,
+        );
+        same(r#"{"attack_ms":9999}"#, r#"{"attack_ms":400}"#);
+        same(
+            r#"{"hold_ms":9999,"release_ms":99999}"#,
+            r#"{"hold_ms":600,"release_ms":2000}"#,
+        );
+        same(r#"{"hold_ms":-4}"#, r#"{"hold_ms":0}"#);
+        // Fields a state does not have are ignored, and bad enums and colours
+        // count as absent.
+        same(
+            r#"{"upcoming":{"lift":0.2,"rotate":4,"opacity":0.8},"active":{"blur":5}}"#,
+            r#"{"upcoming":{"opacity":0.8}}"#,
+        );
+        same(
+            r##"{"mode":"sideways","fill":"wipe","attack_ease":"wobble","active":{"color":"#12345"},"upcoming":{"opacity":0.8}}"##,
+            r#"{"upcoming":{"opacity":0.8}}"#,
+        );
+        let ent = |bad: &str, good: &str| {
+            assert_eq!(
+                build_look("minimal", &format!(r#"{{"enter":{bad}}}"#)),
+                build_look("minimal", &format!(r#"{{"enter":{good}}}"#)),
+                "{bad}"
+            );
+        };
+        ent(
+            r#"{"kind":"slide_up","ms":99999}"#,
+            r#"{"kind":"slide_up","ms":800}"#,
+        );
+        ent(r#"{"kind":"zoom","ms":-5}"#, r#"{"kind":"zoom","ms":0}"#);
+        ent(r#"{"kind":"fade","ease":"wobble"}"#, r#"{"kind":"fade"}"#);
+        let ex = |bad: &str, good: &str| {
+            assert_eq!(
+                build_look("minimal", &format!(r#"{{"exit":{bad}}}"#)),
+                build_look("minimal", &format!(r#"{{"exit":{good}}}"#)),
+                "{bad}"
+            );
+        };
+        ex(
+            r#"{"kind":"zoom","ms":99999}"#,
+            r#"{"kind":"zoom","ms":600}"#,
+        );
+        // A kind with no time is no motion.
+        assert_eq!(
+            build_look(
+                "minimal",
+                r#"{"enter":{"kind":"zoom","ms":0},"exit":{"kind":"fade","ms":0}}"#
+            ),
+            build_look(
+                "minimal",
+                r#"{"enter":{"kind":"none"},"exit":{"kind":"none"}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn v1_anim_maps_onto_mode_and_motion_and_v2_wins() {
+        let nudge = r#""upcoming":{"opacity":0.9}"#;
+        let look = |anim: &str, extra: &str| {
+            build_look(
+                "minimal",
+                &format!(r#"{{"anim":"{anim}","words":{{{nudge}{extra}}}}}"#),
+            )
+        };
+        // words -> build + pop
+        let w = look("words", "");
+        assert_eq!(start(ev(&w, "I")[0]), "0:00:00.40", "{w}");
+        assert!(tg(ev(&w, "so")[0]).contains("\\fscx84\\fscy84"), "{w}");
+        // An explicit mode beats it; the entrance stays.
+        let w = look("words", r#","mode":"all""#);
+        assert_eq!(start(ev(&w, "I")[0]), "0:00:00.00", "{w}");
+        // The flat option means the same: the Look's own words beat it.
+        let o = AssOpts {
+            anim: Anim::Words,
+            ..with(r#"{"words":{"mode":"all","upcoming":{"opacity":0.9}}}"#)
+        };
+        let w = build_for(&sample(), "minimal", 0.0, &o);
+        assert_eq!(start(ev(&w, "I")[0]), "0:00:00.00", "{w}");
+        let o = AssOpts {
+            anim: Anim::Words,
+            ..with(r#"{"words":{"upcoming":{"opacity":0.9}}}"#)
+        };
+        let w = build_for(&sample(), "minimal", 0.0, &o);
+        assert_eq!(start(ev(&w, "I")[0]), "0:00:00.40", "{w}");
+        // pop -> pop in, a 60 ms fade out
+        let p = look("pop", "");
+        let e = ev(&p, "so");
+        assert!(tg(e[0]).contains("\\fscx84\\fscy84"), "{p}");
+        assert!(tg(e.last().unwrap()).contains("\\t("), "{p}");
+        assert!(tg(e.last().unwrap()).contains("\\alpha&HFF&)"), "{p}");
+        // none -> no entrance, no exit
+        let n = look("none", "");
+        let t = tg(ev(&n, "so")[0]).to_string();
+        assert!(
+            !t.contains("fsc") && !t.contains("\\move") && !t.contains("\\alpha&HFF&"),
+            "{t}"
+        );
+        // fade -> fades in, no scale
+        let f = look("fade", "");
+        let t = tg(ev(&f, "so")[0]).to_string();
+        assert!(t.contains("\\alpha&HFF&") && !t.contains("fsc"), "{t}");
+        // slide -> rises
+        let s = look("slide", "");
+        assert!(tg(ev(&s, "so")[0]).contains("\\move("), "{s}");
+        // bounce -> deeper start
+        let b = look("bounce", "");
+        assert!(tg(ev(&b, "so")[0]).contains("\\fscx70\\fscy70"), "{b}");
+        // v2 enter beats the shorthand's, kind by kind.
+        let s = build_look(
+            "minimal",
+            &format!(r#"{{"anim":"slide","enter":{{"kind":"fade"}},"words":{{{nudge}}}}}"#),
+        );
+        let t = tg(ev(&s, "so")[0]).to_string();
+        assert!(t.contains("\\alpha&HFF&") && !t.contains("\\move"), "{t}");
+        // A time alone keeps the shorthand's kind.
+        let s = build_look(
+            "minimal",
+            r#"{"anim":"slide","enter":{"ms":400},"exit":{"ms":300}}"#,
+        );
+        assert!(tg(ev(&s, "so")[0]).contains("\\move("), "{s}");
+        // A static shorthand with word looks keeps the static grouping: the
+        // lines run exactly the words' span.
+        let st_ = look("none", "");
+        assert!(
+            dialogues(&st_)
+                .iter()
+                .any(|l| l.contains("0:00:00.00,0:00:01.55,")),
+            "{st_}"
+        );
+    }
+
+    fn secs_of(s: &str) -> f64 {
+        stamp_secs(s)
+    }
+
+    #[test]
+    fn every_entrance_kind_starts_where_it_should() {
+        let first = |kind: &str| {
+            let a = build_look(
+                "minimal",
+                &format!(r#"{{"enter":{{"kind":"{kind}","ms":300,"ease":"linear"}}}}"#),
+            );
+            let e: Vec<String> = ev(&a, "so").iter().map(|s| s.to_string()).collect();
+            e
+        };
+        let last_y = |e: &[String]| at(e.last().unwrap()).1;
+        let last_x = |e: &[String]| at(e.last().unwrap()).0;
+        // none: the line is just there.
+        let n = first("none");
+        assert!(
+            !tg(&n[0]).contains("\\move") && !tg(&n[0]).contains("\\t(0,"),
+            "{n:?}"
+        );
+        // pop 0.84, zoom 0.6, bounce 0.7: the line starts smaller.
+        assert!(tg(&first("pop")[0]).contains("\\fscx84\\fscy84"));
+        assert!(tg(&first("zoom")[0]).contains("\\fscx60\\fscy60"));
+        assert!(tg(&first("bounce")[0]).contains("\\fscx70\\fscy70"));
+        // fade and blur start clear; blur starts soft.
+        assert!(tg(&first("fade")[0]).contains("\\alpha&HFF&"));
+        let b = first("blur");
+        assert!(
+            tg(&b[0]).contains("\\blur8") && tg(&b[0]).contains("\\alpha&HFF&"),
+            "{b:?}"
+        );
+        // slides start 2.2% of the height lower / higher, 4% of the width right / left.
+        let e = first("slide_up");
+        assert!((at(&e[0]).1 - last_y(&e) - 42.2).abs() < 0.3, "{e:?}");
+        let e = first("slide_down");
+        assert!((at(&e[0]).1 - last_y(&e) + 42.2).abs() < 0.3, "{e:?}");
+        let e = first("slide_left");
+        assert!((at(&e[0]).0 - last_x(&e) - 43.2).abs() < 0.3, "{e:?}");
+        let e = first("slide_right");
+        assert!((at(&e[0]).0 - last_x(&e) + 43.2).abs() < 0.3, "{e:?}");
+        // drop starts 6% of the height above.
+        let e = first("drop");
+        assert!((at(&e[0]).1 - last_y(&e) + 115.2).abs() < 0.3, "{e:?}");
+        // The entrance is over in the time given: the word is at rest after 300 ms.
+        let e = first("slide_up");
+        let rest = e.iter().find(|l| secs_of(start(l)) >= 0.3 - 1e-9).unwrap();
+        assert!(tg(rest).contains("\\pos("), "{rest}");
+        // Every kind ends at rest, at the same place.
+        for k in [
+            "pop",
+            "fade",
+            "slide_up",
+            "slide_down",
+            "slide_left",
+            "slide_right",
+            "zoom",
+            "bounce",
+            "blur",
+            "drop",
+        ] {
+            let e = first(k);
+            let l = e.last().unwrap();
+            assert!(tg(l).contains("\\pos("), "{k}: {l}");
+        }
+    }
+
+    #[test]
+    fn entrance_ease_shapes_the_travel() {
+        let ys = |ease: &str| {
+            let a = build_look(
+                "minimal",
+                &format!(r#"{{"enter":{{"kind":"slide_up","ms":400,"ease":"{ease}"}}}}"#),
+            );
+            ev(&a, "so").iter().map(|l| at(l).1).collect::<Vec<_>>()
+        };
+        let rest = |v: &[f64]| *v.last().unwrap();
+        // How far the line has come at 100 ms (a quarter of the time).
+        let travelled = |ease: &str| {
+            let a = build_look(
+                "minimal",
+                &format!(r#"{{"enter":{{"kind":"slide_up","ms":400,"ease":"{ease}"}}}}"#),
+            );
+            let e = ev(&a, "so");
+            let r = at(e.last().unwrap()).1;
+            let l = e
+                .iter()
+                .find(|l| secs_of(start(l)) >= 0.1 - 1e-9)
+                .copied()
+                .unwrap_or(e[0]);
+            (at(e[0]).1 - at(l).1) / (at(e[0]).1 - r)
+        };
+        let (lin, out, inn) = (travelled("linear"), travelled("out"), travelled("in"));
+        assert!(out > lin + 0.1 && inn < lin - 0.1, "{lin} {out} {inn}");
+        // Back runs past the end and settles: some slice goes above the rest
+        // position... for a rising slide, past it is higher (smaller y).
+        let b = ys("back");
+        assert!(b.iter().any(|y| *y < rest(&b) - 0.5), "{b:?}");
+        let l = ys("linear");
+        assert!(l.iter().all(|y| *y >= rest(&l) - 0.11), "{l:?}");
+    }
+
+    #[test]
+    fn every_exit_kind_ends_where_it_should() {
+        let last = |kind: &str, ms: u32| {
+            let a = build_look(
+                "minimal",
+                &format!(r#"{{"exit":{{"kind":"{kind}","ms":{ms}}}}}"#),
+            );
+            let e = ev(&a, "year.");
+            (a.clone(), e.last().unwrap().to_string(), e.len())
+        };
+        // none: a hard cut, nothing happens at the end.
+        let (_, e, _) = last("none", 200);
+        assert!(!tg(&e).contains("\\t("), "{e}");
+        // fade: 100 ms of fading out, ending clear exactly at the line's end.
+        let (a, e, _) = last("fade", 100);
+        let ends = secs_of(end(&e));
+        assert!(tg(&e).contains("\\alpha&HFF&)"), "{a}\n{e}");
+        let from = tg(&e)
+            .split("\\t(")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        let line_ms = (ends - secs_of(start(&e))) * 1000.0;
+        assert!(
+            (line_ms - from - 100.0).abs() <= 10.0,
+            "{line_ms} {from}\n{e}"
+        );
+        // zoom shrinks to 60%, blur to 8, slides 2.2% of the height.
+        let (_, e, _) = last("zoom", 200);
+        assert!(tg(&e).contains("\\fscx60\\fscy60"), "{e}");
+        let (_, e, _) = last("blur", 200);
+        assert!(
+            tg(&e).contains("\\blur8") && tg(&e).contains("\\alpha&HFF&"),
+            "{e}"
+        );
+        let (_, e, _) = last("slide_up", 200);
+        let (_, y1) = to(&e);
+        let (a0, _, _) = last("none", 200);
+        let rest_y = at(ev(&a0, "year.").last().unwrap()).1;
+        assert!((rest_y - y1 - 42.2).abs() < 0.3, "{rest_y} {y1}");
+        let (_, e, _) = last("slide_down", 200);
+        assert!((to(&e).1 - rest_y - 42.2).abs() < 0.3, "{e}");
+        // A longer exit starts earlier.
+        let (_, long, n_long) = last("fade", 400);
+        let (_, short, n_short) = last("fade", 100);
+        assert!(secs_of(start(&long)) <= secs_of(start(&short)) + 1e-9);
+        assert!(n_long >= 1 && n_short >= 1);
+    }
+
+    #[test]
+    fn the_line_stays_put_when_a_word_scales_lifts_or_tilts() {
+        // Wherever a word goes in time, its slot's x never changes and, without
+        // lift, neither does its y: the neighbours do not move.
+        let a = st(
+            r#""words":{"active":{"scale":1.4,"rotate":3},"spoken":{"scale":1.2},"attack_ms":200,"release_ms":300}"#,
+        );
+        for w in ["so", "I", "made", "3"] {
+            let e = ev(&a, w);
+            let (x0, y0) = at(e[0]);
+            for l in &e {
+                let (x, y) = at(l);
+                assert!((x - x0).abs() < 0.11 && (y - y0).abs() < 0.11, "{w}: {l}");
+            }
+        }
+        // With lift only the y moves.
+        let a =
+            st(r#""words":{"active":{"lift":0.2,"scale":1.3},"attack_ms":160,"release_ms":300}"#);
+        for w in ["so", "I", "made", "3"] {
+            let e = ev(&a, w);
+            let x0 = at(e[0]).0;
+            assert!(e.iter().all(|l| (at(l).0 - x0).abs() < 0.11), "{w}");
+        }
+        // A line that wraps wraps the same way for its whole life.
+        let a = build_look(
+            "minimal",
+            r#"{"anim":"none","size":2,"words":{"active":{"scale":1.5},"spoken":{"scale":1.25},"release_ms":200}}"#,
+        );
+        for w in ["million", "dollars", "last", "year."] {
+            let e = ev(&a, w);
+            let (x0, y0) = at(e[0]);
+            assert!(
+                e.iter()
+                    .all(|l| (at(l).0 - x0).abs() < 0.11 && (at(l).1 - y0).abs() < 0.11),
+                "{w}"
+            );
+        }
+        let ys: std::collections::BTreeSet<i64> = ["million", "dollars", "last", "year."]
+            .iter()
+            .map(|w| at(ev(&a, w)[0]).1.round() as i64)
+            .collect();
+        assert!(ys.len() >= 2, "a 128 px line of four words wraps: {ys:?}");
+    }
+
+    #[test]
+    fn a_wrapped_line_is_a_block_centred_on_its_anchor() {
+        // Two rows of four slots: the block's middle is where one row's would be.
+        let one = build_look("minimal", r#"{"anim":"none","words":{"mode":"all"}}"#);
+        let two = build_look(
+            "minimal",
+            r#"{"anim":"none","size":2,"words":{"mode":"all"}}"#,
+        );
+        let mid = |a: &str| {
+            let ys: Vec<f64> = ["so", "I", "made", "3"]
+                .iter()
+                .map(|w| at(ev(a, w)[0]).1)
+                .collect();
+            (ys.iter().cloned().fold(f64::MAX, f64::min)
+                + ys.iter().cloned().fold(f64::MIN, f64::max))
+                / 2.0
+        };
+        // Bottom-anchored: the block's bottom edge stays at the margin, so two
+        // rows sit higher than one by half a row.
+        assert!(mid(&one) > mid(&two), "{} {}", mid(&one), mid(&two));
+    }
+
+    #[test]
+    fn a_box_is_drawn_once_per_row_and_follows_the_line() {
+        let a = build_look("hormozi", r#"{"words":{"upcoming":{"opacity":0.5}}}"#);
+        let style = style_line(&a, "HormoziBox");
+        assert_eq!(style[15], "3");
+        // The text style has no box.
+        assert_eq!(style_line(&a, "Hormozi")[15], "1");
+        let boxes: Vec<&str> = a.lines().filter(|l| l.contains(",HormoziBox,")).collect();
+        assert!(!boxes.is_empty());
+        // The box event comes before its words and carries the line's fade.
+        let first_box = a.find(",HormoziBox,").unwrap();
+        let first_word = a.find(",Hormozi,,0,0,0,,{").unwrap();
+        assert!(first_box < first_word, "{a}");
+        assert!(boxes[0].contains("\\3a&H"), "{}", boxes[0]);
+        // Single mode: a box per word, around that word only.
+        let s = build_look("hormozi", r#"{"words":{"mode":"single"}}"#);
+        let n_box = s.lines().filter(|l| l.contains(",HormoziBox,")).count();
+        let n_word = s
+            .lines()
+            .filter(|l| l.contains(",Hormozi,,0,0,0,,{"))
+            .count();
+        assert_eq!(n_box, n_word, "{s}");
+    }
+
+    #[test]
+    fn the_word_model_works_on_every_style_and_canvas() {
+        let look = r##"{"words":{"mode":"build","upcoming":{"opacity":0.4,"blur":2},
+            "active":{"color":"#FFD400","scale":1.1,"lift":0.05,"rotate":-2},"spoken":{"opacity":0.8},
+            "keyword":{"scale":1.2},"fill":"sweep","release_ms":300},
+            "enter":{"kind":"drop","ms":300},"exit":{"kind":"blur","ms":150}}"##;
+        for style in [
+            "karaoke",
+            "hormozi",
+            "minimal",
+            "beast",
+            "neon",
+            "highlight",
+            "ghost",
+            "tiktok",
+        ] {
+            for (w, h) in [(1080, 1920), (1080, 1350), (1080, 1080), (1920, 1080)] {
+                let o = AssOpts { w, h, ..with(look) };
+                let a = build_for(&sample(), style, 0.0, &o);
+                assert!(
+                    a.lines().filter(|l| l.starts_with("Dialogue: 0,")).count() > 10,
+                    "{style}"
+                );
+                // Every override block closes, every time is ordered.
+                for l in a.lines().filter(|l| l.starts_with("Dialogue: 0,")) {
+                    assert_eq!(l.matches('{').count(), l.matches('}').count(), "{l}");
+                    assert!(secs_of(end(l)) > secs_of(start(l)), "{l}");
+                    assert!(!l.contains("NaN") && !l.contains("inf"), "{l}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_minute_of_captions_stays_a_reasonable_event_count() {
+        // 12 words, two lines of six.
+        let ws: Vec<Word> = (0..12)
+            .map(|i| Word {
+                w: [
+                    "Most", "people", "never", "learn", "how", "to", "speak", "on", "camera.",
+                    "Try", "it", "today.",
+                ][i]
+                    .into(),
+                s: 0.3 + i as f64 * 0.4,
+                e: 0.3 + i as f64 * 0.4 + 0.35,
+                conf: None,
+            })
+            .collect();
+        let count = |json: &str| {
+            let o = with(json);
+            let a = build_for(&ws, "karaoke", 0.0, &o);
+            a.lines().filter(|l| l.starts_with("Dialogue: 0,")).count()
+        };
+        let before = count("{}");
+        let after = count(r#"{"words":{"release_ms":400,"spoken":{"opacity":0.6}}}"#);
+        assert!(before <= 6, "{before}");
+        // The word model costs events, but stays in the tens per line.
+        assert!(after < 12 * 14, "{after}");
+        let lift = count(r#"{"words":{"active":{"lift":0.1},"attack_ms":120,"release_ms":300}}"#);
+        assert!(lift < 12 * 24, "{lift}");
     }
 }

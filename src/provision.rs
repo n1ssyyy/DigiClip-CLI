@@ -19,7 +19,7 @@ pub const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-
 pub const YUNET_URL: &str = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2026may.onnx";
 pub const YUNET_FILE: &str = "yunet_2026may.onnx";
 
-const FONTS: &[(&str, &[u8])] = &[
+pub(crate) const FONTS: &[(&str, &[u8])] = &[
     (
         "Anton-Regular.ttf",
         include_bytes!("../resources/fonts/Anton-Regular.ttf"),

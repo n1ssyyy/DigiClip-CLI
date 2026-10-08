@@ -8,6 +8,15 @@
 //!       [--bar <#RRGGBB>] [--logo <png> [--logo-pos tl|tr|bl|br]]
 //!       [--scene flat|crop|letterbox|split]`
 //!
+//! `--strip <n>` writes a strip instead of the usual five moments: stills
+//! every 40 ms from 200 ms before sample word `n` (0-based) starts to one
+//! second after it ends, `still-strip-<ms>ms.png` (the time is the clip clock
+//! in the name), and `strip-sheet.png`, the caption band of all of them in
+//! time order (3 across, 40 ms per tile), to judge a transition at a glance.
+//!
+//! `--at <s>[,<s>...]` writes stills at those clip times only
+//! (`still-at-<ms>ms.png`).
+//!
 //! `--bar` and `--logo` use the real compositor (`look.bar`) and the real
 //! logo filter graph (`look.logo`) on the grey frame, so a bar position or
 //! a logo placement can be seen exactly as a render draws it.
@@ -75,7 +84,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: look_stills <out_dir> [--look <json|@file>] [--style <name>] [--aspect 9:16] \
          [--headline \"<text>\"] [--bar <#RRGGBB>] [--logo <png> [--logo-pos tr]] \
-         [--scene flat|crop|letterbox|split]"
+         [--scene flat|crop|letterbox|split] [--strip <word index>] [--at <s>,<s>...]"
     );
     std::process::exit(2)
 }
@@ -250,6 +259,79 @@ fn composed_background(
     ok.then_some(png)
 }
 
+/// The caption band of a still (rows of the 540-wide stills): around the
+/// first line's position, else where the style's alignment puts it.
+fn caption_band(ass: &str, canvas: Canvas) -> (u32, u32) {
+    let k = 540.0 / canvas.w as f64;
+    let field = |l: &str, i: usize| l.split(',').nth(i).and_then(|v| v.parse::<f64>().ok());
+    let style = ass
+        .lines()
+        .find(|l| l.starts_with("Style: ") && !l.contains("Headline"));
+    let size = style.and_then(|l| field(l, 2)).unwrap_or(80.0);
+    let first = ass
+        .lines()
+        .find(|l| l.starts_with("Dialogue: 0,"))
+        .unwrap_or("");
+    let tag_y = ["\\pos(", "\\move("].iter().find_map(|t| {
+        first
+            .split(t)
+            .nth(1)
+            .and_then(|r| r.split(',').nth(1))
+            .and_then(|y| y.trim_end_matches(')').parse::<f64>().ok())
+    });
+    let h = canvas.h as f64;
+    let cy = tag_y.unwrap_or_else(|| {
+        let (align, mv) = style
+            .map(|l| (field(l, 18).unwrap_or(2.0), field(l, 21).unwrap_or(0.0)))
+            .unwrap_or((2.0, 400.0));
+        match align as u32 {
+            1..=3 => h - mv - size / 2.0,
+            7..=9 => mv + size / 2.0,
+            _ => h / 2.0,
+        }
+    });
+    let band = (size * 2.6 * k).round().max(40.0);
+    let top = (cy * k - band / 2.0).clamp(0.0, (h * k - band).max(0.0));
+    (top.round() as u32 & !1, band as u32 & !1)
+}
+
+/// All of a strip's stills as one sheet, caption band only, 3 across.
+fn strip_sheet(ffmpeg: &Path, dir: &Path, stills: &[PathBuf], ass: &str, canvas: Canvas) {
+    let (top, band) = caption_band(ass, canvas);
+    let list = dir.join("strip-list.txt");
+    let body: String = stills
+        .iter()
+        .map(|p| {
+            format!(
+                "file '{}'\nduration 0.04\n",
+                p.display().to_string().replace('\\', "/")
+            )
+        })
+        .collect();
+    if std::fs::write(&list, body).is_err() {
+        return;
+    }
+    let rows = stills.len().div_ceil(3);
+    let sheet = dir.join("strip-sheet.png");
+    let ok = digiclip_rs::process::command(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "concat", "-safe", "0", "-i"])
+        .arg(&list)
+        .arg("-vf")
+        .arg(format!(
+            "crop=iw:{band}:0:{top},tile=3x{rows}:padding=3:color=0x202020"
+        ))
+        .args(["-frames:v", "1"])
+        .arg(&sheet)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&list);
+    if ok {
+        println!("{} (3 across, 40 ms per tile)", sheet.display());
+    }
+}
+
 fn main() {
     let mut out_dir: Option<PathBuf> = None;
     let (mut look_arg, mut style, mut aspect) =
@@ -257,6 +339,8 @@ fn main() {
     let (mut headline, mut bar, mut logo_file, mut logo_pos) =
         (None, None, None, String::from("tr"));
     let mut scene_arg: Option<String> = None;
+    let mut strip: Option<usize> = None;
+    let mut at: Vec<f64> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -268,6 +352,15 @@ fn main() {
             "--logo" => logo_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--logo-pos" => logo_pos = it.next().unwrap_or_else(|| usage()),
             "--scene" => scene_arg = Some(it.next().unwrap_or_else(|| usage())),
+            "--at" => {
+                at = it
+                    .next()
+                    .unwrap_or_else(|| usage())
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect()
+            }
+            "--strip" => strip = it.next().and_then(|v| v.parse().ok()).or_else(|| usage()),
             _ if a.starts_with("--") => usage(),
             _ if out_dir.is_none() => out_dir = Some(PathBuf::from(a)),
             _ => usage(),
@@ -385,19 +478,22 @@ fn main() {
         (Some(&f), Some(&l)) => (f, l),
         _ => (0.30, 3.90),
     };
-    let mut marks = vec![
+    let mut marks: Vec<(String, f64)> = [
         ("1-start", first + 0.02),
         ("2-mid-pop", first + 0.11),
         ("3-settled", first + 0.60),
         ("4-later-line", last + 0.12),
         ("5-later-settled", last + 0.50),
-    ];
+    ]
+    .iter()
+    .map(|&(n, t)| (n.to_string(), t))
+    .collect();
     // The headline enters at 0: fading in, mid-pop, settled, and (when the
     // Look ends it early) just after it has gone.
     if text.contains("Dialogue: 1,") {
-        marks.insert(0, ("h1-entrance", 0.06));
-        marks.insert(1, ("h2-entrance-mid", 0.22));
-        marks.insert(2, ("h3-settled", 0.80));
+        marks.insert(0, ("h1-entrance".into(), 0.06));
+        marks.insert(1, ("h2-entrance-mid".into(), 0.22));
+        marks.insert(2, ("h3-settled".into(), 0.80));
         if let Some(end) = text
             .lines()
             .find(|l| l.starts_with("Dialogue: 1,"))
@@ -405,8 +501,27 @@ fn main() {
             .map(secs)
             .filter(|&e| e + 0.15 < dur)
         {
-            marks.insert(3, ("h4-after-seconds", end + 0.15));
+            marks.insert(3, ("h4-after-seconds".into(), end + 0.15));
         }
+    }
+    // A strip: fine steps around one word instead.
+    if let Some(n) = strip {
+        let Some(w) = words.get(n) else {
+            eprintln!("--strip: the sample has words 0..{}", words.len() - 1);
+            std::process::exit(2)
+        };
+        let (a, b) = ((w.s - 0.2).max(0.0), w.e + 1.0);
+        marks = (0..)
+            .map(|i| a + 0.04 * i as f64)
+            .take_while(|t| *t <= b + 1e-9)
+            .map(|t| (format!("strip-{:05}ms", (t * 1000.0).round() as i64), t))
+            .collect();
+    }
+    if !at.is_empty() && strip.is_none() {
+        marks = at
+            .iter()
+            .map(|&t| (format!("at-{:05}ms", (t * 1000.0).round() as i64), t))
+            .collect();
     }
     let fonts = digiclip_rs::render::fonts_dir();
     let ass_filter = format!(
@@ -418,6 +533,7 @@ fn main() {
     // the compositor's frame with the engine's own logo overlay.
     let real = bar.is_some() || logo.is_some() || scene != Scene::Flat || look.effects.is_some();
     let mut failed = false;
+    let mut made: Vec<PathBuf> = Vec::new();
     for (name, t) in marks {
         let png = out_dir.join(format!("still-{name}.png"));
         let mut cmd = digiclip_rs::process::command(&ffmpeg);
@@ -467,6 +583,7 @@ fn main() {
             .expect("run ffmpeg");
         if out.status.success() && Path::new(&png).is_file() {
             println!("{} (t={t:.2}s)", png.display());
+            made.push(png.clone());
         } else {
             failed = true;
             eprintln!(
@@ -476,6 +593,9 @@ fn main() {
         }
     }
     let _ = std::fs::remove_file(out_dir.join("background.png"));
+    if strip.is_some() && !made.is_empty() {
+        strip_sheet(&ffmpeg, &out_dir, &made, &text, canvas);
+    }
     println!("{}", ass_path.display());
     if failed {
         std::process::exit(1);

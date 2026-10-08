@@ -21,6 +21,21 @@
 //!   layout:   { split } }
 //! ```
 //!
+//! `captions` also takes the word-level section (all optional, absent = what
+//! the engine renders today):
+//!
+//! ```text
+//! captions: { ...,
+//!   words: { mode: all|build|single, fill: snap|sweep,
+//!            upcoming: { color, opacity, scale, blur },
+//!            active:   { color, opacity, scale, lift, rotate },
+//!            spoken:   { color, opacity, scale, blur },
+//!            keyword:  { color, scale },
+//!            attack_ms, attack_ease, hold_ms, release_ms, release_ease },
+//!   enter: { kind, ms, ease },
+//!   exit:  { kind, ms } }
+//! ```
+//!
 //! `x`/`y` are the centre of an element as a fraction of the output frame
 //! (0..1, right and down). Sizes multiply today's size. Colours are
 //! `#RRGGBB` strings.
@@ -37,6 +52,8 @@ use crate::captions::ass::Anim;
 pub const CAPS: &[&str] = &[
     "look",
     "look.captions",
+    "look.captions.words",
+    "look.captions.motion",
     "look.headline",
     "look.bar",
     "look.logo",
@@ -88,6 +105,136 @@ pub enum BoxLook {
     Color(Rgb),
 }
 
+/// How a value travels between two looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ease {
+    Linear,
+    /// Fast start, slow arrival.
+    Out,
+    /// Slow start, fast arrival.
+    In,
+    /// Overshoots a little, then settles.
+    Back,
+}
+
+impl Ease {
+    pub fn parse(s: &str) -> Option<Ease> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "linear" => Some(Ease::Linear),
+            "out" => Some(Ease::Out),
+            "in" => Some(Ease::In),
+            "back" => Some(Ease::Back),
+            _ => None,
+        }
+    }
+}
+
+/// Which words of a caption line are on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordMode {
+    /// The whole line from its start.
+    All,
+    /// Words appear as they are spoken.
+    Build,
+    /// One word at a time.
+    Single,
+}
+
+/// How a word takes its active colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fill {
+    /// At once, at the word's start.
+    Snap,
+    /// A left-to-right sweep over the word's own duration.
+    Sweep,
+}
+
+/// One look of a word (before, during or after it is spoken). Each state
+/// only reads the fields it has in the contract; the others stay `None`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WordState {
+    pub color: Option<Rgb>,
+    /// 0..1.
+    pub opacity: Option<f64>,
+    /// 0.5..1.5.
+    pub scale: Option<f64>,
+    /// 0..10 (px at a 1080-wide frame).
+    pub blur: Option<f64>,
+    /// -0.3..0.3 em, positive = up (active only).
+    pub lift: Option<f64>,
+    /// -10..10 degrees, positive = clockwise (active only).
+    pub rotate: Option<f64>,
+}
+
+/// The emphasis words (the ones the engine already accents).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KeywordLook {
+    pub color: Option<Rgb>,
+    /// 0.5..1.5.
+    pub scale: Option<f64>,
+}
+
+/// Word-level section of the captions: states, transitions, reveal mode.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WordsLook {
+    pub mode: Option<WordMode>,
+    pub upcoming: WordState,
+    pub active: WordState,
+    pub spoken: WordState,
+    pub keyword: KeywordLook,
+    pub fill: Option<Fill>,
+    /// 0..400.
+    pub attack_ms: Option<f64>,
+    pub attack_ease: Option<Ease>,
+    /// 0..600.
+    pub hold_ms: Option<f64>,
+    /// 0..2000.
+    pub release_ms: Option<f64>,
+    pub release_ease: Option<Ease>,
+}
+
+/// How a caption line comes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnterKind {
+    None,
+    Pop,
+    Fade,
+    SlideUp,
+    SlideDown,
+    SlideLeft,
+    SlideRight,
+    Zoom,
+    Bounce,
+    Blur,
+    Drop,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EnterLook {
+    pub kind: Option<EnterKind>,
+    /// 0..800.
+    pub ms: Option<f64>,
+    pub ease: Option<Ease>,
+}
+
+/// How a caption line leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitKind {
+    None,
+    Fade,
+    SlideUp,
+    SlideDown,
+    Zoom,
+    Blur,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExitLook {
+    pub kind: Option<ExitKind>,
+    /// 0..600.
+    pub ms: Option<f64>,
+}
+
 /// Caption section. `None` fields keep the style's own value.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CaptionsLook {
@@ -124,6 +271,11 @@ pub struct CaptionsLook {
     /// Words per line, 1..8.
     pub max_words: Option<usize>,
     pub anim: Option<Anim>,
+    /// Word looks, transitions and reveal mode (`None` = today's captions).
+    pub words: Option<WordsLook>,
+    /// How a line comes in / leaves (`None` = what `anim` says).
+    pub enter: Option<EnterLook>,
+    pub exit: Option<ExitLook>,
 }
 
 /// Headline motion.
@@ -364,6 +516,107 @@ fn captions(o: &Obj) -> CaptionsLook {
         box_opacity: num(o, "box_opacity", 0.0, 1.0),
         max_words: num(o, "max_words", 1.0, 8.0).map(|n| n.round() as usize),
         anim: word(o, "anim").and_then(|a| Anim::from_name(&a)),
+        words: sect(o, "words")
+            .map(words)
+            .filter(|w| *w != WordsLook::default()),
+        enter: sect(o, "enter")
+            .map(enter)
+            .filter(|e| *e != EnterLook::default()),
+        exit: sect(o, "exit")
+            .map(exit)
+            .filter(|e| *e != ExitLook::default()),
+    }
+}
+
+fn sect<'a>(o: &'a Obj, k: &str) -> Option<&'a Obj> {
+    o.get(k).and_then(Value::as_object)
+}
+
+fn ease(o: &Obj, k: &str) -> Option<Ease> {
+    word(o, k).and_then(|e| Ease::parse(&e))
+}
+
+/// One word state; only the fields in `keep` are read.
+fn word_state(o: &Obj, k: &str, keep: &[&str]) -> WordState {
+    let Some(s) = sect(o, k) else {
+        return WordState::default();
+    };
+    let has = |f: &str| keep.contains(&f);
+    WordState {
+        color: color(s, "color").filter(|_| has("color")),
+        opacity: num(s, "opacity", 0.0, 1.0).filter(|_| has("opacity")),
+        scale: num(s, "scale", 0.5, 1.5).filter(|_| has("scale")),
+        blur: num(s, "blur", 0.0, 10.0).filter(|_| has("blur")),
+        lift: num(s, "lift", -0.3, 0.3).filter(|_| has("lift")),
+        rotate: num(s, "rotate", -10.0, 10.0).filter(|_| has("rotate")),
+    }
+}
+
+fn words(o: &Obj) -> WordsLook {
+    WordsLook {
+        mode: match word(o, "mode").as_deref() {
+            Some("all") => Some(WordMode::All),
+            Some("build") => Some(WordMode::Build),
+            Some("single") => Some(WordMode::Single),
+            _ => None,
+        },
+        upcoming: word_state(o, "upcoming", &["color", "opacity", "scale", "blur"]),
+        active: word_state(
+            o,
+            "active",
+            &["color", "opacity", "scale", "lift", "rotate"],
+        ),
+        spoken: word_state(o, "spoken", &["color", "opacity", "scale", "blur"]),
+        keyword: sect(o, "keyword").map_or_else(KeywordLook::default, |k| KeywordLook {
+            color: color(k, "color"),
+            scale: num(k, "scale", 0.5, 1.5),
+        }),
+        fill: match word(o, "fill").as_deref() {
+            Some("snap") => Some(Fill::Snap),
+            Some("sweep") => Some(Fill::Sweep),
+            _ => None,
+        },
+        attack_ms: num(o, "attack_ms", 0.0, 400.0),
+        attack_ease: ease(o, "attack_ease"),
+        hold_ms: num(o, "hold_ms", 0.0, 600.0),
+        release_ms: num(o, "release_ms", 0.0, 2000.0),
+        release_ease: ease(o, "release_ease"),
+    }
+}
+
+fn enter(o: &Obj) -> EnterLook {
+    EnterLook {
+        kind: match word(o, "kind").as_deref() {
+            Some("none") => Some(EnterKind::None),
+            Some("pop") => Some(EnterKind::Pop),
+            Some("fade") => Some(EnterKind::Fade),
+            Some("slide_up") => Some(EnterKind::SlideUp),
+            Some("slide_down") => Some(EnterKind::SlideDown),
+            Some("slide_left") => Some(EnterKind::SlideLeft),
+            Some("slide_right") => Some(EnterKind::SlideRight),
+            Some("zoom") => Some(EnterKind::Zoom),
+            Some("bounce") => Some(EnterKind::Bounce),
+            Some("blur") => Some(EnterKind::Blur),
+            Some("drop") => Some(EnterKind::Drop),
+            _ => None,
+        },
+        ms: num(o, "ms", 0.0, 800.0),
+        ease: ease(o, "ease"),
+    }
+}
+
+fn exit(o: &Obj) -> ExitLook {
+    ExitLook {
+        kind: match word(o, "kind").as_deref() {
+            Some("none") => Some(ExitKind::None),
+            Some("fade") => Some(ExitKind::Fade),
+            Some("slide_up") => Some(ExitKind::SlideUp),
+            Some("slide_down") => Some(ExitKind::SlideDown),
+            Some("zoom") => Some(ExitKind::Zoom),
+            Some("blur") => Some(ExitKind::Blur),
+            _ => None,
+        },
+        ms: num(o, "ms", 0.0, 600.0),
     }
 }
 
@@ -497,6 +750,90 @@ mod tests {
     }
 
     #[test]
+    fn word_section_parses_clamps_and_drops_bad_values() {
+        let c = Look::parse(
+            r##"{"captions":{"words":{"mode":"Build","fill":"sweep",
+                "upcoming":{"color":"#102030","opacity":-1,"scale":9,"blur":99,"lift":1,"rotate":3},
+                "active":{"color":"nope","opacity":0.5,"scale":0.1,"lift":9,"rotate":-99,"blur":4},
+                "spoken":{"color":"#FFFFFF","opacity":2,"scale":1.2,"blur":2},
+                "keyword":{"color":"#FF00FF","scale":2},
+                "attack_ms":999,"attack_ease":"BACK","hold_ms":-5,"release_ms":5000,"release_ease":"wobble"},
+              "enter":{"kind":"Slide_Up","ms":9999,"ease":"out"},
+              "exit":{"kind":"zoom","ms":-3}}}"##,
+        )
+        .captions
+        .unwrap();
+        let w = c.words.unwrap();
+        assert_eq!((w.mode, w.fill), (Some(WordMode::Build), Some(Fill::Sweep)));
+        // Each state keeps only the fields it has in the contract.
+        assert_eq!(
+            w.upcoming,
+            WordState {
+                color: Some(Rgb(0x10, 0x20, 0x30)),
+                opacity: Some(0.0),
+                scale: Some(1.5),
+                blur: Some(10.0),
+                lift: None,
+                rotate: None,
+            }
+        );
+        assert_eq!(
+            w.active,
+            WordState {
+                color: None,
+                opacity: Some(0.5),
+                scale: Some(0.5),
+                blur: None,
+                lift: Some(0.3),
+                rotate: Some(-10.0),
+            }
+        );
+        assert_eq!(
+            (w.spoken.opacity, w.spoken.scale, w.spoken.blur),
+            (Some(1.0), Some(1.2), Some(2.0))
+        );
+        assert_eq!(
+            (w.keyword.color, w.keyword.scale),
+            (Some(Rgb(255, 0, 255)), Some(1.5))
+        );
+        assert_eq!(
+            (
+                w.attack_ms,
+                w.attack_ease,
+                w.hold_ms,
+                w.release_ms,
+                w.release_ease
+            ),
+            (Some(400.0), Some(Ease::Back), Some(0.0), Some(2000.0), None)
+        );
+        let e = c.enter.unwrap();
+        assert_eq!(
+            (e.kind, e.ms, e.ease),
+            (Some(EnterKind::SlideUp), Some(800.0), Some(Ease::Out))
+        );
+        let x = c.exit.unwrap();
+        assert_eq!((x.kind, x.ms), (Some(ExitKind::Zoom), Some(0.0)));
+    }
+
+    #[test]
+    fn empty_word_sections_are_no_sections() {
+        for j in [
+            r#"{"captions":{"words":{}}}"#,
+            r#"{"captions":{"words":{"mode":"sideways","fill":3,"upcoming":"x","keyword":[]}}}"#,
+            r#"{"captions":{"enter":{}}}"#,
+            r#"{"captions":{"enter":{"kind":"spin","ease":"wobble"}}}"#,
+            r#"{"captions":{"exit":{"kind":"slide_left"}}}"#,
+            r#"{"captions":{"words":5,"enter":"pop","exit":null}}"#,
+        ] {
+            let c = Look::parse(j).captions.unwrap();
+            assert_eq!((c.words, c.enter, c.exit), (None, None, None), "{j}");
+            assert!(Look::parse(j).is_empty(), "{j}");
+        }
+        assert!(!Look::parse(r#"{"captions":{"words":{"mode":"single"}}}"#).is_empty());
+        assert!(!Look::parse(r#"{"captions":{"enter":{"kind":"none"}}}"#).is_empty());
+    }
+
+    #[test]
     fn bad_enums_fall_back_to_absent() {
         let c = Look::parse(
             r#"{"captions":{"case":"title","anim":"spin","font":"Arial","box":"teal"}}"#,
@@ -566,6 +903,8 @@ mod tests {
         ] {
             assert!(CAPS.contains(&format!("look.{s}").as_str()), "{s}");
         }
+        assert!(CAPS.contains(&"look.captions.words"));
+        assert!(CAPS.contains(&"look.captions.motion"));
     }
 
     #[test]
