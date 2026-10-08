@@ -294,6 +294,26 @@ pub fn group(
     max_gap: f64,
     max_dur: f64,
 ) -> Vec<Vec<Word>> {
+    group_by(words, max_words, max_chars, max_gap, max_dur, false)
+}
+
+/// [`group`], counting the characters of a block as characters (a Look's
+/// `max_chars`) rather than as the bytes the styles' own budgets were tuned in.
+fn group_by(
+    words: &[Word],
+    max_words: usize,
+    max_chars: usize,
+    max_gap: f64,
+    max_dur: f64,
+    by_chars: bool,
+) -> Vec<Vec<Word>> {
+    let len = |w: &Word| {
+        if by_chars {
+            w.w.chars().count()
+        } else {
+            w.w.len()
+        }
+    };
     let mut lines: Vec<Vec<Word>> = Vec::new();
     let mut cur: Vec<Word> = Vec::new();
     for w in words {
@@ -301,7 +321,7 @@ pub fn group(
             false
         } else {
             let last = cur.last().unwrap();
-            let text_len: usize = cur.iter().map(|x| x.w.len() + 1).sum::<usize>() + w.w.len();
+            let text_len: usize = cur.iter().map(|x| len(x) + 1).sum::<usize>() + len(w);
             cur.len() >= max_words
                 || text_len > max_chars
                 || (w.s - last.e) > max_gap
@@ -341,14 +361,23 @@ fn split_sentences(lines: Vec<Vec<Word>>) -> Vec<Vec<Word>> {
 /// A line too short to read joins a neighbor from the same sentence
 /// ("I'M" + "KINDERGARTEN"), forward first, if the pair stays compact
 /// (a little over the preset's width is fine: it wraps, it doesn't flash).
-/// `word_cap` is a hard words-per-line limit set by a Look.
-fn merge_flashes(lines: Vec<Vec<Word>>, max_c: usize, word_cap: Option<usize>) -> Vec<Vec<Word>> {
+/// `word_cap` is a hard words-per-line limit set by a Look; `hard_chars` says
+/// the character budget is a Look's `max_chars`, which a merge never exceeds
+/// (the style's own is stretched by a few characters).
+fn merge_flashes(
+    lines: Vec<Vec<Word>>,
+    max_c: usize,
+    word_cap: Option<usize>,
+    hard_chars: bool,
+) -> Vec<Vec<Word>> {
     let chars = |l: &[Word]| l.iter().map(|w| w.w.chars().count() + 1).sum::<usize>();
     let span = |l: &[Word]| l[l.len() - 1].e - l[0].s;
+    // Two blocks joined read as `chars(a) + chars(b) - 1` characters.
+    let room = if hard_chars { max_c + 1 } else { max_c + 8 };
     let fits = |a: &[Word], b: &[Word]| {
         !ends_sentence(&a[a.len() - 1].w)
             && b[0].s - a[a.len() - 1].e < 0.6
-            && chars(a) + chars(b) <= max_c + 8
+            && chars(a) + chars(b) <= room
             && word_cap.is_none_or(|n| a.len() + b.len() <= n)
     };
     let mut out: Vec<Vec<Word>> = Vec::with_capacity(lines.len());
@@ -698,10 +727,12 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     let cap = o.captions.as_ref();
     // The Look's motion wins over the flat option.
     let anim = cap.and_then(|c| c.anim).unwrap_or(o.anim);
-    // Word looks, an entrance or an exit in the Look: the word-level writer
-    // (`motion`) draws the captions. Without them the line writer below runs,
-    // exactly as it always did.
-    let word_level = cap.filter(|c| c.words.is_some() || c.enter.is_some() || c.exit.is_some());
+    // Word looks, an entrance or an exit, or any of the text-dressing fields
+    // (stroke, shadow, glow, box objects, spacing, line gap, lines, max_chars,
+    // align, rotate) in the Look: the word-level writer (`motion`) draws the
+    // captions. Without them the line writer below runs, exactly as it always
+    // did.
+    let word_level = cap.filter(|c| c.positioned());
     let moving = match word_level {
         Some(c) => {
             let (en, ex) = motion::effective_motion(c, anim);
@@ -716,25 +747,48 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         Some(n) => (n, max_c),
         None => (max_w, max_c),
     };
-    let mut lines = group(&attach_punctuation(words), max_w, max_c, 0.6, 4.0);
+    // A Look's `max_chars` replaces the style's character budget; the word
+    // cap is then its own `max_words`, or the contract's top (8): the style's
+    // own few words would otherwise cut every block short of it.
+    let hard_chars = cap.and_then(|c| c.max_chars);
+    let (max_w, max_c) = match hard_chars {
+        Some(n) => (cap.and_then(|c| c.max_words).unwrap_or(8), n),
+        None => (max_w, max_c),
+    };
+    let mut lines = group_by(
+        &attach_punctuation(words),
+        max_w,
+        max_c,
+        0.6,
+        4.0,
+        hard_chars.is_some(),
+    );
     if cap.is_some_and(|c| c.show == Some(false)) {
         lines.clear();
     }
     if moving {
-        lines = merge_flashes(split_sentences(lines), max_c, cap.and_then(|c| c.max_words));
+        lines = merge_flashes(
+            split_sentences(lines),
+            max_c,
+            cap.and_then(|c| c.max_words),
+            hard_chars.is_some(),
+        );
     }
-    let spans = if moving {
-        hold_lines(
-            &lines,
-            if o.dur > 0.0 {
-                o.dur + offset
-            } else {
-                f64::INFINITY
-            },
-        )
-    } else {
-        lines.iter().map(|l| (l[0].s, l[l.len() - 1].e)).collect()
+    let spans_of = |lines: &[Vec<Word>]| -> Vec<(f64, f64)> {
+        if moving {
+            hold_lines(
+                lines,
+                if o.dur > 0.0 {
+                    o.dur + offset
+                } else {
+                    f64::INFINITY
+                },
+            )
+        } else {
+            lines.iter().map(|l| (l[0].s, l[l.len() - 1].e)).collect()
+        }
     };
+    let spans = spans_of(&lines);
     let (pw, ph) = (o.w.max(2), o.h.max(2));
     // Type is designed at 1080 wide; shorter canvases scale it down a bit.
     let k = (pw as f64 / PLAY_W as f64).min(ph as f64 / 1200.0).min(1.0);
@@ -812,7 +866,17 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     let mut border = style.border;
     let mut outline = style.outline.to_string();
     let mut outline_w = px(style.outline_w as f64) as f64;
+    // A box object is drawn as a shape by the word-level writer: the style's
+    // own libass box (and a v1 box colour) step aside for it.
+    let vector_box = cap.is_some_and(|c| c.box_fx.is_some());
+    // The box the style or a v1 `box` colour gives (the shape's default colour).
+    let own_box = match cap.and_then(|c| c.box_) {
+        Some(BoxLook::Color(c)) => Some(c.ass(0)),
+        Some(BoxLook::None) => None,
+        None => (style.border == 3).then(|| style.outline.to_string()),
+    };
     match cap.and_then(|c| c.box_) {
+        _ if vector_box => border = 1,
         Some(BoxLook::None) => border = 1,
         Some(BoxLook::Color(c)) => {
             let op = cap.and_then(|c| c.box_opacity).unwrap_or(1.0);
@@ -833,12 +897,42 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
             outline = c.ass(0);
         }
     }
-    if let Some(v) = cap.and_then(|c| c.outline_w) {
+    if vector_box && style.border == 3 {
+        // The style's outline width was its box padding: no stroke.
+        outline_w = 0.0;
+    } else if let Some(v) = cap.and_then(|c| c.outline_w) {
         outline_w = v * k;
     }
-    let shadow = cap
-        .and_then(|c| c.shadow)
-        .map_or(style.shadow as f64, |v| v * k);
+    // The text's own stroke: what its style row draws, the Look's `stroke` on
+    // top (it wins over `outline` / `outline_w`). Under a libass box the style
+    // row has no stroke (its outline slot is the box).
+    let stroke_look = cap.and_then(|c| c.stroke.as_ref());
+    let mut stroke_c = if border == 3 {
+        "&H00000000".to_string()
+    } else {
+        outline.clone()
+    };
+    let mut stroke_w = if border == 3 { 0.0 } else { outline_w };
+    if let Some(st) = stroke_look {
+        if let Some(c) = st.color {
+            stroke_c = c.ass(0);
+        }
+        if let Some(w) = st.width {
+            stroke_w = w * k;
+        }
+        if border != 3 {
+            outline = stroke_c.clone();
+            outline_w = stroke_w;
+        }
+    }
+    // A shadow object replaces the style's (and a v1 number): it is drawn as
+    // a copy under the text.
+    let shadow = if cap.is_some_and(|c| c.shadow_fx.is_some()) {
+        0.0
+    } else {
+        cap.and_then(|c| c.shadow)
+            .map_or(style.shadow as f64, |v| v * k)
+    };
     let mut out = format!(
         "[Script Info]\nTitle: DigiClip {display}\nScriptType: v4.00+\nPlayResX: {pw}\nPlayResY: {ph}\nScaledBorderAndShadow: yes\nWrapStyle: 0\n\n"
     );
@@ -861,11 +955,15 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
             margin_v
         )
     };
-    // libass draws a translucent box once per run of text, and the karaoke
-    // runs overlap by the padding: a dark seam between words. So a see-through
-    // box gets its own style and one event per line (a single run of
-    // invisible text under the real one); an opaque box needs neither.
-    let soft_box = border == 3 && !outline.starts_with("&H00");
+    // libass draws a box once per run of text, and the karaoke runs overlap by
+    // the padding: where the box is see-through a dark seam shows between
+    // words. A box is see-through when its colour is, and for the eighty
+    // milliseconds a line fades in or out (every motion but `none`, which cuts,
+    // and `words`, whose box is meant to grow word by word). So such a box
+    // gets its own style and one event per line (a single run of invisible
+    // text under the real one); a box that is opaque all the time needs neither.
+    let fading = moving && anim != Anim::Words;
+    let soft_box = border == 3 && (!outline.starts_with("&H00") || fading);
     let box_name = format!("{display}Box");
     // The word-level writer always draws the box as its own event(s).
     let split_box = if word_level.is_some() {
@@ -1047,6 +1145,15 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
             motion::col_of_ass(&secondary),
             motion::col_of_ass(&accent),
             k,
+            &motion::Base {
+                stroke: motion::Stroke {
+                    col: motion::col_of_ass(&stroke_c),
+                    w: stroke_w,
+                },
+                box_col: own_box.as_deref().map(motion::col_of_ass),
+                box_opacity: c.box_opacity.unwrap_or(1.0),
+                font_px: font_px as f64,
+            },
         );
         let alpha_of = |s: &str| u8::from_str_radix(s.get(2..4).unwrap_or("00"), 16).unwrap_or(0);
         let geo = motion::Geo {
@@ -1071,6 +1178,15 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
                 )
             }),
             caps,
+        };
+        // At most `lines` rows in a block: longer blocks are cut into more.
+        let (lines, spans) = match c.lines {
+            Some(n) => {
+                let l = motion::fit_rows(&cfg, &geo, caps, lines, n);
+                let s = spans_of(&l);
+                (l, s)
+            }
+            None => (lines, spans),
         };
         out.push_str(&motion::events(&cfg, &geo, &draw, &lines, &spans, offset));
         return out;
@@ -1470,7 +1586,7 @@ mod tests {
                     clear: tr(true, false),
                     ..AssOpts::default()
                 },
-                (0x8675867d6d103399, 1879),
+                (0xec7cabc2b102f4b4, 2585),
             ),
             (
                 "minimal",
@@ -1498,7 +1614,7 @@ mod tests {
                     seam: true,
                     ..AssOpts::default()
                 },
-                (0xd3868e02dafc904d, 1631),
+                (0xee2916c46b0b8e44, 2346),
             ),
             (
                 "beast",
@@ -1707,16 +1823,36 @@ mod tests {
             boxes[0]
         );
         assert!(!boxes[0].contains("\\k"));
-        // Opaque: just the one style.
-        let ass = build_look("minimal", r##"{"box":"#000000","box_opacity":1}"##);
+        // Opaque and cut in (nothing fades): just the one style.
+        let ass = build_look(
+            "minimal",
+            r##"{"box":"#000000","box_opacity":1,"anim":"none"}"##,
+        );
         assert!(!ass.contains("MinimalBox"));
         assert_eq!(style_line(&ass, "Minimal")[15], "3");
-        let ass = build_look("minimal", r##"{"box":"#336699"}"##);
+        let ass = build_look("minimal", r##"{"box":"#336699","anim":"none"}"##);
         let s = style_line(&ass, "Minimal");
         assert_eq!((s[5], s[15]), ("&H00996633", "3"));
         // An explicit outline_w is the padding.
-        let ass = build_look("minimal", r##"{"box":"#336699","outline_w":6}"##);
+        let ass = build_look(
+            "minimal",
+            r##"{"box":"#336699","outline_w":6,"anim":"none"}"##,
+        );
         assert_eq!(style_line(&ass, "Minimal")[16], "6");
+        // Opaque but fading in and out: the box is its own event per line, or
+        // the boxes of the runs would overlap into a dark seam while it fades.
+        let ass = build_look("minimal", r##"{"box":"#336699"}"##);
+        let s = style_line(&ass, "MinimalBox");
+        assert_eq!((s[5], s[15], s[16]), ("&H00996633", "3", "14"));
+        assert_eq!(style_line(&ass, "Minimal")[15], "1");
+        let (boxes, texts): (Vec<&str>, Vec<&str>) = dialogues(&ass)
+            .into_iter()
+            .partition(|l| l.contains(",MinimalBox,"));
+        assert_eq!(boxes.len(), texts.len());
+        assert!(!boxes[0].contains("\\k"));
+        // `words` grows the box with the words, as it always did.
+        let ass = build_look("minimal", r##"{"box":"#336699","anim":"words"}"##);
+        assert!(!ass.contains("MinimalBox"));
         // Removing a style's box.
         for style in ["hormozi", "highlight"] {
             let name = if style == "hormozi" {
@@ -1724,7 +1860,8 @@ mod tests {
             } else {
                 "Highlight"
             };
-            assert_eq!(style_line(&build_look(style, ""), name)[15], "3");
+            let cut = |j: &str| build_look(style, j);
+            assert_eq!(style_line(&cut(r#"{"anim":"none"}"#), name)[15], "3");
             for off in [r#"{"box":null}"#, r#"{"box":"none"}"#] {
                 let ass = build_look(style, off);
                 assert_eq!(style_line(&ass, name)[15], "1", "{style} {off}");
@@ -1738,8 +1875,11 @@ mod tests {
         let ass = build_look("minimal", r#"{"box_opacity":0.5}"#);
         assert_eq!(style_line(&ass, "Minimal")[15], "1");
         // A new colour keeps the style's box.
-        let ass = build_look("highlight", r##"{"box":"#FF00FF"}"##);
+        let ass = build_look("highlight", r##"{"box":"#FF00FF","anim":"none"}"##);
         let s = style_line(&ass, "Highlight");
+        assert_eq!((s[5], s[15], s[16]), ("&H00FF00FF", "3", "2"));
+        let ass = build_look("highlight", r##"{"box":"#FF00FF"}"##);
+        let s = style_line(&ass, "HighlightBox");
         assert_eq!((s[5], s[15], s[16]), ("&H00FF00FF", "3", "2"));
     }
 
@@ -2284,12 +2424,12 @@ mod tests {
             ("karaoke", 3, 0xd36bc11fc5008783, 1182),
             ("karaoke", 4, 0x62070ba5fe3cadc3, 1322),
             ("karaoke", 5, 0xddb2b8fa274b9d28, 2372),
-            ("hormozi", 0, 0xbb4f12555cbd4439, 1858),
+            ("hormozi", 0, 0xa06e82056cdaa933, 2848),
             ("hormozi", 1, 0xa5a5c4574fcf22cd, 2130),
             ("hormozi", 2, 0x58625c6da271ec68, 1134),
-            ("hormozi", 3, 0xa71e96eaea180310, 1226),
-            ("hormozi", 4, 0xbdf898f37a42474a, 1400),
-            ("hormozi", 5, 0xbc525e3791b444a8, 2236),
+            ("hormozi", 3, 0x97ab22c27e6d5eb8, 1820),
+            ("hormozi", 4, 0x7ff9a358b07168b2, 2168),
+            ("hormozi", 5, 0x3a41694e7c9bf372, 3550),
             ("minimal", 0, 0x613bbc0c9b432d08, 1750),
             ("minimal", 1, 0x8aaca1953ddb57a6, 2096),
             ("minimal", 2, 0x85c09e8fbc1e94d8, 1090),
@@ -2308,12 +2448,12 @@ mod tests {
             ("neon", 3, 0xf242d9731e26d878, 1153),
             ("neon", 4, 0x4189686735e5c330, 1293),
             ("neon", 5, 0x31bc34f84f278527, 2343),
-            ("highlight", 0, 0x76f9b8178e415771, 1874),
+            ("highlight", 0, 0x08014178d679867c, 2878),
             ("highlight", 1, 0xb2a072fde39550f1, 2146),
             ("highlight", 2, 0xcf5bd369ed64bad4, 1150),
-            ("highlight", 3, 0x286d00134297389c, 1242),
-            ("highlight", 4, 0xf67e9174e81ca2de, 1416),
-            ("highlight", 5, 0x9bfb542ba25f1bf4, 2252),
+            ("highlight", 3, 0xae45d0b96277f717, 1850),
+            ("highlight", 4, 0xbdd8fcfab527a0d9, 2198),
+            ("highlight", 5, 0x68c79bd7fc445bf1, 3580),
             ("ghost", 0, 0x69c5fde3c802c709, 1738),
             ("ghost", 1, 0xc57647296bd6af97, 2084),
             ("ghost", 2, 0xfcde295efb4010d9, 1076),
@@ -3135,5 +3275,859 @@ mod tests {
         assert!(after < 12 * 14, "{after}");
         let lift = count(r#"{"words":{"active":{"lift":0.1},"attack_ms":120,"release_ms":300}}"#);
         assert!(lift < 12 * 24, "{lift}");
+    }
+
+    // ---- the text-dressing fields (look.captions.fx / look.captions.type) ----
+
+    fn layer(ass: &str, n: u8) -> Vec<&str> {
+        let p = format!("Dialogue: {n},");
+        ass.lines().filter(|l| l.starts_with(&p)).collect()
+    }
+
+    /// The text of an event: what follows its first override block.
+    fn body(e: &str) -> &str {
+        let at = e.find(",,0,0,0,,").map_or(0, |i| i + 9);
+        let rest = &e[at..];
+        rest.find('}').map_or(rest, |i| &rest[i + 1..])
+    }
+
+    /// Numbers after a tag name in one event, e.g. `\\blur` -> [8.0].
+    fn tag_nums(e: &str, tag: &str) -> Vec<f64> {
+        e.split(tag)
+            .skip(1)
+            .filter_map(|r| {
+                let n: String = r
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                    .collect();
+                n.parse().ok()
+            })
+            .collect()
+    }
+
+    /// (start, end) pairs of events, in order.
+    fn times(evs: &[&str]) -> Vec<(String, String)> {
+        evs.iter()
+            .map(|e| (start(e).to_string(), end(e).to_string()))
+            .collect()
+    }
+
+    fn karaoke_px() -> f64 {
+        84.0
+    }
+
+    fn face() -> &'static crate::captions::metrics::Face {
+        crate::captions::metrics::face("Archivo Black").unwrap()
+    }
+
+    #[test]
+    fn any_new_field_switches_the_caption_to_the_positioned_writer() {
+        let base = build_look("karaoke", "{}");
+        assert!(base.contains("\\k"), "the line writer");
+        for j in [
+            r#"{"spacing":0.1}"#,
+            r#"{"line_gap":1.2}"#,
+            r#"{"lines":2}"#,
+            r#"{"max_chars":20}"#,
+            r#"{"align":"left"}"#,
+            r#"{"rotate":3}"#,
+            r##"{"stroke":{"width":4}}"##,
+            r##"{"shadow":{"x":3}}"##,
+            r##"{"glow":{"size":10}}"##,
+            r##"{"box":{"radius":1}}"##,
+            r##"{"words":{"active":{"glow":{"size":9}}}}"##,
+            r##"{"words":{"keyword":{"glow":{"size":9}}}}"##,
+        ] {
+            let a = build_look("karaoke", j);
+            assert!(!a.contains("\\k"), "{j}: {a}");
+            assert!(a.contains("\\an5"), "{j}");
+        }
+        // The v1 forms alone keep the line writer.
+        for j in [
+            r##"{"box":"#101010"}"##,
+            r#"{"box":"none"}"#,
+            r#"{"shadow":4}"#,
+            r##"{"outline":"#FF0000","outline_w":5}"##,
+            r#"{"max_words":2}"#,
+        ] {
+            assert!(build_look("karaoke", j).contains("\\k"), "{j}");
+        }
+        // Junk in the new fields is nothing.
+        for j in [
+            r#"{"glow":{"size":"big"}}"#,
+            r#"{"glow":{}}"#,
+            r#"{"box":{"radius":"round"}}"#,
+            r#"{"stroke":5}"#,
+            r#"{"align":"middle"}"#,
+            r#"{"spacing":"wide"}"#,
+        ] {
+            assert_eq!(build_look("karaoke", j), base, "{j}");
+        }
+    }
+
+    #[test]
+    fn letter_spacing_is_a_fraction_of_the_type_size_and_widens_the_line() {
+        let ws = &sample();
+        let a = build_look("karaoke", r#"{"spacing":0.1}"#);
+        let e = &layer(&a, 0)[0];
+        assert!(
+            tag_nums(e, "\\fsp")
+                .iter()
+                .all(|v| (v - 0.1 * karaoke_px()).abs() < 0.06),
+            "{e}"
+        );
+        assert!(e.contains("\\fsp8.4"), "{e}");
+        // Clamped to its range, a bad value is absent, zero says nothing.
+        assert_eq!(
+            build_look("karaoke", r#"{"spacing":9}"#),
+            build_look("karaoke", r#"{"spacing":0.3}"#)
+        );
+        assert!(!build_look("karaoke", r#"{"spacing":0}"#).contains("\\fsp"));
+        // Wider: the first line's first and last words sit further apart.
+        let span = |j: &str| {
+            let j = j.replace('}', r#","anim":"none"}"#);
+            let a = build_for(ws, "karaoke", 0.0, &with(&j));
+            let l = layer(&a, 0);
+            (at(l[2]).0 - at(l[0]).0).abs()
+        };
+        assert!(span(r#"{"spacing":0.2}"#) > span(r#"{"spacing":0.01}"#) + 20.0);
+        // Tighter is allowed.
+        assert!(build_look("karaoke", r#"{"spacing":-0.05}"#).contains("\\fsp-4.2"));
+    }
+
+    #[test]
+    fn line_gap_scales_the_row_pitch_and_clamps() {
+        let rows_y = |j: &str| {
+            let a = build_look("karaoke", &format!(r#"{{"max_words":8,"size":2,{j}}}"#));
+            let l = layer(&a, 0);
+            let mut ys: Vec<f64> = l.iter().map(|e| at(e).1).collect();
+            ys.sort_by(|a, b| a.total_cmp(b));
+            ys.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+            ys
+        };
+        let one = rows_y(r#""line_gap":1"#);
+        let two = rows_y(r#""line_gap":1.4"#);
+        assert!(one.len() >= 2 && two.len() >= 2, "{one:?} {two:?}");
+        let (p1, p2) = (one[1] - one[0], two[1] - two[0]);
+        assert!((p2 / p1 - 1.4).abs() < 0.02, "{p1} {p2}");
+        // Clamped.
+        assert_eq!(
+            build_look("karaoke", r#"{"line_gap":9}"#),
+            build_look("karaoke", r#"{"line_gap":1.6}"#)
+        );
+        assert_eq!(
+            build_look("karaoke", r#"{"line_gap":0}"#),
+            build_look("karaoke", r#"{"line_gap":0.8}"#)
+        );
+    }
+
+    #[test]
+    fn lines_1_never_wraps_and_lines_2_stays_in_two() {
+        let one = build_look(
+            "karaoke",
+            r#"{"lines":1,"max_chars":40,"max_words":8,"size":1.6,"anim":"none"}"#,
+        );
+        // Every block is one row: all its words share a y.
+        let mut by_start: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+        for e in layer(&one, 0) {
+            by_start
+                .entry(start(e).to_string())
+                .or_default()
+                .push(at(e).1);
+        }
+        assert!(by_start.len() > 2);
+        for (s, ys) in &by_start {
+            assert!(ys.iter().all(|y| (y - ys[0]).abs() < 0.5), "{s} {ys:?}");
+        }
+        // The same text with room for two rows needs fewer blocks.
+        let two = build_look(
+            "karaoke",
+            r#"{"lines":2,"max_chars":40,"max_words":8,"size":1.6,"anim":"none"}"#,
+        );
+        let blocks = |a: &str| {
+            layer(a, 0)
+                .iter()
+                .map(|e| start(e).to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
+        assert!(
+            blocks(&two) < blocks(&one),
+            "{} {}",
+            blocks(&two),
+            blocks(&one)
+        );
+        // At most two distinct rows per block.
+        let mut rows: std::collections::BTreeMap<String, Vec<i64>> = Default::default();
+        for e in layer(&two, 0) {
+            rows.entry(start(e).to_string())
+                .or_default()
+                .push(at(e).1.round() as i64);
+        }
+        for (s, ys) in &mut rows {
+            ys.sort();
+            ys.dedup();
+            assert!(ys.len() <= 2, "{s} {ys:?}");
+        }
+        // Out of range clamps.
+        assert_eq!(
+            build_look("karaoke", r#"{"lines":9}"#),
+            build_look("karaoke", r#"{"lines":2}"#)
+        );
+        assert_eq!(
+            build_look("karaoke", r#"{"lines":0}"#),
+            build_look("karaoke", r#"{"lines":1}"#)
+        );
+    }
+
+    #[test]
+    fn max_chars_is_a_hard_limit_per_block() {
+        let ws: Vec<Word> =
+            "so I made 3 million dollars last year. Never stop building the best thing ever"
+                .split(' ')
+                .enumerate()
+                .map(|(i, w)| Word {
+                    w: w.into(),
+                    s: i as f64 * 0.4,
+                    e: i as f64 * 0.4 + 0.35,
+                    conf: Some(0.9),
+                })
+                .collect();
+        for n in [6usize, 12, 20, 40] {
+            for anim in ["pop", "none"] {
+                let o = with(&format!(r#"{{"max_chars":{n},"anim":"{anim}"}}"#));
+                let a = build_for(&ws, "karaoke", 0.0, &o);
+                let mut blocks: std::collections::BTreeMap<String, Vec<String>> =
+                    Default::default();
+                for e in layer(&a, 0) {
+                    blocks
+                        .entry(start(e).to_string())
+                        .or_default()
+                        .push(body(e).to_string());
+                }
+                assert!(!blocks.is_empty());
+                for (s, words) in &blocks {
+                    let len = words.join(" ").chars().count();
+                    // A single word longer than the budget is its own block.
+                    assert!(len <= n || words.len() == 1, "{n} {anim} {s} {words:?}");
+                }
+            }
+        }
+        // Fewer characters, more blocks; and no style budget gets in the way.
+        let count = |n: usize| {
+            let a = build_for(
+                &ws,
+                "karaoke",
+                0.0,
+                &with(&format!(r#"{{"max_chars":{n}}}"#)),
+            );
+            layer(&a, 0)
+                .iter()
+                .map(|e| start(e).to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        };
+        assert!(count(8) > count(40));
+        // Out of range clamps.
+        assert_eq!(
+            build_look("karaoke", r#"{"max_chars":1}"#),
+            build_look("karaoke", r#"{"max_chars":6}"#)
+        );
+    }
+
+    #[test]
+    fn max_words_still_means_at_most_n_words_per_block() {
+        for n in 1..=8usize {
+            let a = build_look(
+                "minimal",
+                &format!(r#"{{"max_words":{n},"enter":{{"kind":"fade"}}}}"#),
+            );
+            let mut blocks: std::collections::BTreeMap<String, usize> = Default::default();
+            for e in layer(&a, 0) {
+                *blocks.entry(start(e).to_string()).or_default() += 1;
+            }
+            assert!(blocks.values().all(|c| *c <= n), "{n} {blocks:?}");
+        }
+    }
+
+    #[test]
+    fn align_places_the_rows_of_a_block_against_one_edge() {
+        let look = |a: &str| {
+            let ass = build_look(
+                "karaoke",
+                &format!(
+                    r#"{{"max_words":6,"max_chars":40,"size":1.25,"anim":"none","align":"{a}"}}"#
+                ),
+            );
+            // Rows of the first block: first and last word of each.
+            let evs = layer(&ass, 0);
+            let first_start = start(evs[0]).to_string();
+            let blk: Vec<&&str> = evs.iter().filter(|e| start(e) == first_start).collect();
+            let mut rows: std::collections::BTreeMap<i64, Vec<(f64, String)>> = Default::default();
+            for e in &blk {
+                let (x, y) = at(e);
+                rows.entry(y.round() as i64)
+                    .or_default()
+                    .push((x, body(e).to_string()));
+            }
+            rows.into_values()
+                .map(|mut r| {
+                    r.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    r
+                })
+                .collect::<Vec<_>>()
+        };
+        let sz = 1.25;
+        let edge = |a: &str| -> Vec<(f64, f64)> {
+            look(a)
+                .into_iter()
+                .map(|r| {
+                    let f = |t: &str| face().width(t, karaoke_px() * sz);
+                    let left = r[0].0 - f(&r[0].1) / 2.0;
+                    let last = r.last().unwrap();
+                    (left, last.0 + f(&last.1) / 2.0)
+                })
+                .collect()
+        };
+        let (l, c, r) = (edge("left"), edge("center"), edge("right"));
+        assert!(l.len() >= 2, "{l:?}");
+        // Left: the rows start together; right: they end together; centre: neither.
+        assert!((l[0].0 - l[1].0).abs() < 1.5, "{l:?}");
+        assert!((r[0].1 - r[1].1).abs() < 1.5, "{r:?}");
+        assert!(
+            (c[0].0 - c[1].0).abs() > 5.0 && (c[0].1 - c[1].1).abs() > 5.0,
+            "{c:?}"
+        );
+        // The block keeps its place: the widest row spans the same extent.
+        let span = |v: &[(f64, f64)]| {
+            (
+                v.iter().map(|x| x.0).fold(f64::MAX, f64::min),
+                v.iter().map(|x| x.1).fold(f64::MIN, f64::max),
+            )
+        };
+        let (sl, sr) = (span(&l), span(&r));
+        assert!(
+            (sl.0 - sr.0).abs() < 1.5 && (sl.1 - sr.1).abs() < 1.5,
+            "{sl:?} {sr:?}"
+        );
+        // Nothing says "centre" and "center" differently; junk is absent.
+        assert_eq!(
+            build_look("karaoke", r#"{"align":"centre"}"#),
+            build_look("karaoke", r#"{"align":"center"}"#)
+        );
+    }
+
+    #[test]
+    fn rotate_tilts_the_whole_block_about_its_middle() {
+        let flat = build_look("karaoke", r#"{"rotate":0,"anim":"none"}"#);
+        let tilted = build_look("karaoke", r#"{"rotate":6,"anim":"none"}"#);
+        let (f, t) = (layer(&flat, 0), layer(&tilted, 0));
+        assert_eq!(f.len(), t.len());
+        // Clockwise 6 degrees is -6 in ASS, on every word.
+        assert!(
+            t.iter().all(|e| tag_nums(e, "\\frz") == vec![-6.0]),
+            "{}",
+            t[0]
+        );
+        assert!(f.iter().all(|e| !e.contains("\\frz")));
+        // The first line: words further right sit lower.
+        let ys: Vec<(f64, f64)> = t.iter().take(2).map(|e| at(e)).collect();
+        assert!(ys[1].0 > ys[0].0 && ys[1].1 > ys[0].1, "{ys:?}");
+        // About the block's middle: every word keeps its distance from it.
+        let pivot = (540.0, 960.0);
+        let dist = |e: &str| {
+            let p = at(e);
+            ((p.0 - pivot.0).powi(2) + (p.1 - pivot.1).powi(2)).sqrt()
+        };
+        for (a, b) in f.iter().zip(&t) {
+            assert!((dist(a) - dist(b)).abs() < 0.3, "{a} {b}");
+        }
+        // Clamped.
+        assert_eq!(
+            build_look("karaoke", r#"{"rotate":90}"#),
+            build_look("karaoke", r#"{"rotate":15}"#)
+        );
+    }
+
+    #[test]
+    fn stroke_object_wins_over_the_v1_outline_and_a_word_can_have_its_own() {
+        // v1 on its own: the style row says it, nothing on the events.
+        let v1 = build_look(
+            "karaoke",
+            r##"{"outline":"#FF0000","outline_w":5,"anim":"none"}"##,
+        );
+        assert_eq!(style_line(&v1, "Karaoke")[16], "5");
+        // The object: its colour and width, on the style row and every event.
+        let both = build_look(
+            "karaoke",
+            r##"{"outline":"#FF0000","outline_w":5,"stroke":{"color":"#00FF00","width":9},"anim":"none"}"##,
+        );
+        let s = style_line(&both, "Karaoke");
+        assert_eq!((s[5], s[16]), ("&H0000FF00", "9"));
+        assert!(
+            layer(&both, 0)
+                .iter()
+                .all(|e| e.contains("\\bord9") && e.contains("\\3c&H00FF00&")),
+            "{}",
+            layer(&both, 0)[0]
+        );
+        // Half given: the other half comes from v1, then the style.
+        let w = build_look(
+            "karaoke",
+            r##"{"outline":"#FF0000","stroke":{"width":7},"anim":"none"}"##,
+        );
+        assert!(layer(&w, 0)[0].contains("\\bord7") && layer(&w, 0)[0].contains("\\3c&H0000FF&"));
+        let c = build_look(
+            "karaoke",
+            r##"{"stroke":{"color":"#336699"},"anim":"none"}"##,
+        );
+        assert!(
+            layer(&c, 0)[0].contains("\\bord3\\3c&H996633&"),
+            "{}",
+            layer(&c, 0)[0]
+        );
+        // Clamped, and scaled with the canvas.
+        assert!(build_look("karaoke", r#"{"stroke":{"width":99}}"#).contains("\\bord12"));
+        let sq = AssOpts {
+            w: 1080,
+            h: 1080,
+            ..with(r#"{"stroke":{"width":10},"anim":"none"}"#)
+        };
+        assert!(build_for(&sample(), "karaoke", 0.0, &sq).contains("\\bord9"));
+        // A word's own stroke: only the spoken word, and back afterwards.
+        let a = build_look(
+            "karaoke",
+            r##"{"anim":"none","words":{"active":{"stroke":{"color":"#FFFFFF","width":8}}}}"##,
+        );
+        let l = layer(&a, 0);
+        let (first, second) = (l[0], l[1]);
+        assert!(first.contains("\\bord8"), "{first}");
+        // The first word's text event steps back to 3 when it is over.
+        assert!(
+            l.iter().any(|e| body(e) == "SO" && e.contains("\\bord3")),
+            "{a}"
+        );
+        assert!(second.contains("\\bord3\\3c&H000000&"), "{second}");
+    }
+
+    #[test]
+    fn shadow_object_is_an_offset_blurred_copy_under_the_text() {
+        let a = build_look(
+            "karaoke",
+            r##"{"anim":"none","shadow":{"color":"#102030","x":6,"y":8,"blur":8,"opacity":0.6}}"##,
+        );
+        let (sh, tx) = (layer(&a, 1), layer(&a, 3));
+        assert!(!sh.is_empty() && !tx.is_empty());
+        // The text moved up to its layer; nothing is left on layer 0.
+        assert!(layer(&a, 0).is_empty());
+        // One shadow per row where the words keep their shape: one event per line here.
+        assert!(sh.len() < tx.len(), "{} {}", sh.len(), tx.len());
+        let e = sh[0];
+        assert!(e.contains("\\shad0"), "{e}");
+        assert!(
+            e.contains("\\1c&H302010&") && e.contains("\\3c&H302010&"),
+            "{e}"
+        );
+        assert_eq!(tag_nums(e, "\\blur"), vec![8.0], "{e}");
+        // 60% opacity is alpha 0x66.
+        assert!(e.contains("\\alpha&H66&"), "{e}");
+        // Offset right and down of the row it follows.
+        let (xs, ys) = at(e);
+        let row: Vec<(f64, f64)> = tx.iter().take(2).map(|e| at(e)).collect();
+        let mid = ((row[0].0 + row[1].0) / 2.0, row[0].1);
+        assert!((ys - mid.1 - 8.0).abs() < 0.2, "{ys} {mid:?}");
+        assert!(xs - mid.0 > 4.0, "{xs} {mid:?}");
+        // The libass shadow of the style is gone (minimal has shadow 1).
+        let m = build_look("minimal", r##"{"shadow":{"blur":2}}"##);
+        assert_eq!(style_line(&m, "Minimal")[17], "0");
+        // v1 number: still the style's \shad, and the line writer.
+        let v1 = build_look("minimal", r#"{"shadow":4}"#);
+        assert_eq!(style_line(&v1, "Minimal")[17], "4");
+        // Ranges.
+        let big = build_look(
+            "karaoke",
+            r#"{"shadow":{"x":99,"y":-99,"blur":99,"opacity":9}}"#,
+        );
+        let e = layer(&big, 1)[0];
+        assert_eq!(tag_nums(e, "\\blur"), vec![20.0], "{e}");
+        assert!(e.contains("\\alpha&H00&") || !e.contains("\\alpha"), "{e}");
+    }
+
+    #[test]
+    fn glow_is_a_blurred_bordered_copy_with_the_strength_as_its_opacity() {
+        let a = build_look(
+            "karaoke",
+            r##"{"anim":"none","glow":{"color":"#FFD400","size":20,"strength":0.5}}"##,
+        );
+        let gl = layer(&a, 2);
+        assert!(!gl.is_empty());
+        let e = gl[0];
+        // size 20: a 11 px border, blurred by 12.
+        assert!(e.contains("\\bord14"), "{e}"); // 3 (the style's stroke) + 11
+        assert_eq!(tag_nums(e, "\\blur"), vec![12.0], "{e}");
+        assert!(
+            e.contains("\\1c&H00D4FF&") && e.contains("\\3c&H00D4FF&"),
+            "{e}"
+        );
+        // Strength 0.5 is alpha 0x80.
+        assert!(e.contains("\\alpha&H80&"), "{e}");
+        // Strength 0 or size 0: no glow events at all.
+        for j in [
+            r#"{"glow":{"size":20,"strength":0}}"#,
+            r#"{"glow":{"size":0}}"#,
+        ] {
+            assert!(layer(&build_look("karaoke", j), 2).is_empty(), "{j}");
+        }
+        // Defaults for what an object leaves out: the text's own colour.
+        let d = build_look("neon", r#"{"glow":{"size":10}}"#);
+        let e = layer(&d, 2)[0];
+        assert!(e.contains("\\1c&H"), "{e}");
+        // Ranges.
+        let big = build_look(
+            "karaoke",
+            r#"{"anim":"none","glow":{"size":99,"strength":9}}"#,
+        );
+        let e = layer(&big, 2)[0];
+        assert_eq!(tag_nums(e, "\\blur"), vec![24.0], "{e}");
+    }
+
+    #[test]
+    fn a_glow_on_the_spoken_word_only_lives_while_it_is_spoken() {
+        let a = build_look(
+            "karaoke",
+            r##"{"anim":"none","words":{"active":{"glow":{"color":"#00E5FF","size":20,"strength":1}}}}"##,
+        );
+        let gl = layer(&a, 2);
+        let tx = layer(&a, 3);
+        // A glow event per word, each only for that word's time.
+        assert_eq!(gl.len(), tx.len());
+        for e in &gl {
+            assert!(secs_of(end(e)) - secs_of(start(e)) < 0.5, "{e}");
+        }
+        // The first word "so" is spoken 0.00 to 0.35.
+        assert_eq!(start(gl[0]), "0:00:00.00");
+        assert_eq!(end(gl[0]), "0:00:00.35");
+        // A keyword's glow stacks on the spoken word's and stays once spoken.
+        let k = build_look(
+            "karaoke",
+            r##"{"anim":"none","words":{"keyword":{"glow":{"color":"#FF00FF","size":30,"strength":1}}}}"##,
+        );
+        let gl = layer(&k, 2);
+        assert!(!gl.is_empty());
+        // "3" (a digit: a keyword) glows to the end of its line, in the keyword's colour.
+        let three = gl.iter().find(|e| e.contains("\\1c&HFF00FF&")).unwrap();
+        assert!(tag_nums(three, "\\blur")[0] > 17.0, "{three}");
+    }
+
+    /// First move of a drawing event, as the box (w, h) in px.
+    fn box_size(e: &str) -> (f64, f64) {
+        let d = body(e);
+        let nums: Vec<f64> = d
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect();
+        let xs: Vec<f64> = nums.iter().step_by(2).copied().collect();
+        let ys: Vec<f64> = nums.iter().skip(1).step_by(2).copied().collect();
+        let mx = xs.iter().cloned().fold(f64::MIN, f64::max);
+        let my = ys.iter().cloned().fold(f64::MIN, f64::max);
+        (mx / 8.0, my / 8.0)
+    }
+
+    #[test]
+    fn a_box_object_is_a_drawn_shape_sized_from_the_text() {
+        let a = build_look(
+            "karaoke",
+            r##"{"anim":"none","stroke":{"width":0},"box":{"color":"#102030","opacity":0.5,"pad_x":20,"pad_y":10,"radius":0}}"##,
+        );
+        let bx = layer(&a, 0);
+        let tx = layer(&a, 3);
+        // One box per line, drawn with \p4, under every other layer.
+        assert_eq!(bx.len(), 5, "{a}");
+        let e = bx[0];
+        assert!(e.contains("\\p4") && e.contains("\\bord0\\shad0"), "{e}");
+        assert!(
+            e.contains("\\1c&H302010&") && e.contains("\\alpha&H80&"),
+            "{e}"
+        );
+        // Square: no curve.
+        assert!(!body(e).contains(" b "), "{e}");
+        // Width = ink of "MOST PEOPLE" + 2 pad_x; height = ink band + 2 pad_y.
+        let f = face();
+        let first_words: Vec<&str> = tx
+            .iter()
+            .filter(|t| start(t) == start(bx[0]))
+            .map(|t| body(t))
+            .collect();
+        let text = first_words.join(" ");
+        let text = text.as_str();
+        let (l, _) = f.ink_x(first_words[0], karaoke_px());
+        let (_, r) = f.ink_x(first_words[first_words.len() - 1], karaoke_px());
+        let want_w = f.width(text, karaoke_px()) - l - r + 40.0;
+        let (top, bottom) = f.ink_y(text, karaoke_px()).unwrap();
+        let want_h = top - bottom + 20.0;
+        let (w, h) = box_size(e);
+        assert!((w - want_w).abs() < 0.3, "{w} {want_w}");
+        assert!((h - want_h).abs() < 0.3, "{h} {want_h}");
+        // The shape is centred on the ink: on the line's x, offset in y by
+        // the ink's position in the line box.
+        assert!(tx.len() > bx.len());
+        // Radius: 0.5 and 1 draw curves; 1 is a pill (the corner radius is half the height).
+        let r1 = build_look("karaoke", r##"{"anim":"none","box":{"radius":1}}"##);
+        let d = body(layer(&r1, 0)[0]).to_string();
+        assert!(d.contains(" b "), "{d}");
+        let (w1, h1) = box_size(layer(&r1, 0)[0]);
+        let first: f64 = d.split_whitespace().nth(1).unwrap().parse().unwrap();
+        assert!((first / 8.0 - h1 / 2.0).abs() < 0.2, "{first} {h1} {w1}");
+        let r05 = build_look("karaoke", r##"{"anim":"none","box":{"radius":0.5}}"##);
+        let first: f64 = body(layer(&r05, 0)[0])
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((first / 8.0 - h1 / 4.0).abs() < 0.3, "{first} {h1}");
+        // Per word: one box per word, each as wide as its word plus padding.
+        let pw = build_look(
+            "karaoke",
+            r##"{"anim":"none","box":{"per":"word","pad_x":10,"pad_y":6}}"##,
+        );
+        let boxes = layer(&pw, 0);
+        assert_eq!(boxes.len(), layer(&pw, 3).len());
+        let (w, _) = box_size(boxes[0]);
+        let w0 = body(layer(&pw, 3)[0]);
+        let (l, r) = f.ink_x(w0, karaoke_px());
+        let want = f.width(w0, karaoke_px()) - l - r + 20.0 + 2.0 * 3.0;
+        assert!((w - want).abs() < 0.3, "{w} {want}");
+        // Ranges and bad values.
+        let big = build_look(
+            "karaoke",
+            r##"{"anim":"none","box":{"pad_x":900,"opacity":9,"radius":9}}"##,
+        );
+        let (w, _) = box_size(layer(&big, 0)[0]);
+        assert!(w > 120.0 && w < 1000.0);
+        assert!(
+            build_look("karaoke", r#"{"box":{"per":"paragraph","radius":0.2}}"#).contains("\\p4")
+        );
+        // A box object that says nothing usable is no box object.
+        assert!(!build_look("karaoke", r#"{"box":{"per":"paragraph"}}"#).contains("\\p4"));
+    }
+
+    #[test]
+    fn a_box_object_replaces_the_styles_own_box_and_v1_forms_still_work() {
+        // The style's libass box steps aside.
+        let a = build_look("hormozi", r##"{"box":{"radius":0.3}}"##);
+        assert_eq!(style_line(&a, "Hormozi")[15], "1");
+        assert!(!a.contains("HormoziBox"));
+        // The shape takes the style's box colour when none is given.
+        assert!(
+            layer(&a, 0)[0].contains("\\1c&H000000&"),
+            "{}",
+            layer(&a, 0)[0]
+        );
+        let h = build_look("highlight", r##"{"box":{"radius":0.3}}"##);
+        assert!(
+            layer(&h, 0)[0].contains("\\1c&H35E6A3&"),
+            "{}",
+            layer(&h, 0)[0]
+        );
+        // No stroke is invented on a style whose outline was its box padding.
+        assert_eq!(style_line(&a, "Hormozi")[16], "0");
+        // The object wins over a v1 colour.
+        let both = build_look(
+            "karaoke",
+            r##"{"box":{"color":"#00FF00"},"box_opacity":0.5}"##,
+        );
+        assert!(layer(&both, 0)[0].contains("\\1c&H00FF00&"));
+        assert!(
+            layer(&both, 0)[0].contains("\\alpha&H80&"),
+            "{}",
+            layer(&both, 0)[0]
+        );
+        // v1: a colour string is still a libass box, "none" still removes it.
+        let v1 = build_look("karaoke", r##"{"box":"#101010","anim":"none"}"##);
+        assert_eq!(style_line(&v1, "Karaoke")[15], "3");
+        assert!(!v1.contains("\\p4"));
+        let off = build_look("hormozi", r#"{"box":"none"}"#);
+        assert_eq!(style_line(&off, "Hormozi")[15], "1");
+    }
+
+    #[test]
+    fn the_spoken_words_own_box_follows_it_only_while_it_is_spoken() {
+        let a = build_look(
+            "karaoke",
+            r##"{"anim":"none","words":{"active":{"box":{"color":"#FFD400","radius":1}}}}"##,
+        );
+        let bx = layer(&a, 0);
+        // One shape per word, each only while its word is spoken.
+        assert_eq!(bx.len(), layer(&a, 3).len());
+        assert!(
+            bx[0].contains("\\1c&H00D4FF&") && bx[0].contains("\\p4"),
+            "{}",
+            bx[0]
+        );
+        assert_eq!(start(bx[0]), "0:00:00.00");
+        assert_eq!(end(bx[0]), "0:00:00.35");
+        // Its opacity.
+        let h = build_look(
+            "karaoke",
+            r##"{"anim":"none","words":{"active":{"box":{"opacity":0.25}}}}"##,
+        );
+        assert!(
+            layer(&h, 0)[0].contains("\\alpha&HBF&"),
+            "{}",
+            layer(&h, 0)[0]
+        );
+        // It follows the word's scale and lift: its tags are the word's.
+        let s = build_look(
+            "karaoke",
+            r##"{"anim":"none","words":{"active":{"scale":1.2,"lift":0.1,"box":{"color":"#FFD400"}}}}"##,
+        );
+        let (b, t) = (layer(&s, 0), layer(&s, 3));
+        let so = t.iter().find(|e| body(e) == "SO").unwrap();
+        assert!(
+            b[0].contains("\\fscx120") && so.contains("\\fscx120"),
+            "{} {so}",
+            b[0]
+        );
+        // Lifted by a tenth of the type size, and the box with it.
+        assert!(at(so).1 < 960.0 - 7.0, "{so}");
+        assert!((at(b[0]).1 - at(so).1).abs() < 8.0, "{} {so}", b[0]);
+    }
+
+    #[test]
+    fn the_layers_are_stacked_box_shadow_glow_text() {
+        let a = build_look(
+            "karaoke",
+            r##"{"anim":"none","box":{"color":"#101010"},"shadow":{"x":4},"glow":{"size":12},"stroke":{"width":2}}"##,
+        );
+        // Within the first caption line the layers come in rising order.
+        let first: Vec<u8> = a
+            .lines()
+            .filter(|l| l.starts_with("Dialogue: ") && start(l) == "0:00:00.00")
+            .map(|l| l[10..11].parse::<u8>().unwrap())
+            .collect();
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "{first:?}");
+        for n in 0..=3u8 {
+            assert!(first.contains(&n), "layer {n} missing: {first:?}");
+        }
+        // Without any lower layer the text stays on layer 0.
+        let plain = build_look("karaoke", r#"{"spacing":0.05,"anim":"none"}"#);
+        assert!(!layer(&plain, 0).is_empty() && layer(&plain, 3).is_empty());
+    }
+
+    #[test]
+    fn the_copies_share_the_words_timing_through_every_motion() {
+        let look = r##"{"words":{"mode":"build","active":{"scale":1.15,"lift":0.1,"glow":{"color":"#00E5FF","size":16},
+                "box":{"color":"#FFD400","radius":1}},"release_ms":300,"attack_ms":120,"spoken":{"opacity":0.6}},
+            "shadow":{"x":3,"y":4,"blur":4},"box":{"per":"word"},
+            "enter":{"kind":"slide_up","ms":260},"exit":{"kind":"fade","ms":140}}"##;
+        let a = build_look("karaoke", look);
+        let (bx, sh, gl, tx) = (layer(&a, 0), layer(&a, 1), layer(&a, 2), layer(&a, 3));
+        assert!(!sh.is_empty() && !gl.is_empty() && !bx.is_empty());
+        // Per-word shadow events (the words move), cut exactly like the text.
+        let tt: std::collections::BTreeSet<_> = times(&tx).into_iter().collect();
+        for (name, evs) in [("shadow", &sh), ("glow", &gl)] {
+            for t in times(evs) {
+                assert!(tt.contains(&t), "{name} {t:?} is not a text slice");
+            }
+        }
+        assert_eq!(times(&sh), times(&tx), "shadow slices equal text slices");
+        // They move with the word: the lifted text and its shadow, glow and box
+        // are at the same height (the shadow lower by its offset).
+        let t0 = tx.iter().find(|e| body(e) == "I").unwrap();
+        let s0 = sh.iter().find(|e| body(e) == "I").unwrap();
+        let g0 = gl.iter().find(|e| body(e) == "I").unwrap();
+        assert!((at(s0).1 - at(t0).1 - 4.0).abs() < 0.3, "{s0} {t0}");
+        assert!((at(g0).1 - at(t0).1).abs() < 0.3, "{g0} {t0}");
+        assert!((at(s0).0 - at(t0).0 - 3.0).abs() < 0.3);
+        // Their scale follows the word's.
+        assert_eq!(tag_nums(s0, "\\fscx"), tag_nums(t0, "\\fscx"));
+        assert_eq!(tag_nums(g0, "\\fscx"), tag_nums(t0, "\\fscx"));
+        // Every override block closes; no NaN.
+        for l in a.lines().filter(|l| l.starts_with("Dialogue: ")) {
+            assert_eq!(l.matches('{').count(), l.matches('}').count(), "{l}");
+            assert!(!l.contains("NaN") && !l.contains("inf"), "{l}");
+        }
+    }
+
+    #[test]
+    fn a_row_of_steady_words_shares_one_shadow_event() {
+        let a = build_look("karaoke", r##"{"anim":"none","shadow":{"x":3}}"##);
+        let (sh, tx) = (layer(&a, 1), layer(&a, 3));
+        // One per line (5 lines), against one per word.
+        assert_eq!(sh.len(), 5, "{a}");
+        assert!(tx.len() > 10);
+        // Words that scale need one each.
+        let b = build_look(
+            "karaoke",
+            r##"{"anim":"none","shadow":{"x":3},"words":{"active":{"scale":1.2}}}"##,
+        );
+        assert_eq!(layer(&b, 1).len(), layer(&b, 3).len());
+    }
+
+    #[test]
+    fn dressing_works_on_every_style_and_canvas() {
+        let look = r##"{"spacing":0.04,"line_gap":1.2,"align":"left","rotate":-3,
+            "stroke":{"color":"#202020","width":4},"shadow":{"x":4,"y":5,"blur":5},
+            "glow":{"size":14,"strength":0.7},"box":{"radius":0.6,"per":"line"},
+            "words":{"active":{"scale":1.1,"stroke":{"width":6},"glow":{"size":20},"box":{"radius":1}},
+                     "keyword":{"glow":{"color":"#FF00FF"}}}}"##;
+        for style in [
+            "karaoke",
+            "hormozi",
+            "minimal",
+            "beast",
+            "neon",
+            "highlight",
+            "ghost",
+            "tiktok",
+        ] {
+            for (w, h) in [(1080, 1920), (1080, 1350), (1080, 1080), (1920, 1080)] {
+                let o = AssOpts { w, h, ..with(look) };
+                let a = build_for(&sample(), style, 0.0, &o);
+                for n in 0..=3u8 {
+                    assert!(!layer(&a, n).is_empty(), "{style} {w}x{h} layer {n}");
+                }
+                for l in a.lines().filter(|l| l.starts_with("Dialogue: ")) {
+                    assert_eq!(l.matches('{').count(), l.matches('}').count(), "{l}");
+                    assert!(secs_of(end(l)) > secs_of(start(l)), "{l}");
+                    assert!(!l.contains("NaN") && !l.contains("inf"), "{l}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn event_count_of_twelve_words_with_everything_on() {
+        let ws: Vec<Word> = (0..12)
+            .map(|i| Word {
+                w: [
+                    "Most", "people", "never", "learn", "how", "to", "speak", "on", "camera.",
+                    "Try", "it", "today.",
+                ][i]
+                    .into(),
+                s: 0.3 + i as f64 * 0.4,
+                e: 0.3 + i as f64 * 0.4 + 0.35,
+                conf: None,
+            })
+            .collect();
+        let look = r##"{"spacing":0.05,"stroke":{"width":4},"shadow":{"x":4,"y":6,"blur":6},
+            "glow":{"size":16},"box":{"radius":1,"per":"word"},
+            "words":{"active":{"scale":1.15,"lift":0.08,"glow":{"size":24},"box":{"radius":1}},
+                     "spoken":{"opacity":0.6},"release_ms":400},
+            "enter":{"kind":"slide_up"},"exit":{"kind":"fade"}}"##;
+        let a = build_for(&ws, "karaoke", 0.0, &with(look));
+        let n: Vec<usize> = (0..=3u8).map(|l| layer(&a, l).len()).collect();
+        eprintln!("events per layer (box, shadow, glow, text) for 12 words, everything on: {n:?}, total {}", n.iter().sum::<usize>());
+        assert!(n.iter().sum::<usize>() < 12 * 70, "{n:?}");
+        // The same look with the words standing still needs far fewer.
+        let calm = r##"{"stroke":{"width":4},"shadow":{"x":4,"y":6,"blur":6},"glow":{"size":16,"color":"#FFD400"},
+            "box":{"radius":1},"anim":"none"}"##;
+        let c = build_for(&ws, "karaoke", 0.0, &with(calm));
+        let m: Vec<usize> = (0..=3u8).map(|l| layer(&c, l).len()).collect();
+        eprintln!("steady: {m:?}");
+        assert!(m[0] <= 6 && m[1] <= 6 && m[2] <= 6, "{m:?}");
     }
 }

@@ -36,6 +36,20 @@
 //!   exit:  { kind, ms } }
 //! ```
 //!
+//! and the text-dressing fields (`look.captions.fx` and `look.captions.type`):
+//!
+//! ```text
+//! captions: { ...,
+//!   spacing, line_gap, lines, max_chars, align, rotate,
+//!   stroke: { color, width },
+//!   shadow: <number> | { color, x, y, blur, opacity },
+//!   glow:   { color, size, strength },
+//!   box:    "#RRGGBB" | "none" | { color, opacity, pad_x, pad_y, radius, per },
+//!   words: { active:  { stroke: { color, width }, glow: { color, size, strength },
+//!                       box: { color, opacity, radius } },
+//!            keyword: { glow: { color, size, strength } } } }
+//! ```
+//!
 //! `x`/`y` are the centre of an element as a fraction of the output frame
 //! (0..1, right and down). Sizes multiply today's size. Colours are
 //! `#RRGGBB` strings.
@@ -54,6 +68,8 @@ pub const CAPS: &[&str] = &[
     "look.captions",
     "look.captions.words",
     "look.captions.motion",
+    "look.captions.fx",
+    "look.captions.type",
     "look.headline",
     "look.bar",
     "look.logo",
@@ -149,6 +165,79 @@ pub enum Fill {
     Sweep,
 }
 
+/// How the lines of a caption block sit inside the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// Where a box is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxPer {
+    /// One box per caption line.
+    Line,
+    /// One box per word, following the word.
+    Word,
+}
+
+/// A stroke around the letters. Unset fields keep the style's (or the v1
+/// `outline` / `outline_w`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StrokeLook {
+    pub color: Option<Rgb>,
+    /// 0..12 px at a 1080-wide frame.
+    pub width: Option<f64>,
+}
+
+/// A soft drop shadow.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShadowLook {
+    pub color: Option<Rgb>,
+    /// Offset, -30..30 px at a 1080-wide frame (right / down positive).
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    /// 0..20 px.
+    pub blur: Option<f64>,
+    /// 0..1.
+    pub opacity: Option<f64>,
+}
+
+/// A soft light around the letters.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GlowLook {
+    pub color: Option<Rgb>,
+    /// How far the light reaches, 0..40 px at a 1080-wide frame.
+    pub size: Option<f64>,
+    /// 0..1.
+    pub strength: Option<f64>,
+}
+
+/// A box drawn as a shape behind the line (or each word).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BoxFxLook {
+    pub color: Option<Rgb>,
+    /// 0..1.
+    pub opacity: Option<f64>,
+    /// Room between the letters and the box, 0..60 px at a 1080-wide frame.
+    pub pad_x: Option<f64>,
+    pub pad_y: Option<f64>,
+    /// 0 = square corners, 1 = round ends.
+    pub radius: Option<f64>,
+    pub per: Option<BoxPer>,
+}
+
+/// The box behind just the spoken word.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ActiveBoxLook {
+    pub color: Option<Rgb>,
+    /// 0..1.
+    pub opacity: Option<f64>,
+    /// 0..1.
+    pub radius: Option<f64>,
+}
+
 /// One look of a word (before, during or after it is spoken). Each state
 /// only reads the fields it has in the contract; the others stay `None`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -164,6 +253,12 @@ pub struct WordState {
     pub lift: Option<f64>,
     /// -10..10 degrees, positive = clockwise (active only).
     pub rotate: Option<f64>,
+    /// The spoken word's own stroke (active only).
+    pub stroke: Option<StrokeLook>,
+    /// The spoken word's own glow (active only).
+    pub glow: Option<GlowLook>,
+    /// A box behind the spoken word (active only).
+    pub box_: Option<ActiveBoxLook>,
 }
 
 /// The emphasis words (the ones the engine already accents).
@@ -172,6 +267,8 @@ pub struct KeywordLook {
     pub color: Option<Rgb>,
     /// 0.5..1.5.
     pub scale: Option<f64>,
+    /// The emphasis words' own glow.
+    pub glow: Option<GlowLook>,
 }
 
 /// Word-level section of the captions: states, transitions, reveal mode.
@@ -276,6 +373,47 @@ pub struct CaptionsLook {
     /// How a line comes in / leaves (`None` = what `anim` says).
     pub enter: Option<EnterLook>,
     pub exit: Option<ExitLook>,
+    /// Letter spacing, -0.05..0.3 em.
+    pub spacing: Option<f64>,
+    /// Row pitch of a wrapped block as a multiple of the line height, 0.8..1.6.
+    pub line_gap: Option<f64>,
+    /// Most lines in one caption block, 1 or 2.
+    pub lines: Option<usize>,
+    /// Most characters in one caption block, 6..40.
+    pub max_chars: Option<usize>,
+    /// How the lines sit inside the block.
+    pub align: Option<Align>,
+    /// Tilt of the whole block, -15..15 degrees, positive = clockwise.
+    pub rotate: Option<f64>,
+    /// Stroke around the letters (wins over `outline` / `outline_w`).
+    pub stroke: Option<StrokeLook>,
+    /// Shadow as an object (a plain number is `shadow`).
+    pub shadow_fx: Option<ShadowLook>,
+    pub glow: Option<GlowLook>,
+    /// Box as an object (a colour or `none` is `box_`).
+    pub box_fx: Option<BoxFxLook>,
+}
+
+impl CaptionsLook {
+    /// Does this caption need the positioned writer (every word its own
+    /// event)? It does when it has word looks, an entrance or exit, or any
+    /// of the text-dressing fields. A caption without any of them goes through
+    /// the one-event-per-line writer, byte for byte as it always did.
+    pub fn positioned(&self) -> bool {
+        self.words.is_some()
+            || self.enter.is_some()
+            || self.exit.is_some()
+            || self.spacing.is_some()
+            || self.line_gap.is_some()
+            || self.lines.is_some()
+            || self.max_chars.is_some()
+            || self.align.is_some()
+            || self.rotate.is_some()
+            || self.stroke.is_some()
+            || self.shadow_fx.is_some()
+            || self.glow.is_some()
+            || self.box_fx.is_some()
+    }
 }
 
 /// Headline motion.
@@ -513,6 +651,29 @@ fn captions(o: &Obj) -> CaptionsLook {
             Some(Value::String(s)) => Rgb::parse(s).map(BoxLook::Color),
             _ => None,
         },
+        shadow_fx: sect(o, "shadow")
+            .map(shadow_fx)
+            .filter(|s| *s != ShadowLook::default()),
+        box_fx: sect(o, "box")
+            .map(box_fx)
+            .filter(|b| *b != BoxFxLook::default()),
+        spacing: num(o, "spacing", -0.05, 0.3),
+        line_gap: num(o, "line_gap", 0.8, 1.6),
+        lines: num(o, "lines", 1.0, 2.0).map(|n| n.round() as usize),
+        max_chars: num(o, "max_chars", 6.0, 40.0).map(|n| n.round() as usize),
+        align: match word(o, "align").as_deref() {
+            Some("left") => Some(Align::Left),
+            Some("center" | "centre") => Some(Align::Center),
+            Some("right") => Some(Align::Right),
+            _ => None,
+        },
+        rotate: num(o, "rotate", -15.0, 15.0),
+        stroke: sect(o, "stroke")
+            .map(stroke)
+            .filter(|s| *s != StrokeLook::default()),
+        glow: sect(o, "glow")
+            .map(glow)
+            .filter(|g| *g != GlowLook::default()),
         box_opacity: num(o, "box_opacity", 0.0, 1.0),
         max_words: num(o, "max_words", 1.0, 8.0).map(|n| n.round() as usize),
         anim: word(o, "anim").and_then(|a| Anim::from_name(&a)),
@@ -532,6 +693,54 @@ fn sect<'a>(o: &'a Obj, k: &str) -> Option<&'a Obj> {
     o.get(k).and_then(Value::as_object)
 }
 
+fn stroke(o: &Obj) -> StrokeLook {
+    StrokeLook {
+        color: color(o, "color"),
+        width: num(o, "width", 0.0, 12.0),
+    }
+}
+
+fn shadow_fx(o: &Obj) -> ShadowLook {
+    ShadowLook {
+        color: color(o, "color"),
+        x: num(o, "x", -30.0, 30.0),
+        y: num(o, "y", -30.0, 30.0),
+        blur: num(o, "blur", 0.0, 20.0),
+        opacity: num(o, "opacity", 0.0, 1.0),
+    }
+}
+
+fn glow(o: &Obj) -> GlowLook {
+    GlowLook {
+        color: color(o, "color"),
+        size: num(o, "size", 0.0, 40.0),
+        strength: num(o, "strength", 0.0, 1.0),
+    }
+}
+
+fn box_fx(o: &Obj) -> BoxFxLook {
+    BoxFxLook {
+        color: color(o, "color"),
+        opacity: num(o, "opacity", 0.0, 1.0),
+        pad_x: num(o, "pad_x", 0.0, 60.0),
+        pad_y: num(o, "pad_y", 0.0, 60.0),
+        radius: num(o, "radius", 0.0, 1.0),
+        per: match word(o, "per").as_deref() {
+            Some("line") => Some(BoxPer::Line),
+            Some("word") => Some(BoxPer::Word),
+            _ => None,
+        },
+    }
+}
+
+fn active_box(o: &Obj) -> ActiveBoxLook {
+    ActiveBoxLook {
+        color: color(o, "color"),
+        opacity: num(o, "opacity", 0.0, 1.0),
+        radius: num(o, "radius", 0.0, 1.0),
+    }
+}
+
 fn ease(o: &Obj, k: &str) -> Option<Ease> {
     word(o, k).and_then(|e| Ease::parse(&e))
 }
@@ -549,6 +758,18 @@ fn word_state(o: &Obj, k: &str, keep: &[&str]) -> WordState {
         blur: num(s, "blur", 0.0, 10.0).filter(|_| has("blur")),
         lift: num(s, "lift", -0.3, 0.3).filter(|_| has("lift")),
         rotate: num(s, "rotate", -10.0, 10.0).filter(|_| has("rotate")),
+        stroke: sect(s, "stroke")
+            .filter(|_| has("stroke"))
+            .map(stroke)
+            .filter(|v| *v != StrokeLook::default()),
+        glow: sect(s, "glow")
+            .filter(|_| has("glow"))
+            .map(glow)
+            .filter(|v| *v != GlowLook::default()),
+        box_: sect(s, "box")
+            .filter(|_| has("box"))
+            .map(active_box)
+            .filter(|v| *v != ActiveBoxLook::default()),
     }
 }
 
@@ -564,12 +785,17 @@ fn words(o: &Obj) -> WordsLook {
         active: word_state(
             o,
             "active",
-            &["color", "opacity", "scale", "lift", "rotate"],
+            &[
+                "color", "opacity", "scale", "lift", "rotate", "stroke", "glow", "box",
+            ],
         ),
         spoken: word_state(o, "spoken", &["color", "opacity", "scale", "blur"]),
         keyword: sect(o, "keyword").map_or_else(KeywordLook::default, |k| KeywordLook {
             color: color(k, "color"),
             scale: num(k, "scale", 0.5, 1.5),
+            glow: sect(k, "glow")
+                .map(glow)
+                .filter(|v| *v != GlowLook::default()),
         }),
         fill: match word(o, "fill").as_deref() {
             Some("snap") => Some(Fill::Snap),
@@ -775,6 +1001,7 @@ mod tests {
                 blur: Some(10.0),
                 lift: None,
                 rotate: None,
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -786,6 +1013,7 @@ mod tests {
                 blur: None,
                 lift: Some(0.3),
                 rotate: Some(-10.0),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -918,5 +1146,148 @@ mod tests {
         assert!(!from_file.is_empty());
         // A missing file is no look, not an error.
         assert!(Look::from_arg("@/no/such/look.json").is_empty());
+    }
+
+    #[test]
+    fn dressing_fields_parse_clamp_and_fall_back() {
+        let c = Look::parse(
+            r##"{"captions":{"spacing":9,"line_gap":0,"lines":7,"max_chars":1,"align":"Right","rotate":-99,
+                "stroke":{"color":"#102030","width":99},
+                "shadow":{"color":"#000000","x":-99,"y":99,"blur":99,"opacity":9},
+                "glow":{"color":"#FFD400","size":99,"strength":-1},
+                "box":{"color":"#101010","opacity":2,"pad_x":999,"pad_y":-1,"radius":3,"per":"Word"}}}"##,
+        )
+        .captions
+        .unwrap();
+        assert_eq!((c.spacing, c.line_gap), (Some(0.3), Some(0.8)));
+        assert_eq!((c.lines, c.max_chars), (Some(2), Some(6)));
+        assert_eq!((c.align, c.rotate), (Some(Align::Right), Some(-15.0)));
+        assert_eq!(
+            c.stroke,
+            Some(StrokeLook {
+                color: Some(Rgb(0x10, 0x20, 0x30)),
+                width: Some(12.0)
+            })
+        );
+        let sh = c.shadow_fx.unwrap();
+        assert_eq!(
+            (sh.x, sh.y, sh.blur, sh.opacity),
+            (Some(-30.0), Some(30.0), Some(20.0), Some(1.0))
+        );
+        assert_eq!(c.shadow, None);
+        let g = c.glow.unwrap();
+        assert_eq!((g.size, g.strength), (Some(40.0), Some(0.0)));
+        let b = c.box_fx.unwrap();
+        assert_eq!(
+            (b.opacity, b.pad_x, b.pad_y, b.radius, b.per),
+            (
+                Some(1.0),
+                Some(60.0),
+                Some(0.0),
+                Some(1.0),
+                Some(BoxPer::Word)
+            )
+        );
+        assert_eq!(c.box_, None);
+        // Lower ends and the other spellings.
+        let c = Look::parse(
+            r#"{"captions":{"spacing":-9,"line_gap":9,"lines":0,"max_chars":99,"align":"centre"}}"#,
+        )
+        .captions
+        .unwrap();
+        assert_eq!((c.spacing, c.line_gap), (Some(-0.05), Some(1.6)));
+        assert_eq!((c.lines, c.max_chars), (Some(1), Some(40)));
+        assert_eq!(c.align, Some(Align::Center));
+    }
+
+    #[test]
+    fn bad_dressing_values_are_absent_and_empty_objects_are_nothing() {
+        for j in [
+            r#"{"captions":{"spacing":"wide","align":"middle","rotate":null,"lines":"two"}}"#,
+            r#"{"captions":{"stroke":{},"glow":{},"shadow":{},"box":{}}}"#,
+            r#"{"captions":{"stroke":5,"glow":"big","shadow":[1],"box":false}}"#,
+            r##"{"captions":{"glow":{"color":"gold","size":"big"},"stroke":{"color":"red"}}}"##,
+            r#"{"captions":{"box":{"per":"paragraph","radius":"round"}}}"#,
+            r#"{"captions":{"words":{"active":{"glow":{},"stroke":5,"box":[]},"keyword":{"glow":"x"}}}}"#,
+        ] {
+            let l = Look::parse(j);
+            assert!(l.is_empty(), "{j}: {l:?}");
+        }
+        // A box of `false` is not `none`.
+        assert_eq!(
+            Look::parse(r#"{"captions":{"box":false}}"#)
+                .captions
+                .unwrap()
+                .box_,
+            None
+        );
+    }
+
+    #[test]
+    fn v1_forms_are_still_read_and_the_objects_sit_beside_them() {
+        let c = Look::parse(
+            r##"{"captions":{"box":"#101010","box_opacity":0.5,"shadow":4,"outline":"#FF0000","outline_w":5}}"##,
+        )
+        .captions
+        .unwrap();
+        assert_eq!(c.box_, Some(BoxLook::Color(Rgb(0x10, 0x10, 0x10))));
+        assert_eq!((c.box_opacity, c.shadow), (Some(0.5), Some(4.0)));
+        assert_eq!((c.outline, c.outline_w), (Some(Rgb(255, 0, 0)), Some(5.0)));
+        assert!(c.box_fx.is_none() && c.shadow_fx.is_none() && c.stroke.is_none());
+        assert!(!c.positioned());
+        // Objects land in their own fields and make the caption positioned.
+        let c = Look::parse(
+            r##"{"captions":{"box":{"radius":1},"shadow":{"x":2},"stroke":{"width":3}}}"##,
+        )
+        .captions
+        .unwrap();
+        assert!(c.box_.is_none() && c.shadow.is_none());
+        assert!(c.box_fx.is_some() && c.shadow_fx.is_some() && c.stroke.is_some());
+        assert!(c.positioned());
+        // "none" is still v1.
+        let c = Look::parse(r#"{"captions":{"box":"none"}}"#)
+            .captions
+            .unwrap();
+        assert_eq!(c.box_, Some(BoxLook::None));
+        assert!(!c.positioned());
+    }
+
+    #[test]
+    fn word_dressing_is_read_for_the_states_that_have_it() {
+        let w = Look::parse(
+            r##"{"captions":{"words":{
+                "active":{"stroke":{"color":"#FFFFFF","width":99},"glow":{"size":99,"strength":0.5},
+                          "box":{"color":"#FFD400","opacity":2,"radius":-1}},
+                "spoken":{"stroke":{"width":3},"glow":{"size":3},"box":{"radius":1}},
+                "upcoming":{"glow":{"size":3}},
+                "keyword":{"glow":{"color":"#FF00FF","size":99,"strength":9}}}}}"##,
+        )
+        .captions
+        .unwrap()
+        .words
+        .unwrap();
+        let a = w.active;
+        assert_eq!(a.stroke.unwrap().width, Some(12.0));
+        assert_eq!(a.glow.unwrap().size, Some(40.0));
+        let b = a.box_.unwrap();
+        assert_eq!(
+            (b.color, b.opacity, b.radius),
+            (Some(Rgb(255, 212, 0)), Some(1.0), Some(0.0))
+        );
+        // Only the spoken word has these.
+        for s in [&w.spoken, &w.upcoming] {
+            assert!(s.stroke.is_none() && s.glow.is_none() && s.box_.is_none());
+        }
+        let k = w.keyword.glow.unwrap();
+        assert_eq!(
+            (k.color, k.size, k.strength),
+            (Some(Rgb(255, 0, 255)), Some(40.0), Some(1.0))
+        );
+    }
+
+    #[test]
+    fn caps_announce_the_dressing() {
+        assert!(CAPS.contains(&"look.captions.fx"));
+        assert!(CAPS.contains(&"look.captions.type"));
     }
 }

@@ -6,7 +6,7 @@
 //! Run: `cargo run --example look_stills -- <out_dir> [--look <json|@file>]
 //!       [--style <name>] [--aspect 9:16] [--headline "<text>"]
 //!       [--bar <#RRGGBB>] [--logo <png> [--logo-pos tl|tr|bl|br]]
-//!       [--scene flat|crop|letterbox|split]`
+//!       [--scene flat|crop|letterbox|split] [--width 540]`
 //!
 //! `--strip <n>` writes a strip instead of the usual five moments: stills
 //! every 40 ms from 200 ms before sample word `n` (0-based) starts to one
@@ -16,6 +16,9 @@
 //!
 //! `--at <s>[,<s>...]` writes stills at those clip times only
 //! (`still-at-<ms>ms.png`).
+//!
+//! `--width <px>` is the width of the stills (540 by default; the full canvas
+//! width shows glow and edges pixel for pixel).
 //!
 //! `--bar` and `--logo` use the real compositor (`look.bar`) and the real
 //! logo filter graph (`look.logo`) on the grey frame, so a bar position or
@@ -84,7 +87,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: look_stills <out_dir> [--look <json|@file>] [--style <name>] [--aspect 9:16] \
          [--headline \"<text>\"] [--bar <#RRGGBB>] [--logo <png> [--logo-pos tr]] \
-         [--scene flat|crop|letterbox|split] [--strip <word index>] [--at <s>,<s>...]"
+         [--scene flat|crop|letterbox|split] [--strip <word index>] [--at <s>,<s>...]          [--width <px>]"
     );
     std::process::exit(2)
 }
@@ -259,10 +262,10 @@ fn composed_background(
     ok.then_some(png)
 }
 
-/// The caption band of a still (rows of the 540-wide stills): around the
+/// The caption band of a still (rows of the `--width`-wide stills): around the
 /// first line's position, else where the style's alignment puts it.
-fn caption_band(ass: &str, canvas: Canvas) -> (u32, u32) {
-    let k = 540.0 / canvas.w as f64;
+fn caption_band(ass: &str, canvas: Canvas, width: u32) -> (u32, u32) {
+    let k = width as f64 / canvas.w as f64;
     let field = |l: &str, i: usize| l.split(',').nth(i).and_then(|v| v.parse::<f64>().ok());
     let style = ass
         .lines()
@@ -296,8 +299,15 @@ fn caption_band(ass: &str, canvas: Canvas) -> (u32, u32) {
 }
 
 /// All of a strip's stills as one sheet, caption band only, 3 across.
-fn strip_sheet(ffmpeg: &Path, dir: &Path, stills: &[PathBuf], ass: &str, canvas: Canvas) {
-    let (top, band) = caption_band(ass, canvas);
+fn strip_sheet(
+    ffmpeg: &Path,
+    dir: &Path,
+    stills: &[PathBuf],
+    ass: &str,
+    canvas: Canvas,
+    width: u32,
+) {
+    let (top, band) = caption_band(ass, canvas, width);
     let list = dir.join("strip-list.txt");
     let body: String = stills
         .iter()
@@ -341,6 +351,7 @@ fn main() {
     let mut scene_arg: Option<String> = None;
     let mut strip: Option<usize> = None;
     let mut at: Vec<f64> = Vec::new();
+    let mut width = 540u32;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -359,6 +370,13 @@ fn main() {
                     .split(',')
                     .filter_map(|v| v.trim().parse().ok())
                     .collect()
+            }
+            "--width" => {
+                width = it
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map(|v| v.clamp(120, 4096) & !1)
+                    .unwrap_or_else(|| usage())
             }
             "--strip" => strip = it.next().and_then(|v| v.parse().ok()).or_else(|| usage()),
             _ if a.starts_with("--") => usage(),
@@ -470,7 +488,7 @@ fn main() {
     // and a later line.
     let starts: Vec<f64> = text
         .lines()
-        .filter(|l| l.starts_with("Dialogue: 0,"))
+        .filter(|l| l.starts_with("Dialogue: 0,") || l.starts_with("Dialogue: 3,"))
         .filter_map(|l| l.split(',').nth(1))
         .map(secs)
         .collect();
@@ -563,7 +581,7 @@ fn main() {
                 cmd.arg("-i").arg(&l.path);
                 graph.push_str(&render::logo_chain(1, l, canvas));
             }
-            graph.push_str(&format!(",{ass_filter},scale=540:-2[v]"));
+            graph.push_str(&format!(",{ass_filter},scale={width}:-2[v]"));
             cmd.arg("-filter_complex").arg(graph).args(["-map", "[v]"]);
         } else {
             cmd.args(["-f", "lavfi", "-i"])
@@ -574,7 +592,7 @@ fn main() {
                     t + 0.5
                 ))
                 .arg("-vf")
-                .arg(format!("{ass_filter},scale=540:-2"));
+                .arg(format!("{ass_filter},scale={width}:-2"));
         }
         let out = cmd
             .args(["-ss", &format!("{t:.3}"), "-frames:v", "1"])
@@ -594,7 +612,7 @@ fn main() {
     }
     let _ = std::fs::remove_file(out_dir.join("background.png"));
     if strip.is_some() && !made.is_empty() {
-        strip_sheet(&ffmpeg, &out_dir, &made, &text, canvas);
+        strip_sheet(&ffmpeg, &out_dir, &made, &text, canvas, width);
     }
     println!("{}", ass_path.display());
     if failed {

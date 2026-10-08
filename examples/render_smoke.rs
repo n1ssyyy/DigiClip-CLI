@@ -22,7 +22,8 @@
 //!    at 0.6. Checked by pixel: the bar is at the top in its exact colour, a
 //!    corner is darker than in the same render without the vignette, the
 //!    seam sits on its row. PNG frames land in `<tmp>/look/`.
-//!    `-- --look <json|@file>` swaps the camera scene's Look for another.
+//!    `-- --look <json|@file>` swaps the camera scene's Look for another and
+//!    `-- --style <name>` the caption style it is drawn in (default `hormozi`).
 
 use std::process::Command;
 
@@ -53,6 +54,13 @@ fn look_arg() -> String {
         },
         None => LOOK.to_string(),
     }
+}
+
+/// `--style <name>` picks the caption style of stage 4 (default `hormozi`).
+fn style_arg() -> String {
+    let mut it = std::env::args().skip_while(|a| a != "--style");
+    it.next();
+    it.next().unwrap_or_else(|| "hormozi".to_string())
 }
 
 fn run(cmd: &mut Command, what: &str) -> Vec<u8> {
@@ -607,7 +615,7 @@ fn main() {
             &ass,
             digiclip_rs::captions::ass::build_for(
                 &words,
-                "hormozi",
+                &style_arg(),
                 0.0,
                 &pipeline::ass_opts(&look, args.headline.clone(), cam_dur, false),
             ),
