@@ -121,6 +121,11 @@ pub struct JobOptions {
     /// Caption motion: `pop` (default), `words`, `none`.
     #[serde(default)]
     pub caption_anim: Option<String>,
+    /// The Look (see [`crate::look`]): kept as raw JSON so a field this
+    /// build does not know never fails the frame, and so a saved preset
+    /// round-trips it untouched.
+    #[serde(default)]
+    pub look: Option<serde_json::Value>,
     /// Absent = off, `""` = each clip's title, text = that text.
     #[serde(default)]
     pub headline: Option<String>,
@@ -1163,6 +1168,14 @@ fn args_for(
         .filter(|v| matches!(v.as_str(), "pop" | "words" | "none"))
     {
         flag(&mut argv, "--caption-anim", v.clone());
+    }
+    // Only a non-empty object travels: no look is the default argv.
+    if let Some(v) = o
+        .look
+        .as_ref()
+        .filter(|v| v.as_object().is_some_and(|m| !m.is_empty()))
+    {
+        flag(&mut argv, "--look", v.to_string());
     }
     // `""` = on with the default (clip title / brand yellow).
     if let Some(v) = &o.headline {
@@ -2860,6 +2873,62 @@ mod tests {
         assert_eq!(args_for(&src, &out, &o, &s).unwrap().caption_anim, "words");
         o.caption_anim = Some("bogus".into());
         assert_eq!(args_for(&src, &out, &o, &s).unwrap().caption_anim, "pop");
+    }
+
+    #[test]
+    fn look_reaches_args_and_only_when_set() {
+        let (src, out, mut o, s) = opts();
+        let plain = args_for(&src, &out, &o, &s).unwrap();
+        assert!(plain.look.is_none());
+        // No look, `{}`, null and junk leave the argv alone.
+        for v in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("nope")),
+        ] {
+            o.look = v;
+            let a = args_for(&src, &out, &o, &s).unwrap();
+            assert!(a.look.is_none(), "{:?}", o.look);
+        }
+        // A look travels as compact JSON and parses back to the same thing.
+        o.look =
+            Some(serde_json::json!({"v": 1, "captions": {"x": 0.5, "y": 0.25, "anim": "bounce"}}));
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        let raw = a.look.clone().unwrap();
+        assert!(!raw.contains('\n') && !raw.contains(": "), "{raw}");
+        let c = crate::look::Look::from_arg(&raw).captions.unwrap();
+        assert_eq!((c.x, c.y), (Some(0.5), Some(0.25)));
+        assert_eq!(c.anim, Some(crate::captions::ass::Anim::Bounce));
+        // Everything else in the argv is unchanged.
+        let b = crate::cli::Args { look: None, ..a };
+        assert_eq!(format!("{b:?}"), format!("{plain:?}"));
+    }
+
+    #[test]
+    fn job_options_with_an_odd_look_still_deserialise() {
+        let o: JobOptions = serde_json::from_str(
+            r#"{"style":"hormozi","look":{"v":9,"future":[1,2],"captions":{"x":0.2,"sparkle":true,"font":42},"hologram":{"on":1}},"also_new":1}"#,
+        )
+        .unwrap();
+        assert_eq!(o.style.as_deref(), Some("hormozi"));
+        let look = o.look.clone().unwrap();
+        assert_eq!(look["captions"]["sparkle"], true);
+        // A look of the wrong JSON type does not break the frame either.
+        let o2: JobOptions = serde_json::from_str(r#"{"look":"not an object"}"#).unwrap();
+        let (src, out, _, s) = opts();
+        assert!(args_for(&src, &out, &o2, &s).unwrap().look.is_none());
+        // Saved presets carry it through a round trip.
+        let p = Preset {
+            name: "x".into(),
+            options: o,
+        };
+        let back: Preset = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.options.look, Some(look));
+        // The engine side reads what it understands and ignores the rest.
+        let a = args_for(&src, &out, &back.options, &s).unwrap();
+        let l = crate::look::Look::from_arg(a.look.as_deref().unwrap());
+        assert_eq!(l.captions.unwrap().x, Some(0.2));
     }
 
     #[test]

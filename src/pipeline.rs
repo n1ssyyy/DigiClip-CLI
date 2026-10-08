@@ -125,6 +125,11 @@ fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
         logo,
         music,
         anim: crate::captions::ass::Anim::parse(&args.caption_anim),
+        captions: args
+            .look
+            .as_deref()
+            .map(crate::look::Look::from_arg)
+            .and_then(|l| l.captions),
     })
 }
 
@@ -142,6 +147,7 @@ fn ass_opts(
         headline,
         dur,
         anim: look.anim,
+        captions: look.captions.clone(),
         seam,
         // Logo width + its inset + a gap.
         clear: look.logo.as_ref().map(|l| crate::captions::ass::Clear {

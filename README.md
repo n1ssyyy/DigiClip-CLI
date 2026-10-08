@@ -104,6 +104,7 @@ Everything lands in `<input-name>-digiclip/`: `clip-01-9x16.mp4` with its `.ass`
 digiclip input.mp4 --aspect 1:1                 # also 4:5 (feed) and 16:9 (YouTube)
 digiclip input.mp4 --headline                   # clip title pinned on top (or --headline "Your text")
 digiclip input.mp4 --caption-anim words         # caption motion: pop (default), words, none
+digiclip input.mp4 --look '{"captions":{"x":0.5,"y":0.25,"size":1.4}}'   # place and style the captions (or --look @look.json)
 digiclip input.mp4 --progress-bar               # watch-time bar along the bottom (or --progress-bar "#00E5FF")
 digiclip input.mp4 --logo logo.png --logo-pos br   # corner logo: tl, tr (default), bl, br
 digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked under speech

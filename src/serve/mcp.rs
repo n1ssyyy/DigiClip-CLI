@@ -1469,6 +1469,7 @@ fn options_schema() -> Value {
             "focus": { "type": "string", "description": "Topic to steer picking toward, e.g. \"pricing, AI agents\"." },
             "style": { "type": "string", "enum": ["tiktok", "karaoke", "hormozi", "minimal", "beast", "neon", "highlight", "ghost"], "description": "Caption style." },
             "caption_anim": { "type": "string", "enum": ["pop", "words", "none"] },
+            "look": { "type": "object", "description": "How clips look. Today only look.captions applies: x, y (0..1, centre of the captions), size (0.5..2), font (Anton, Archivo Black, Inter Medium, JetBrains Mono), case (upper, asis), color, active, accent, outline (#RRGGBB), outline_w, shadow, box (#RRGGBB, or none), box_opacity, max_words (1..8), anim (pop, words, none, fade, slide, bounce). Unset fields keep the style's look." },
             "aspect": { "type": "string", "description": "Canvas(es): 9:16 (default), 4:5, 1:1, 16:9; comma-separate for extra versions, e.g. \"9:16,1:1\"." },
             "framing": { "type": "string", "enum": ["smart", "center"], "description": "smart follows faces." },
             "layout": { "type": "string", "enum": ["auto", "single", "split"], "description": "Two-person split screen." },

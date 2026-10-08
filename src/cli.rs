@@ -149,6 +149,16 @@ pub struct Args {
     #[arg(long, default_value = "pop", value_parser = ["pop", "words", "none"])]
     pub caption_anim: String,
 
+    /// The Look: one JSON object that dresses the clips, or `@file.json`
+    /// to read it from a file. Today its `captions` section applies
+    /// (position `x`/`y`, `size`, `font`, `case`, `color`, `active`,
+    /// `accent`, `outline`, `outline_w`, `shadow`, `box`, `box_opacity`,
+    /// `max_words`, `anim`: pop, words, none, fade, slide, bounce);
+    /// unset fields keep the caption style's own look and bad values are
+    /// ignored. `--look '{"captions":{"x":0.5,"y":0.25,"size":1.4}}'`.
+    #[arg(long)]
+    pub look: Option<String>,
+
     /// Output aspect: 9:16 (default — TikTok, Reels, Shorts), 4:5
     /// (Instagram/Facebook feed), 1:1 (square), 16:9 (YouTube). Tracking,
     /// camera, captions and overlays all adapt. A comma list

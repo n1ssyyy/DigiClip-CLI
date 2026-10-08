@@ -57,7 +57,8 @@ pub fn filter_escape(path: &Path) -> String {
     format!("'{}'", option_level.replace('\'', "'\\''"))
 }
 
-fn fonts_dir() -> PathBuf {
+/// Where libass finds the caption fonts.
+pub fn fonts_dir() -> PathBuf {
     // Provisioned first (single-exe installs), then alongside the exe,
     // then the repo checkout (cargo run).
     let prov = crate::provision::fonts_dir();
@@ -357,6 +358,8 @@ pub struct Look {
     pub music: Option<(PathBuf, f64)>,
     /// Caption motion.
     pub anim: crate::captions::ass::Anim,
+    /// The Look's captions section (position, size, colours, ...).
+    pub captions: Option<crate::look::CaptionsLook>,
 }
 
 /// Everything one render needs.

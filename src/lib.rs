@@ -12,6 +12,7 @@ pub mod ffmpeg;
 pub mod framing;
 pub mod gpu;
 pub mod kit;
+pub mod look;
 pub mod models;
 pub mod openrouter;
 pub mod pipeline;
