@@ -274,6 +274,9 @@ pub struct Compositor {
     bg_scratch: Vec<u8>,
     /// Progress bar color (YUV), if drawn.
     bar: Option<(u8, u8, u8)>,
+    /// The Look's bar: along the top edge, and the thickness multiplier.
+    bar_top: bool,
+    bar_height: f64,
 }
 
 impl Compositor {
@@ -297,12 +300,23 @@ impl Compositor {
             bg_tiny: vec![0u8; bg.frame_len()],
             bg_scratch: vec![0u8; bg.frame_len()],
             bar: None,
+            bar_top: false,
+            bar_height: 1.0,
         }
     }
 
     /// Draw a progress bar (sRGB color) along the bottom edge.
     pub fn with_bar(mut self, rgb: Option<(u8, u8, u8)>) -> Self {
         self.bar = rgb.map(|(r, g, b)| yuv709(r, g, b));
+        self
+    }
+
+    /// Where the Look puts the bar and how thick it is.
+    pub fn with_bar_look(mut self, look: Option<&crate::look::BarLook>) -> Self {
+        if let Some(l) = look {
+            self.bar_top = l.pos == Some(crate::look::BarPos::Top);
+            self.bar_height = l.height.unwrap_or(1.0);
+        }
         self
     }
 
@@ -416,7 +430,14 @@ impl Compositor {
             }
         }
         if let Some(color) = self.bar {
-            draw_bar(&mut self.out, canvas, color, progress);
+            draw_bar_at(
+                &mut self.out,
+                canvas,
+                color,
+                progress,
+                self.bar_top,
+                self.bar_height,
+            );
         }
     }
 
@@ -543,12 +564,35 @@ impl Compositor {
 /// Progress bar along the bottom edge: the filled part in `color`, the
 /// rest a dimmed track so the bar reads on any footage. Pure (unit-tested).
 pub fn draw_bar(out: &mut [u8], c: Canvas, color: (u8, u8, u8), progress: f32) {
+    draw_bar_at(out, c, color, progress, false, 1.0);
+}
+
+/// Bar thickness in px (even): 0.65% of the height, at least 8, times the
+/// Look's `height` multiplier (never under 4).
+pub fn bar_thickness(c: Canvas, height: f64) -> u32 {
+    let even = |v: f64| (v / 2.0).round() as u32 * 2;
+    even(c.h as f64 * 0.0065 * height)
+        .max(even(8.0 * height))
+        .max(4)
+        .min(c.h & !1)
+}
+
+/// [`draw_bar`] along the top or bottom edge, `height` times as thick.
+pub fn draw_bar_at(
+    out: &mut [u8],
+    c: Canvas,
+    color: (u8, u8, u8),
+    progress: f32,
+    top: bool,
+    height: f64,
+) {
     let g = Geom { w: c.w, h: c.h };
-    let bh = (((c.h as f64 * 0.0065) / 2.0).round() as u32 * 2).max(8);
+    let bh = bar_thickness(c, height);
     let fill = ((progress.clamp(0.0, 1.0) as f64 * c.w as f64 / 2.0).round() as u32 * 2).min(c.w);
-    let (w, y0) = (c.w as usize, (c.h - bh) as usize);
+    let (w, y0) = (c.w as usize, if top { 0 } else { (c.h - bh) as usize });
+    let y1 = y0 + bh as usize;
     let (oy, uv) = out.split_at_mut(g.luma_len());
-    for y in y0..c.h as usize {
+    for y in y0..y1 {
         let row = &mut oy[y * w..(y + 1) * w];
         for (x, p) in row.iter_mut().enumerate() {
             *p = if (x as u32) < fill {
@@ -561,7 +605,7 @@ pub fn draw_bar(out: &mut [u8], c: Canvas, color: (u8, u8, u8), progress: f32) {
     let (cw, cl) = (g.cw() as usize, g.chroma_len());
     let (ou, ov) = uv.split_at_mut(cl);
     for (plane, val) in [(ou, color.1), (&mut ov[..cl], color.2)] {
-        for y in y0 / 2..g.ch() as usize {
+        for y in y0 / 2..y1 / 2 {
             let row = &mut plane[y * cw..(y + 1) * cw];
             for (x, p) in row.iter_mut().enumerate() {
                 *p = if ((x * 2) as u32) < fill {
@@ -786,6 +830,188 @@ mod tests {
         // A 16:9 wide shot on a square canvas letterboxes over the fill.
         let l = layout(&rect(0.0, 0.0, 1280.0, 720.0), Canvas::SQUARE);
         assert_eq!((l.dw, l.dh), (1080, 608));
+    }
+
+    /// The bar exactly as it was drawn before the Look could move it.
+    fn old_bar(out: &mut [u8], c: Canvas, color: (u8, u8, u8), progress: f32) {
+        let g = Geom { w: c.w, h: c.h };
+        let bh = (((c.h as f64 * 0.0065) / 2.0).round() as u32 * 2).max(8);
+        let fill =
+            ((progress.clamp(0.0, 1.0) as f64 * c.w as f64 / 2.0).round() as u32 * 2).min(c.w);
+        let (w, y0) = (c.w as usize, (c.h - bh) as usize);
+        let (oy, uv) = out.split_at_mut(g.luma_len());
+        for y in y0..c.h as usize {
+            for (x, p) in oy[y * w..(y + 1) * w].iter_mut().enumerate() {
+                *p = if (x as u32) < fill {
+                    color.0
+                } else {
+                    16 + (p.saturating_sub(16) as u32 * 45 / 100) as u8
+                };
+            }
+        }
+        let (cw, cl) = (g.cw() as usize, g.chroma_len());
+        let (ou, ov) = uv.split_at_mut(cl);
+        for (plane, val) in [(ou, color.1), (&mut ov[..cl], color.2)] {
+            for y in y0 / 2..g.ch() as usize {
+                for (x, p) in plane[y * cw..(y + 1) * cw].iter_mut().enumerate() {
+                    *p = if ((x * 2) as u32) < fill {
+                        val
+                    } else {
+                        (128 + (*p as i32 - 128) / 2) as u8
+                    };
+                }
+            }
+        }
+    }
+
+    fn gradient_frame(c: Canvas) -> Vec<u8> {
+        let g = Geom { w: c.w, h: c.h };
+        let mut f: Vec<u8> = (0..g.frame_len())
+            .map(|i| (i * 7 % 200 + 20) as u8)
+            .collect();
+        f[g.luma_len()..].fill(110);
+        f
+    }
+
+    #[test]
+    fn default_and_empty_bar_looks_draw_the_same_pixels_as_before() {
+        let yellow = yuv709(255, 212, 0);
+        for c in [Canvas::TALL, Canvas::SQUARE, Canvas::WIDE, Canvas::PORTRAIT] {
+            for p in [0.0f32, 0.37, 1.0] {
+                let mut want = gradient_frame(c);
+                old_bar(&mut want, c, yellow, p);
+                let mut got = gradient_frame(c);
+                draw_bar(&mut got, c, yellow, p);
+                assert!(got == want, "{c:?} {p}");
+                let mut got = gradient_frame(c);
+                draw_bar_at(&mut got, c, yellow, p, false, 1.0);
+                assert!(got == want, "{c:?} {p}");
+            }
+            // Through the compositor: no look, an empty one, a bottom one.
+            let src = ramp(640, 360);
+            let base = c.base_rect(640.0, 360.0);
+            let mut frames = Vec::new();
+            for look in [
+                None,
+                Some(crate::look::BarLook::default()),
+                Some(crate::look::BarLook {
+                    pos: Some(crate::look::BarPos::Bottom),
+                    height: Some(1.0),
+                }),
+            ] {
+                let mut comp = Compositor::new(640, 360, c)
+                    .with_bar(Some((255, 212, 0)))
+                    .with_bar_look(look.as_ref());
+                frames.push(comp.compose(&src, base, 0.0, 0.5).unwrap().to_vec());
+            }
+            assert!(frames[0] == frames[1] && frames[0] == frames[2], "{c:?}");
+        }
+    }
+
+    #[test]
+    fn bar_thickness_follows_the_height_multiplier() {
+        // Today: 0.65% of the height, even, at least 8.
+        assert_eq!(bar_thickness(Canvas::TALL, 1.0), 12);
+        assert_eq!(bar_thickness(Canvas::SQUARE, 1.0), 8);
+        assert_eq!(bar_thickness(Canvas::WIDE, 1.0), 8);
+        assert_eq!(bar_thickness(Canvas::TALL, 2.0), 24);
+        assert_eq!(bar_thickness(Canvas::TALL, 0.5), 6);
+        assert_eq!(bar_thickness(Canvas::SQUARE, 0.5), 4);
+        assert_eq!(bar_thickness(Canvas::SQUARE, 3.0), 24);
+        for c in [Canvas::TALL, Canvas::SQUARE, Canvas::WIDE, Canvas::PORTRAIT] {
+            for h in [0.5, 0.75, 1.0, 1.5, 2.0, 3.0] {
+                let t = bar_thickness(c, h);
+                assert!(t.is_multiple_of(2) && t >= 4, "{c:?} {h} -> {t}");
+            }
+            assert!(bar_thickness(c, 3.0) > bar_thickness(c, 1.0));
+            assert!(bar_thickness(c, 0.5) < bar_thickness(c, 1.0));
+        }
+    }
+
+    #[test]
+    fn bar_rows_land_at_the_top_or_bottom_with_the_right_thickness() {
+        let yellow = yuv709(255, 212, 0);
+        for c in [Canvas::TALL, Canvas::SQUARE, Canvas::WIDE] {
+            let g = Geom { w: c.w, h: c.h };
+            let w = c.w as usize;
+            for height in [0.5, 1.0, 2.0, 3.0] {
+                let bh = bar_thickness(c, height) as usize;
+                for top in [true, false] {
+                    let mut out = vec![100u8; g.frame_len()];
+                    out[g.luma_len()..].fill(128);
+                    draw_bar_at(&mut out, c, yellow, 1.0, top, height);
+                    let rows: Vec<usize> = (0..c.h as usize)
+                        .filter(|&y| out[y * w..(y + 1) * w].iter().all(|&v| v == yellow.0))
+                        .collect();
+                    let want: Vec<usize> = if top {
+                        (0..bh).collect()
+                    } else {
+                        (c.h as usize - bh..c.h as usize).collect()
+                    };
+                    assert_eq!(rows, want, "{c:?} height {height} top {top}");
+                    // Every other luma row is untouched picture.
+                    for y in (0..c.h as usize).filter(|y| !want.contains(y)) {
+                        assert!(out[y * w..(y + 1) * w].iter().all(|&v| v == 100));
+                    }
+                    // Chroma: the bar's rows carry the colour, the rest do not.
+                    let cw = g.cw() as usize;
+                    let u = &out[g.luma_len()..];
+                    for y in 0..g.ch() as usize {
+                        let on = want.contains(&(y * 2));
+                        let row = &u[y * cw..(y + 1) * cw];
+                        assert_eq!(
+                            row.iter().all(|&v| v == yellow.1),
+                            on,
+                            "{c:?} chroma row {y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_top_bar_fills_left_to_right_over_a_dim_track() {
+        let c = Canvas::SQUARE;
+        let g = Geom { w: c.w, h: c.h };
+        let mut out = vec![200u8; g.frame_len()];
+        out[g.luma_len()..].fill(128);
+        let yellow = yuv709(255, 212, 0);
+        draw_bar_at(&mut out, c, yellow, 0.5, true, 1.0);
+        let first = &out[..c.w as usize];
+        assert_eq!((first[0], first[539]), (yellow.0, yellow.0));
+        assert!(first[541] < 110, "track dimmed: {}", first[541]);
+        // Bottom edge untouched.
+        let last = &out[(c.h as usize - 1) * c.w as usize..][..c.w as usize];
+        assert!(last.iter().all(|&v| v == 200));
+    }
+
+    #[test]
+    fn the_compositor_puts_the_looked_bar_where_the_look_says() {
+        let src = ramp(640, 360);
+        let c = Canvas::PORTRAIT;
+        let base = c.base_rect(640.0, 360.0);
+        let look = crate::look::BarLook {
+            pos: Some(crate::look::BarPos::Top),
+            height: Some(2.0),
+        };
+        let mut comp = Compositor::new(640, 360, c)
+            .with_bar(Some((255, 212, 0)))
+            .with_bar_look(Some(&look));
+        let out = comp.compose(&src, base, 0.0, 1.0).unwrap().to_vec();
+        let y = yuv709(255, 212, 0).0;
+        let bh = bar_thickness(c, 2.0) as usize;
+        let w = c.w as usize;
+        assert!(out[..bh * w].iter().all(|&v| v == y));
+        assert!(!out[bh * w..(bh + 1) * w].iter().all(|&v| v == y));
+        assert!(!out[(c.h as usize - 1) * w..c.h as usize * w]
+            .iter()
+            .all(|&v| v == y));
+        // Bar off: the look alone draws nothing.
+        let mut comp = Compositor::new(640, 360, c).with_bar_look(Some(&look));
+        let plain = comp.compose(&src, base, 0.0, 1.0).unwrap().to_vec();
+        let mut none = Compositor::new(640, 360, c);
+        assert!(plain == none.compose(&src, base, 0.0, 1.0).unwrap());
     }
 
     #[test]

@@ -276,13 +276,36 @@ impl Corner {
     }
 }
 
-/// A corner logo.
+/// A logo: in a corner, or (with a Look) anywhere on the frame.
 #[derive(Debug, Clone)]
 pub struct Logo {
     pub path: PathBuf,
     pub corner: Corner,
     /// Image width / height (1.0 when unknown).
     pub aspect: f64,
+    /// The Look's size multiplier on the logo box (1.0 = today's).
+    pub scale: f64,
+    /// The Look's centre for the logo (fraction of the frame); wins over
+    /// `corner`.
+    pub at: Option<(f64, f64)>,
+    /// The Look's opacity (`None` = [`LOGO_ALPHA`]).
+    pub opacity: Option<f64>,
+}
+
+/// How opaque a logo is drawn unless the Look says otherwise.
+const LOGO_ALPHA: &str = "0.9";
+
+impl Default for Logo {
+    fn default() -> Self {
+        Logo {
+            path: PathBuf::new(),
+            corner: Corner::TopRight,
+            aspect: 1.0,
+            scale: 1.0,
+            at: None,
+            opacity: None,
+        }
+    }
 }
 
 impl Logo {
@@ -296,17 +319,44 @@ impl Logo {
             path,
             corner,
             aspect,
+            ..Logo::default()
         }
     }
 
+    /// The same logo dressed by the Look's logo section.
+    pub fn with_look(mut self, l: &crate::look::LogoLook) -> Logo {
+        self.scale = l.size.unwrap_or(1.0);
+        self.at =
+            (l.x.is_some() || l.y.is_some()).then(|| (l.x.unwrap_or(0.5), l.y.unwrap_or(0.5)));
+        self.opacity = l.opacity;
+        self
+    }
+
     /// Drawn size (even px): fits a box 14% of the short canvas side tall
-    /// and 26% wide, so marks and wide wordmarks read at the same weight.
+    /// and 26% wide (times the Look's size), so marks and wide wordmarks
+    /// read at the same weight.
     pub fn size(&self, c: Canvas) -> (u32, u32) {
         let s = c.w.min(c.h) as f64;
-        let (bw, bh) = (s * 0.26, s * 0.14);
+        let (bw, bh) = (s * 0.26 * self.scale, s * 0.14 * self.scale);
         let w = bw.min(bh * self.aspect);
         let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
         (even(w), even(w / self.aspect))
+    }
+
+    /// Top-left (even px) of a freely placed logo: centred on the Look's
+    /// point, then nudged so every edge stays on the canvas.
+    pub fn free_origin(&self, c: Canvas) -> Option<(u32, u32)> {
+        let (fx, fy) = self.at?;
+        let (lw, lh) = self.size(c);
+        let place = |centre: f64, extent: u32, room: u32| -> u32 {
+            let lo = centre - extent as f64 / 2.0;
+            let even = ((lo / 2.0).round() * 2.0).max(0.0) as u32;
+            even.min(room.saturating_sub(extent) & !1)
+        };
+        Some((
+            place(fx * c.w as f64, lw, c.w),
+            place(fy * c.h as f64, lh, c.h),
+        ))
     }
 
     /// Corner insets (x, y) in px.
@@ -360,6 +410,10 @@ pub struct Look {
     pub anim: crate::captions::ass::Anim,
     /// The Look's captions section (position, size, colours, ...).
     pub captions: Option<crate::look::CaptionsLook>,
+    /// The Look's headline section.
+    pub headline: Option<crate::look::HeadlineLook>,
+    /// The Look's progress bar section.
+    pub bar_look: Option<crate::look::BarLook>,
 }
 
 /// Everything one render needs.
@@ -877,7 +931,9 @@ fn run(
     });
 
     // --- compose loop (this thread) ----------------------------------------
-    let mut comp = Compositor::new(dg.w, dg.h, canvas).with_bar(job.look.bar);
+    let mut comp = Compositor::new(dg.w, dg.h, canvas)
+        .with_bar(job.look.bar)
+        .with_bar_look(job.look.bar_look.as_ref());
     let base = canvas.base_rect(
         job.probe.width.unwrap_or(dg.w) as f64,
         job.probe.height.unwrap_or(dg.h) as f64,
@@ -999,24 +1055,34 @@ fn run(
 }
 
 /// Logo overlay (input `li`) on the video chain: sized by `Logo::size`,
-/// lightly translucent, inset from its corner. Captions burn on top.
-fn logo_chain(li: usize, logo: &Logo, c: Canvas) -> String {
+/// lightly translucent, inset from its corner (or put where the Look says).
+/// Captions burn on top.
+pub fn logo_chain(li: usize, logo: &Logo, c: Canvas) -> String {
     let (lw, lh) = logo.size(c);
     let (mx, my) = Logo::inset(c);
-    let x = if logo.corner.is_left() {
-        format!("{mx}")
+    let (x, y) = if let Some((x, y)) = logo.free_origin(c) {
+        (format!("{x}"), format!("{y}"))
     } else {
-        format!("W-w-{mx}")
+        let x = if logo.corner.is_left() {
+            format!("{mx}")
+        } else {
+            format!("W-w-{mx}")
+        };
+        // Bottom corners sit higher: clear of the progress bar and the
+        // platform's bottom UI.
+        let y = if logo.corner.is_top() {
+            format!("{my}")
+        } else {
+            format!("H-h-{}", my * 2)
+        };
+        (x, y)
     };
-    // Bottom corners sit higher: clear of the progress bar and the
-    // platform's bottom UI.
-    let y = if logo.corner.is_top() {
-        format!("{my}")
-    } else {
-        format!("H-h-{}", my * 2)
-    };
+    let alpha = logo.opacity.map_or_else(
+        || LOGO_ALPHA.to_string(),
+        |o| format!("{}", (o.clamp(0.0, 1.0) * 100.0).round() / 100.0),
+    );
     format!(
-        "[vpre];[{li}:v]format=rgba,scale={lw}:{lh}:flags=lanczos,colorchannelmixer=aa=0.9[logo];\
+        "[vpre];[{li}:v]format=rgba,scale={lw}:{lh}:flags=lanczos,colorchannelmixer=aa={alpha}[logo];\
          [vpre][logo]overlay=x={x}:y={y}:format=auto,format=yuv420p"
     )
 }
@@ -1223,6 +1289,7 @@ mod tests {
             path: PathBuf::new(),
             corner: Corner::TopRight,
             aspect: 1.0,
+            ..Default::default()
         };
         let word = Logo {
             aspect: 4.0,
@@ -1246,9 +1313,149 @@ mod tests {
             path: PathBuf::new(),
             corner: Corner::BottomRight,
             aspect: 1.0,
+            ..Default::default()
         };
         let f = logo_chain(3, &l, Canvas::SQUARE);
         assert!(f.contains("[3:v]format=rgba,scale=152:152"), "{f}");
         assert!(f.contains("overlay=x=W-w-43:y=H-h-76"), "{f}");
+    }
+
+    // ---- Look: logo section ----------------------------------------------
+
+    fn logo_look(json: &str) -> crate::look::LogoLook {
+        crate::look::Look::parse(&format!(r#"{{"logo":{json}}}"#))
+            .logo
+            .unwrap()
+    }
+
+    fn logo_with(corner: Corner, aspect: f64, json: &str) -> Logo {
+        Logo {
+            corner,
+            aspect,
+            ..Default::default()
+        }
+        .with_look(&logo_look(json))
+    }
+
+    #[test]
+    fn no_logo_look_and_an_empty_one_leave_the_filter_string_alone() {
+        for (corner, c, x, y) in [
+            (Corner::TopLeft, Canvas::TALL, "43", "67"),
+            (Corner::TopRight, Canvas::SQUARE, "W-w-43", "38"),
+            (Corner::BottomLeft, Canvas::WIDE, "77", "H-h-76"),
+            (Corner::BottomRight, Canvas::PORTRAIT, "W-w-43", "H-h-94"),
+        ] {
+            let (w, h) = Logo {
+                corner,
+                ..Default::default()
+            }
+            .size(c);
+            let want = format!(
+                "[vpre];[3:v]format=rgba,scale={w}:{h}:flags=lanczos,colorchannelmixer=aa=0.9[logo];\
+                 [vpre][logo]overlay=x={x}:y={y}:format=auto,format=yuv420p"
+            );
+            let plain = Logo {
+                corner,
+                ..Default::default()
+            };
+            assert_eq!(logo_chain(3, &plain, c), want, "{corner:?} {c:?}");
+            let looked = logo_with(corner, 1.0, "{}");
+            assert_eq!(logo_chain(3, &looked, c), want, "{corner:?} {c:?}");
+        }
+    }
+
+    #[test]
+    fn a_free_logo_is_centred_on_its_point() {
+        let c = Canvas::TALL;
+        let f = logo_chain(
+            2,
+            &logo_with(Corner::TopRight, 1.0, r#"{"x":0.5,"y":0.5}"#),
+            c,
+        );
+        // 152 px box: 540 - 76, 960 - 76.
+        assert!(f.contains("overlay=x=464:y=884:"), "{f}");
+        assert!(f.contains("scale=152:152"), "{f}");
+        // One coordinate: the other is the middle. It beats the corner.
+        let f = logo_chain(2, &logo_with(Corner::BottomLeft, 1.0, r#"{"x":0.25}"#), c);
+        assert!(f.contains("overlay=x=194:y=884:"), "{f}");
+        let f = logo_chain(2, &logo_with(Corner::BottomLeft, 1.0, r#"{"y":0.1}"#), c);
+        assert!(f.contains("overlay=x=464:y=116:"), "{f}");
+        // Wordmark: its own (shorter) box is what gets centred.
+        let l = logo_with(Corner::TopRight, 4.0, r#"{"x":0.5,"y":0.5}"#);
+        assert_eq!(l.size(c), (280, 70));
+        assert_eq!(l.free_origin(c), Some((400, 926)));
+    }
+
+    #[test]
+    fn a_free_logo_never_leaves_the_frame() {
+        for c in [Canvas::TALL, Canvas::SQUARE, Canvas::WIDE] {
+            for aspect in [1.0, 4.0, 0.5] {
+                for size in [0.4, 1.0, 2.5] {
+                    let json = format!(r#"{{"size":{size}}}"#);
+                    for (x, y) in [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0), (0.5, 0.01)] {
+                        let mut l = logo_with(Corner::TopRight, aspect, &json);
+                        l.at = Some((x, y));
+                        let (lw, lh) = l.size(c);
+                        let (ox, oy) = l.free_origin(c).unwrap();
+                        assert!(ox + lw <= c.w && oy + lh <= c.h, "{c:?} {aspect} {size}");
+                        assert!(ox % 2 == 0 && oy % 2 == 0);
+                    }
+                }
+            }
+        }
+        let c = Canvas::TALL;
+        let f = logo_chain(2, &logo_with(Corner::TopRight, 1.0, r#"{"x":0,"y":0}"#), c);
+        assert!(f.contains("overlay=x=0:y=0:"), "{f}");
+        let f = logo_chain(2, &logo_with(Corner::TopRight, 1.0, r#"{"x":1,"y":1}"#), c);
+        assert!(f.contains("overlay=x=928:y=1768:"), "{f}");
+        // The box must fit even at the largest size on a tall canvas.
+        let f = logo_chain(
+            2,
+            &logo_with(Corner::TopRight, 4.0, r#"{"size":2.5,"x":1,"y":0.5}"#),
+            c,
+        );
+        assert!(f.contains("scale=702:176"), "{f}");
+        assert!(f.contains("overlay=x=378:y=872:"), "{f}");
+    }
+
+    #[test]
+    fn logo_size_scales_the_box_and_the_corner_inset_stays() {
+        let c = Canvas::TALL;
+        let base = logo_with(Corner::BottomRight, 1.0, "{}").size(c);
+        assert_eq!(base, (152, 152));
+        assert_eq!(
+            logo_with(Corner::BottomRight, 1.0, r#"{"size":2}"#).size(c),
+            (302, 302)
+        );
+        assert_eq!(
+            logo_with(Corner::BottomRight, 1.0, r#"{"size":0.5}"#).size(c),
+            (76, 76)
+        );
+        let f = logo_chain(3, &logo_with(Corner::BottomRight, 1.0, r#"{"size":2}"#), c);
+        assert!(f.contains("scale=302:302"), "{f}");
+        assert!(f.contains("overlay=x=W-w-43:y=H-h-134:"), "{f}");
+        // The wordmark box grows too (wide 26% x tall 14%, both times size).
+        let w = logo_with(Corner::TopLeft, 4.0, r#"{"size":2}"#).size(c);
+        assert_eq!(w, (562, 140));
+    }
+
+    #[test]
+    fn logo_opacity_replaces_the_fixed_one() {
+        let c = Canvas::SQUARE;
+        let aa = |json: &str| {
+            let f = logo_chain(1, &logo_with(Corner::TopRight, 1.0, json), c);
+            f.split("colorchannelmixer=aa=")
+                .nth(1)
+                .unwrap()
+                .split('[')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(aa("{}"), "0.9");
+        assert_eq!(aa(r#"{"opacity":0.5}"#), "0.5");
+        assert_eq!(aa(r#"{"opacity":0}"#), "0");
+        assert_eq!(aa(r#"{"opacity":1}"#), "1");
+        assert_eq!(aa(r#"{"opacity":0.333}"#), "0.33");
     }
 }

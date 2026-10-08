@@ -103,12 +103,20 @@ struct Timeline {
 /// Canvas and overlays from the CLI flags. Missing logo/music files fail
 /// fast (they were asked for by name).
 fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
+    let parsed = args.look.as_deref().map(crate::look::Look::from_arg);
     let logo = match &args.logo {
         Some(p) if !p.is_file() => anyhow::bail!("--logo not found: {}", p.display()),
-        Some(p) => Some(crate::render::Logo::new(
-            p.clone(),
-            crate::render::Corner::parse(&args.logo_pos).unwrap_or(crate::render::Corner::TopRight),
-        )),
+        Some(p) => {
+            let logo = crate::render::Logo::new(
+                p.clone(),
+                crate::render::Corner::parse(&args.logo_pos)
+                    .unwrap_or(crate::render::Corner::TopRight),
+            );
+            Some(match parsed.as_ref().and_then(|l| l.logo.as_ref()) {
+                Some(l) => logo.with_look(l),
+                None => logo,
+            })
+        }
         None => None,
     };
     let music = match &args.music {
@@ -125,11 +133,9 @@ fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
         logo,
         music,
         anim: crate::captions::ass::Anim::parse(&args.caption_anim),
-        captions: args
-            .look
-            .as_deref()
-            .map(crate::look::Look::from_arg)
-            .and_then(|l| l.captions),
+        captions: parsed.as_ref().and_then(|l| l.captions.clone()),
+        headline: parsed.as_ref().and_then(|l| l.headline.clone()),
+        bar_look: parsed.and_then(|l| l.bar),
     })
 }
 
@@ -148,13 +154,21 @@ fn ass_opts(
         dur,
         anim: look.anim,
         captions: look.captions.clone(),
+        headline_look: look.headline.clone(),
         seam,
-        // Logo width + its inset + a gap.
-        clear: look.logo.as_ref().map(|l| crate::captions::ass::Clear {
-            top: l.corner.is_top(),
-            left: l.corner.is_left(),
-            px: l.size(c).0 + crate::render::Logo::inset(c).0 + (c.w as f64 * 0.025).round() as u32,
-        }),
+        // Logo width + its inset + a gap. A logo the Look placed by hand is
+        // the user's call: text does not make room for it.
+        clear: look
+            .logo
+            .as_ref()
+            .filter(|l| l.at.is_none())
+            .map(|l| crate::captions::ass::Clear {
+                top: l.corner.is_top(),
+                left: l.corner.is_left(),
+                px: l.size(c).0
+                    + crate::render::Logo::inset(c).0
+                    + (c.w as f64 * 0.025).round() as u32,
+            }),
     }
 }
 
@@ -2567,6 +2581,50 @@ fn exact_fit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn logo_look(corner: crate::render::Corner, json: &str) -> crate::render::Look {
+        let l = crate::look::Look::parse(json);
+        let logo = crate::render::Logo {
+            corner,
+            ..Default::default()
+        };
+        crate::render::Look {
+            canvas: crate::compose::Canvas::SQUARE,
+            logo: Some(match &l.logo {
+                Some(g) => logo.with_look(g),
+                None => logo,
+            }),
+            headline: l.headline,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn text_clears_a_corner_logo_by_its_scaled_size_and_ignores_a_free_one() {
+        use crate::render::Corner::TopRight;
+        let clear = |json: &str| ass_opts(&logo_look(TopRight, json), None, 5.0, false).clear;
+        // Today: logo box 152 + inset 43 + gap 27.
+        let today = clear("{}").unwrap();
+        assert_eq!((today.top, today.left, today.px), (true, false, 222));
+        assert_eq!(clear(r#"{"logo":{"opacity":0.5}}"#), Some(today));
+        // Scaled: the wider box is what text keeps clear of.
+        let big = clear(r#"{"logo":{"size":2}}"#).unwrap();
+        assert_eq!(big.px, 302 + 43 + 27);
+        // Placed by hand: nobody makes room.
+        assert_eq!(clear(r#"{"logo":{"x":0.8,"y":0.1}}"#), None);
+        assert_eq!(clear(r#"{"logo":{"y":0.9}}"#), None);
+    }
+
+    #[test]
+    fn the_headline_look_reaches_the_caption_options() {
+        let l = logo_look(
+            crate::render::Corner::TopLeft,
+            r#"{"headline":{"x":0.3,"seconds":2}}"#,
+        );
+        let o = ass_opts(&l, Some("Big news".into()), 6.0, false);
+        let h = o.headline_look.unwrap();
+        assert_eq!((h.x, h.seconds), (Some(0.3), Some(2.0)));
+    }
 
     #[test]
     fn batch_expands_folders_and_names_outputs() {

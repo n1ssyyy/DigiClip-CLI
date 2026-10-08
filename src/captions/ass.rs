@@ -5,7 +5,7 @@
 //! caption block moved to the lower third (mid-frame would sit on the face).
 //! An optional headline is pinned at the top for the whole clip.
 
-use crate::look::{BoxLook, CaptionsLook, Case};
+use crate::look::{BoxLook, CaptionsLook, Case, HeadlineAnim, HeadlineLook};
 use crate::whisper::Word;
 
 pub const PLAY_W: u32 = 1080;
@@ -491,6 +491,18 @@ const SLIDE_RISE: f64 = 0.022;
 const SLIDE_MS: i64 = 260;
 /// Padding (px at 1080 wide) of a box a Look adds to a style without one.
 const BOX_PAD: f64 = 14.0;
+/// Headline type size and card padding (px at 1080 wide, before `size`).
+const HEADLINE_PX: f64 = 64.0;
+const HEADLINE_PAD: f64 = 24.0;
+/// Outline (px at 1080 wide, before `size`) of a headline without a card.
+const HEADLINE_EDGE: f64 = 5.0;
+/// Line height of the headline face as a share of its size, as libass lays
+/// it out (measured on a render; only used to find the middle of today's
+/// card and to keep a placed card inside the frame).
+const HEADLINE_LINE: f64 = 1.0;
+/// A headline's fade in / out (ms) when the Look asks for one.
+const HEADLINE_FADE_IN: i64 = 200;
+const HEADLINE_FADE_OUT: i64 = 200;
 
 /// Canvas and extras for one captions file.
 #[derive(Debug, Clone)]
@@ -510,6 +522,9 @@ pub struct AssOpts {
     /// The Look's captions section: overrides over the style (position,
     /// size, font, colours, box, words per line, motion).
     pub captions: Option<CaptionsLook>,
+    /// The Look's headline section (position, size, colours, card, motion,
+    /// time on screen). Only matters while `headline` is set.
+    pub headline_look: Option<HeadlineLook>,
 }
 
 /// Corner space taken by a logo: text on that band (headline at the top,
@@ -532,6 +547,7 @@ impl Default for AssOpts {
             anim: Anim::default(),
             seam: false,
             captions: None,
+            headline_look: None,
         }
     }
 }
@@ -866,31 +882,107 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     }
     // Headline: one solid white card (a single box behind both lines —
     // BorderStyle 4) with dark type and one accented word, top center,
-    // clear of the platform's top bar on tall canvases.
+    // clear of the platform's top bar on tall canvases. A Look can move it,
+    // resize it, recolour it, drop the card, change the entrance and end it
+    // early.
     let headline = o
         .headline
         .as_deref()
         .map(|h| headline_text(h, HEADLINE_MAX))
         .filter(|h| !h.is_empty() && o.dur > 0.0);
-    if headline.is_some() {
+    let mut headline_event = None;
+    if let Some(h) = &headline {
+        let hl = o.headline_look.clone().unwrap_or_default();
+        let size = hl.size.unwrap_or(1.0);
         let top = (ph as f64 * if tall { 0.085 } else { 0.05 }).round() as u32;
-        let (ml, mr) = clear_of((90.0 * pw as f64 / PLAY_W as f64).round() as u32, true);
+        let side_h = (90.0 * pw as f64 / PLAY_W as f64).round() as u32;
+        let no_card = hl.card == Some(BoxLook::None);
+        let ink_rgb = hl
+            .ink
+            .or(no_card.then_some(crate::look::Rgb(255, 255, 255)));
+        let ink = ink_rgb.map_or_else(|| HEADLINE_INK.to_string(), |c| c.ass(0));
+        let accent = hl
+            .accent
+            .map_or_else(|| HEADLINE_ACCENT.to_string(), |c| c.ass(0));
+        let (border, edge, edge_w) = if no_card {
+            // No card: a dark outline keeps the type readable on footage (a
+            // light one when the ink itself is dark).
+            let dark_ink = ink_rgb.is_some_and(|c| {
+                (0.2126 * c.0 as f64 + 0.7152 * c.1 as f64 + 0.0722 * c.2 as f64) < 90.0
+            });
+            let e = if dark_ink { "&H00FFFFFF" } else { "&H00000000" };
+            (1, e.to_string(), px(HEADLINE_EDGE * size))
+        } else {
+            let e = match hl.card {
+                Some(BoxLook::Color(c)) => c.ass(0),
+                _ => "&H00FFFFFF".to_string(),
+            };
+            (4, e, px(HEADLINE_PAD * size))
+        };
+        let font_px = px(HEADLINE_PX * size);
+        let markup = headline_markup(h, &ink, &accent);
+        // Where: today's top-centre, or anchored on a point by its middle.
+        let place = (hl.x.is_some() || hl.y.is_some()).then(|| {
+            let (w, s) = (pw as f64, side_h as f64);
+            let cx = hl.x.unwrap_or(0.5) * w;
+            let half = (cx.min(w - cx) - s).max(0.2 * w);
+            let cx = cx.max(half + s).min(w - half - s);
+            let lines = 1 + markup.matches("\\N").count();
+            let block = lines as f64 * font_px as f64 * HEADLINE_LINE;
+            let cy = hl.y.map_or(top as f64 + block / 2.0, |y| y * ph as f64);
+            // Whole card inside the frame.
+            let reach = block / 2.0 + edge_w as f64;
+            let cy = cy.max(reach).min((ph as f64 - reach).max(reach));
+            Place {
+                x: cx.round() as i64,
+                y: cy.round() as i64,
+                margin: (w / 2.0 - half).round().max(0.0) as u32,
+            }
+        });
+        let (ml, mr, align, margin_v) = match &place {
+            Some(p) => (p.margin, p.margin, 5, 0),
+            None => {
+                let (ml, mr) = clear_of(side_h, true);
+                (ml, mr, 8, top)
+            }
+        };
         out.push_str(&format!(
-            "Style: Headline,Archivo Black,{},{HEADLINE_INK},{HEADLINE_INK},&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,4,{},0,8,{ml},{mr},{top},1\n",
-            px(64.0),
-            px(24.0),
+            "Style: Headline,Archivo Black,{font_px},{ink},{ink},{edge},{edge},0,0,0,0,100,100,0,0,{border},{edge_w},0,{align},{ml},{mr},{margin_v},1\n",
+        ));
+        // Time on screen: the whole clip, or `seconds` of it with a short
+        // fade out, never past the clip.
+        let (end, fout) = match hl.seconds.filter(|&s| s > 0.0) {
+            Some(s) if s < o.dur => (s, HEADLINE_FADE_OUT.min((s * 1000.0) as i64)),
+            _ => (o.dur, 0),
+        };
+        let mut tags = String::new();
+        if let Some(p) = &place {
+            tags.push_str(&format!("\\pos({},{})", p.x, p.y));
+        }
+        match hl.anim.unwrap_or(HeadlineAnim::Pop) {
+            // Pops in: a quick overshoot, then settles.
+            HeadlineAnim::Pop => tags.push_str(&format!(
+                "\\fad(160,{fout})\\fscx72\\fscy72\\t(0,200,\\fscx106\\fscy106)\\t(200,340,\\fscx100\\fscy100)"
+            )),
+            HeadlineAnim::Fade => tags.push_str(&format!("\\fad({HEADLINE_FADE_IN},{fout})")),
+            HeadlineAnim::None if fout > 0 => tags.push_str(&format!("\\fad(0,{fout})")),
+            HeadlineAnim::None => {}
+        }
+        let tags = if tags.is_empty() {
+            tags
+        } else {
+            format!("{{{tags}}}")
+        };
+        headline_event = Some(format!(
+            "Dialogue: 1,{},{},Headline,,0,0,0,,{tags}{markup}\n",
+            stamp(0.0),
+            stamp(end),
         ));
     }
     out.push('\n');
     out.push_str("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
-    if let Some(h) = &headline {
-        // Pops in: a quick overshoot, then settles.
-        out.push_str(&format!(
-            "Dialogue: 1,{},{},Headline,,0,0,0,,{{\\fad(160,0)\\fscx72\\fscy72\\t(0,200,\\fscx106\\fscy106)\\t(200,340,\\fscx100\\fscy100)}}{}\n",
-            stamp(0.0),
-            stamp(o.dur),
-            headline_markup(h, HEADLINE_INK, HEADLINE_ACCENT),
-        ));
+    if let Some(e) = &headline_event {
+        out.push_str(e);
     }
     // What opens every line: its placement and entrance. A slide moves
     // the line, so it always needs a point: the requested one, else where
@@ -1283,6 +1375,10 @@ mod tests {
             .collect()
     }
 
+    fn headline_of(json: &str) -> Option<HeadlineLook> {
+        crate::look::Look::parse(&format!(r##"{{"headline":{json}}}"##)).headline
+    }
+
     fn captions_of(json: &str) -> Option<CaptionsLook> {
         crate::look::Look::parse(&format!(r##"{{"captions":{json}}}"##)).captions
     }
@@ -1363,15 +1459,23 @@ mod tests {
             ),
         ];
         for (style, o, (hash, len)) in base {
-            for look in [None, captions_of("{}")] {
+            for (cap, head) in [(None, None), (captions_of("{}"), headline_of("{}"))] {
                 let o = AssOpts {
-                    captions: look,
+                    captions: cap,
+                    headline_look: head,
                     ..o.clone()
                 };
                 let a = build_for(&sample(), style, 0.0, &o);
                 assert_eq!((fnv(&a), a.len()), (hash, len), "{style}\n{a}");
             }
         }
+        // A headline look with no headline on is nothing to draw.
+        let o = AssOpts {
+            headline_look: headline_of(r#"{"x":0.3,"seconds":2,"card":"none"}"#),
+            ..AssOpts::default()
+        };
+        let a = build_for(&sample(), "karaoke", 0.0, &o);
+        assert_eq!((fnv(&a), a.len()), (0xc5102f6c4955005f, 1626));
         // Sections that are not captions change nothing either.
         let l =
             crate::look::Look::parse(r#"{"v":1,"bar":{"pos":"top"},"camera":{"feel":"lively"}}"#);
@@ -1727,5 +1831,318 @@ mod tests {
             "{}",
         );
         same(r#"{"unknown":1,"x":null}"#, "{}");
+    }
+
+    // ---- Look: headline section --------------------------------------
+
+    const HEAD: &str = "Why most founders quit too early";
+
+    /// `H:MM:SS.cc` -> seconds.
+    fn stamp_secs(t: &str) -> f64 {
+        let p: Vec<f64> = t.split(':').map(|v| v.parse().unwrap()).collect();
+        p[0] * 3600.0 + p[1] * 60.0 + p[2]
+    }
+
+    fn head_ass(json: &str, w: u32, h: u32, dur: f64) -> String {
+        build_for(
+            &sample(),
+            "karaoke",
+            0.0,
+            &AssOpts {
+                w,
+                h,
+                dur,
+                headline: Some(HEAD.into()),
+                headline_look: headline_of(json),
+                ..AssOpts::default()
+            },
+        )
+    }
+
+    fn tall(json: &str) -> String {
+        head_ass(json, 1080, 1920, 9.0)
+    }
+
+    fn head_event(ass: &str) -> &str {
+        ass.lines()
+            .find(|l| l.starts_with("Dialogue: 1,"))
+            .unwrap_or_else(|| panic!("no headline event in\n{ass}"))
+    }
+
+    #[test]
+    fn headline_today_is_a_white_card_popping_in_at_the_top() {
+        let ass = tall("{}");
+        let h = style_line(&ass, "Headline");
+        assert_eq!(
+            h[1..].join(","),
+            "Archivo Black,64,&H00111111,&H00111111,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,4,24,0,8,90,90,163,1"
+        );
+        assert!(head_event(&ass).starts_with(
+            "Dialogue: 1,0:00:00.00,0:00:09.00,Headline,,0,0,0,,{\\fad(160,0)\\fscx72\\fscy72\\t(0,200,"
+        ));
+    }
+
+    #[test]
+    fn headline_size_scales_type_and_card_padding_together() {
+        let h = style_line(&tall(r#"{"size":1.5}"#), "Headline").join(",");
+        assert!(h.contains(",Archivo Black,96,"), "{h}");
+        assert!(h.contains(",0,0,4,36,0,8,"), "{h}");
+        let h = style_line(&tall(r#"{"size":0.5}"#), "Headline").join(",");
+        assert!(h.contains(",Archivo Black,32,"), "{h}");
+        assert!(h.contains(",0,0,4,12,0,8,"), "{h}");
+    }
+
+    #[test]
+    fn headline_ink_card_and_accent_colours() {
+        let ass = tall(r##"{"ink":"#FFFFFF","card":"#111111","accent":"#FFD400"}"##);
+        let h = style_line(&ass, "Headline");
+        assert_eq!(
+            (h[3], h[4], h[5], h[6]),
+            ("&H00FFFFFF", "&H00FFFFFF", "&H00111111", "&H00111111")
+        );
+        assert_eq!(h[15], "4");
+        let e = head_event(&ass);
+        // The accent word is yellow, and the type goes back to the ink after.
+        assert!(e.contains("{\\1c&H0000D4FF&}"), "{e}");
+        assert!(e.contains("{\\1c&H00FFFFFF&}"), "{e}");
+        assert!(!e.contains("&H001E3CFF"), "{e}");
+        // Each colour on its own.
+        let h = style_line(&tall(r##"{"ink":"#00FF00"}"##), "Headline").join(",");
+        assert!(
+            h.contains(",&H0000FF00,&H0000FF00,&H00FFFFFF,&H00FFFFFF,"),
+            "{h}"
+        );
+        let h = style_line(&tall(r##"{"card":"#102030"}"##), "Headline").join(",");
+        assert!(
+            h.contains(",&H00111111,&H00111111,&H00302010,&H00302010,"),
+            "{h}"
+        );
+        assert!(head_event(&tall(r##"{"accent":"#00FF00"}"##)).contains("{\\1c&H0000FF00&}"));
+    }
+
+    #[test]
+    fn a_headline_without_a_card_gets_a_dark_outline() {
+        for card in [r#""none""#, "null", r#""NONE""#] {
+            let ass = tall(&format!(r#"{{"card":{card}}}"#));
+            let h = style_line(&ass, "Headline");
+            // Plain outline text: white ink, black edge, no box.
+            assert_eq!(
+                (h[3], h[5], h[15], h[16]),
+                ("&H00FFFFFF", "&H00000000", "1", "5"),
+                "{card}"
+            );
+            let e = head_event(&ass);
+            assert!(e.contains("{\\1c&H001E3CFF&}"), "{e}");
+            assert!(
+                e.contains("{\\1c&HFFFFFF&}") || e.contains("{\\1c&H00FFFFFF&}"),
+                "{e}"
+            );
+        }
+        // The edge scales with the type.
+        let ass = tall(r#"{"card":"none","size":2}"#);
+        let h = style_line(&ass, "Headline");
+        assert_eq!((h[2], h[16]), ("128", "10"));
+        // Your own ink is kept; a dark ink gets a light edge instead.
+        let ass = tall(r##"{"card":"none","ink":"#FFD400"}"##);
+        let h = style_line(&ass, "Headline");
+        assert_eq!((h[3], h[5]), ("&H0000D4FF", "&H00000000"));
+        let ass = tall(r##"{"card":"none","ink":"#101010"}"##);
+        let h = style_line(&ass, "Headline");
+        assert_eq!((h[3], h[5]), ("&H00101010", "&H00FFFFFF"));
+    }
+
+    #[test]
+    fn headline_position_anchors_the_card_by_its_centre() {
+        let ass = tall(r#"{"x":0.5,"y":0.7}"#);
+        let h = style_line(&ass, "Headline");
+        // Middle-centre, no vertical margin, the usual side margins.
+        assert_eq!((h[18], h[19], h[20], h[21]), ("5", "90", "90", "0"));
+        assert!(head_event(&ass).contains(",,{\\pos(540,1344)\\fad(160,0)\\fscx72"));
+        // Off-centre: wrap width is twice the room to the nearer edge.
+        let ass = tall(r#"{"x":0.35,"y":0.2}"#);
+        let h = style_line(&ass, "Headline");
+        assert_eq!((h[19], h[20]), ("252", "252"));
+        assert!(head_event(&ass).contains("{\\pos(378,384)"));
+        // Hard against an edge the centre is nudged in so words still fit.
+        let ass = tall(r#"{"x":0.02,"y":0.5}"#);
+        let h = style_line(&ass, "Headline");
+        assert_eq!((h[19], h[20]), ("324", "324"));
+        assert!(head_event(&ass).contains("{\\pos(306,960)"));
+        let ass = tall(r#"{"x":1,"y":0.5}"#);
+        assert!(head_event(&ass).contains("{\\pos(774,960)"));
+        // Never lets the wrapped text leave the frame, wherever x is.
+        for i in 0..=20 {
+            let x = i as f64 / 20.0;
+            let ass = tall(&format!(r#"{{"x":{x},"y":0.5}}"#));
+            let h = style_line(&ass, "Headline");
+            let m: f64 = h[19].parse().unwrap();
+            let pos = head_event(&ass).split("\\pos(").nth(1).unwrap();
+            let cx: f64 = pos.split(',').next().unwrap().parse().unwrap();
+            let half = 540.0 - m;
+            assert!(cx - half >= 89.0 && cx + half <= 991.0, "x {x}: {cx} {m}");
+        }
+        // One coordinate: the other is the middle (x) or today's spot (y).
+        let ass = tall(r#"{"y":0.25}"#);
+        assert!(head_event(&ass).contains("{\\pos(540,480)"));
+        let ass = tall(r#"{"x":0.5}"#);
+        assert!(
+            head_event(&ass).contains("{\\pos(540,227)"),
+            "{}",
+            head_event(&ass)
+        );
+    }
+
+    #[test]
+    fn a_placed_headline_stays_in_the_frame_and_beats_the_logo() {
+        // The card (two lines, padding) never pokes out of the top or bottom.
+        let ass = tall(r#"{"x":0.5,"y":0}"#);
+        assert!(
+            head_event(&ass).contains("{\\pos(540,88)"),
+            "{}",
+            head_event(&ass)
+        );
+        let ass = tall(r#"{"x":0.5,"y":1}"#);
+        assert!(
+            head_event(&ass).contains("{\\pos(540,1832)"),
+            "{}",
+            head_event(&ass)
+        );
+        // A corner logo widens the headline's margin only while the headline
+        // sits where it always did.
+        let clear = Some(Clear {
+            top: true,
+            left: false,
+            px: 260,
+        });
+        let run = |json: &str| {
+            build_for(
+                &sample(),
+                "karaoke",
+                0.0,
+                &AssOpts {
+                    headline: Some(HEAD.into()),
+                    dur: 9.0,
+                    clear,
+                    headline_look: headline_of(json),
+                    ..AssOpts::default()
+                },
+            )
+        };
+        let h = style_line(&run("{}"), "Headline").join(",");
+        assert!(h.contains(",8,90,260,163,1"), "{h}");
+        let h = style_line(&run(r#"{"size":1.2}"#), "Headline").join(",");
+        assert!(h.contains(",8,90,260,163,1"), "{h}");
+        let h = style_line(&run(r#"{"x":0.5,"y":0.12}"#), "Headline").join(",");
+        assert!(h.contains(",5,90,90,0,1"), "{h}");
+    }
+
+    #[test]
+    fn headline_placement_on_a_square_canvas() {
+        let ass = head_ass(
+            r##"{"x":0.5,"y":0.7,"size":1.3,"ink":"#FFFFFF","card":"#111111","accent":"#FFD400","anim":"fade"}"##,
+            1080,
+            1080,
+            9.0,
+        );
+        let h = style_line(&ass, "Headline");
+        assert_eq!((h[2], h[16]), ("75", "28"));
+        assert!(
+            head_event(&ass).contains("{\\pos(540,756)\\fad(200,0)}"),
+            "{}",
+            head_event(&ass)
+        );
+    }
+
+    #[test]
+    fn headline_motion_pop_fade_none() {
+        let tags = |json: &str| {
+            let e = head_event(&tall(json)).to_string();
+            let t = e.split(",,").nth(2).unwrap().to_string();
+            t.split('}')
+                .next()
+                .unwrap()
+                .trim_start_matches('{')
+                .to_string()
+        };
+        assert!(tags(r#"{"anim":"pop"}"#).starts_with("\\fad(160,0)\\fscx72\\fscy72\\t(0,200,"));
+        assert_eq!(tags("{}"), tags(r#"{"anim":"pop"}"#));
+        // Fade: fades in, never scales.
+        assert_eq!(tags(r#"{"anim":"fade"}"#), "\\fad(200,0)");
+        // None: cuts in, so there is no tag block at all...
+        let ass = tall(r#"{"anim":"none"}"#);
+        assert!(
+            head_event(&ass).contains(",Headline,,0,0,0,,Why "),
+            "{}",
+            head_event(&ass)
+        );
+        // ...unless it is placed or ends early.
+        assert_eq!(tags(r#"{"anim":"none","x":0.4}"#), "\\pos(432,227)");
+        assert_eq!(tags(r#"{"anim":"none","seconds":3}"#), "\\fad(0,200)");
+        assert!(!tags(r#"{"anim":"fade","x":0.5,"y":0.5}"#).contains("fscx"));
+    }
+
+    #[test]
+    fn headline_seconds_shortens_the_event_and_never_passes_the_clip() {
+        let end = |json: &str, dur: f64| {
+            let ass = head_ass(json, 1080, 1920, dur);
+            let e = head_event(&ass).to_string();
+            let mut f = e.split(',').skip(1);
+            let (a, b) = (f.next().unwrap().to_string(), f.next().unwrap().to_string());
+            let fad = e
+                .split("\\fad(")
+                .nth(1)
+                .map(|t| t.split(')').next().unwrap().to_string());
+            (a, b, fad)
+        };
+        // Whole clip: absent, zero.
+        assert_eq!(
+            end("{}", 9.0),
+            (
+                "0:00:00.00".into(),
+                "0:00:09.00".into(),
+                Some("160,0".into())
+            )
+        );
+        assert_eq!(end(r#"{"seconds":0}"#, 9.0), end("{}", 9.0));
+        // 3 s then a 200 ms fade out inside it.
+        assert_eq!(
+            end(r#"{"seconds":3}"#, 9.0),
+            (
+                "0:00:00.00".into(),
+                "0:00:03.00".into(),
+                Some("160,200".into())
+            )
+        );
+        assert_eq!(end(r#"{"seconds":2.5,"anim":"fade"}"#, 9.0).1, "0:00:02.50");
+        // Longer than the clip, or the same: the clip.
+        assert_eq!(end(r#"{"seconds":30}"#, 9.0), end("{}", 9.0));
+        assert_eq!(end(r#"{"seconds":9}"#, 9.0), end("{}", 9.0));
+        assert_eq!(end(r#"{"seconds":3}"#, 2.0), end("{}", 2.0));
+        // Very short: the fade out cannot be longer than the headline.
+        assert_eq!(end(r#"{"seconds":0.1}"#, 9.0).2, Some("160,100".into()));
+        // It moves with the clip length, not the other way round.
+        for dur in [1.0, 4.0, 60.0] {
+            let (_, b, _) = end(r#"{"seconds":5}"#, dur);
+            let secs = stamp_secs(&b);
+            assert!(secs <= dur + 1e-9, "{b} vs {dur}");
+        }
+        // The captions do not follow it.
+        let ass = tall(r#"{"seconds":1}"#);
+        assert_eq!(dialogues(&ass), dialogues(&tall("{}")));
+    }
+
+    #[test]
+    fn a_headline_look_without_a_headline_draws_nothing() {
+        let ass = build_for(
+            &sample(),
+            "karaoke",
+            0.0,
+            &AssOpts {
+                dur: 9.0,
+                headline_look: headline_of(r#"{"x":0.2,"y":0.2}"#),
+                ..AssOpts::default()
+            },
+        );
+        assert!(!ass.contains("Headline"));
     }
 }

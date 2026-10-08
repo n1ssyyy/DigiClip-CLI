@@ -1622,6 +1622,8 @@ async fn snapshot(st: &AppState) -> serde_json::Value {
         "models": models,
         "health": health().await,
         "mcp": mcp::public(st).await,
+        // What this engine can do, so the app only enables live controls.
+        "caps": crate::look::CAPS,
     })
 }
 
@@ -3272,6 +3274,43 @@ mod tests {
             e.to_string(),
             format!("couldn't reach Ollama (this PC) at {dead} — is it running?")
         );
+    }
+
+    #[tokio::test]
+    async fn hello_announces_what_the_engine_can_do() {
+        let (bus, _) = broadcast::channel::<ServerMsg>(8);
+        let st = Arc::new(AppState {
+            token: "t".into(),
+            data_dir: std::env::temp_dir().join(format!("digiclip-hello-{}", std::process::id())),
+            jobs: Mutex::new(HashMap::new()),
+            settings: Mutex::new(Settings::default()),
+            model_runs: Mutex::new(HashMap::new()),
+            worker: Semaphore::new(1),
+            bus,
+            id_counter: AtomicU64::new(1),
+            mcp: mcp::Mcp::default(),
+        });
+        let msg: ClientMsg = serde_json::from_str(r#"{"id":1,"cmd":"hello"}"#).unwrap();
+        let replies = handle_cmd(st, msg).await;
+        let ServerMsg::Res {
+            ok: true,
+            data: Some(data),
+            ..
+        } = &replies[0]
+        else {
+            panic!("hello did not answer ok: {replies:?}");
+        };
+        let caps: Vec<&str> = data["caps"]
+            .as_array()
+            .expect("caps is an array")
+            .iter()
+            .filter_map(|c| c.as_str())
+            .collect();
+        assert!(caps.contains(&"look"), "{caps:?}");
+        for s in ["captions", "headline", "bar", "logo"] {
+            assert!(caps.contains(&format!("look.{s}").as_str()), "{caps:?}");
+        }
+        assert_eq!(caps, crate::look::CAPS);
     }
 
     #[test]

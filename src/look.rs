@@ -7,8 +7,8 @@
 //! their range, a bad enum value or a malformed colour counts as absent,
 //! and JSON that does not parse at all is no look (one warning line).
 //!
-//! v1 contract (only `captions` is applied so far; the other sections are
-//! parsed so later stages can read them):
+//! v1 contract (`captions`, `headline`, `bar` and `logo` are applied; the
+//! other sections are parsed so later stages can read them):
 //!
 //! ```text
 //! look: { v: 1,
@@ -31,6 +31,16 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::captions::ass::Anim;
+
+/// What this engine can do with a look, announced to the app in the `hello`
+/// snapshot (`caps`). Later chunks append to it.
+pub const CAPS: &[&str] = &[
+    "look",
+    "look.captions",
+    "look.headline",
+    "look.bar",
+    "look.logo",
+];
 
 /// The fonts libass can reach (the provisioned ones).
 pub const FONTS: [&str; 4] = ["Anton", "Archivo Black", "Inter Medium", "JetBrains Mono"];
@@ -65,7 +75,7 @@ pub enum Case {
     AsIs,
 }
 
-/// What sits behind the caption line.
+/// What sits behind a caption line, or a headline's card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoxLook {
     /// No box (removes the one a style has).
@@ -120,15 +130,19 @@ pub enum HeadlineAnim {
     None,
 }
 
-/// Headline section (parsed, not applied yet).
+/// Headline section. Only matters while a headline is on.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HeadlineLook {
+    /// Centre of the card (fraction of the frame). When either is set the
+    /// card is anchored there; the other is 0.5 (x) or where the card sits
+    /// today (y).
     pub x: Option<f64>,
     pub y: Option<f64>,
-    /// 0.5..2.
+    /// Type and card padding multiplier, 0.5..2.
     pub size: Option<f64>,
     pub ink: Option<Rgb>,
-    pub card: Option<Rgb>,
+    /// Card colour, or `None` for no card (the text gets an outline).
+    pub card: Option<BoxLook>,
     pub accent: Option<Rgb>,
     pub anim: Option<HeadlineAnim>,
     /// Seconds on screen, >= 0 (0 = the whole clip).
@@ -142,7 +156,7 @@ pub enum BarPos {
     Bottom,
 }
 
-/// Progress bar section (parsed, not applied yet).
+/// Progress bar section. Only matters while the progress bar is on.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BarLook {
     pub pos: Option<BarPos>,
@@ -150,9 +164,11 @@ pub struct BarLook {
     pub height: Option<f64>,
 }
 
-/// Logo section (parsed, not applied yet).
+/// Logo section. Only matters while a logo file is set.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LogoLook {
+    /// Centre of the logo box (fraction of the frame). When either is set
+    /// it wins over the corner; the other is 0.5.
     pub x: Option<f64>,
     pub y: Option<f64>,
     /// 0.4..2.5.
@@ -347,7 +363,12 @@ fn headline(o: &Obj) -> HeadlineLook {
         y: num(o, "y", 0.0, 1.0),
         size: num(o, "size", 0.5, 2.0),
         ink: color(o, "ink"),
-        card: color(o, "card"),
+        card: match o.get("card") {
+            Some(Value::Null) => Some(BoxLook::None),
+            Some(Value::String(s)) if s.trim().eq_ignore_ascii_case("none") => Some(BoxLook::None),
+            Some(Value::String(s)) => Rgb::parse(s).map(BoxLook::Color),
+            _ => None,
+        },
         accent: color(o, "accent"),
         anim: match word(o, "anim").as_deref() {
             Some("pop") => Some(HeadlineAnim::Pop),
@@ -495,6 +516,7 @@ mod tests {
             (h.size, h.seconds, h.anim),
             (Some(0.5), Some(0.0), Some(HeadlineAnim::Fade))
         );
+        assert_eq!(h.card, None);
         let b = l.bar.unwrap();
         assert_eq!((b.pos, b.height), (Some(BarPos::Top), Some(3.0)));
         let g = l.logo.unwrap();
@@ -510,6 +532,28 @@ mod tests {
             (Some(1.0), Some(Grade::Mono), Some(0.4))
         );
         assert_eq!(l.layout.unwrap().split, Some(0.7));
+    }
+
+    #[test]
+    fn headline_card_is_a_colour_or_none() {
+        let card = |j: &str| Look::parse(j).headline.unwrap().card;
+        assert_eq!(
+            card(r##"{"headline":{"card":"#111111"}}"##),
+            Some(BoxLook::Color(Rgb(0x11, 0x11, 0x11)))
+        );
+        assert_eq!(card(r#"{"headline":{"card":null}}"#), Some(BoxLook::None));
+        assert_eq!(card(r#"{"headline":{"card":"None"}}"#), Some(BoxLook::None));
+        assert_eq!(card(r#"{"headline":{"card":"teal"}}"#), None);
+        assert_eq!(card(r#"{"headline":{"card":7}}"#), None);
+        assert!(!Look::parse(r#"{"headline":{"card":null}}"#).is_empty());
+    }
+
+    #[test]
+    fn caps_announce_the_look_and_its_sections() {
+        assert!(CAPS.contains(&"look"));
+        for s in ["captions", "headline", "bar", "logo"] {
+            assert!(CAPS.contains(&format!("look.{s}").as_str()), "{s}");
+        }
     }
 
     #[test]
