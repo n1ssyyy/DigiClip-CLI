@@ -7,8 +7,7 @@
 //! their range, a bad enum value or a malformed colour counts as absent,
 //! and JSON that does not parse at all is no look (one warning line).
 //!
-//! v1 contract (`captions`, `headline`, `bar` and `logo` are applied; the
-//! other sections are parsed so later stages can read them):
+//! v1 contract (every section is applied):
 //!
 //! ```text
 //! look: { v: 1,
@@ -40,6 +39,9 @@ pub const CAPS: &[&str] = &[
     "look.headline",
     "look.bar",
     "look.logo",
+    "look.camera",
+    "look.effects",
+    "look.layout",
 ];
 
 /// The fonts libass can reach (the provisioned ones).
@@ -180,19 +182,24 @@ pub struct LogoLook {
 /// How the virtual camera moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraFeel {
+    /// One framing per shot, held; only cuts between shots reframe.
     Locked,
+    /// Wider dead bands, slower response: moves less, more gently.
     Steady,
+    /// Today's camera.
     Smooth,
+    /// Narrower dead bands, quicker response.
     Lively,
 }
 
-/// Camera section (parsed, not applied yet).
+/// Camera section.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CameraLook {
     pub feel: Option<CameraFeel>,
-    /// 0.8..1.4.
+    /// How tight the face framing is, 0.8..1.4 (1 = today).
     pub zoom: Option<f64>,
-    /// Emphasis punch-in strength, 1.0..1.4.
+    /// Peak scale of the emphasis punch-ins, 1.0..1.4 (absent = today's;
+    /// only matters while punch-ins are on).
     pub punch: Option<f64>,
 }
 
@@ -206,17 +213,18 @@ pub enum Grade {
     Punchy,
 }
 
-/// Effects section (parsed, not applied yet).
+/// Effects section. Vignette and grade touch the picture only (never the
+/// captions, headline, logo or progress bar).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EffectsLook {
-    /// 0..1.
+    /// Corner darkening, 0..1 (0 = none).
     pub vignette: Option<f64>,
     pub grade: Option<Grade>,
     /// Darkening of the blurred fill behind letterboxed video, 0..1.
     pub fill_dim: Option<f64>,
 }
 
-/// Layout section (parsed, not applied yet).
+/// Layout section.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LayoutLook {
     /// Where the split-screen seam sits (fraction of the height), 0.3..0.7.
@@ -551,7 +559,9 @@ mod tests {
     #[test]
     fn caps_announce_the_look_and_its_sections() {
         assert!(CAPS.contains(&"look"));
-        for s in ["captions", "headline", "bar", "logo"] {
+        for s in [
+            "captions", "headline", "bar", "logo", "camera", "effects", "layout",
+        ] {
             assert!(CAPS.contains(&format!("look.{s}").as_str()), "{s}");
         }
     }

@@ -31,6 +31,7 @@
 //! for subject motion.
 
 use crate::compose::Rect;
+use crate::look::CameraFeel;
 
 /// What a target frames. Drives move choice and punch eligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +112,45 @@ pub struct CamCfg {
     /// A framing must be on screen at least this long, or it is skipped
     /// (a blink of a framing right before a cut reads as a glitch) (s).
     pub min_show_s: f64,
+    /// One framing per shot: the camera picks it and holds it (cuts between
+    /// shots still reframe). Off = the planned path.
+    pub hold_shot: bool,
+}
+
+impl CamCfg {
+    /// Tuning for a Look's camera feel. `Smooth` (and no feel at all) is the
+    /// default, untouched.
+    ///
+    /// - `Steady`: dead bands x1.8, safe bands x1.25, pan/tilt/zoom response
+    ///   x1.5, handoff glides x1.3 longer.
+    /// - `Lively`: dead bands x0.5, safe bands x0.8, response x0.5, glides
+    ///   x0.7.
+    /// - `Locked`: the default tuning, holding one framing per shot.
+    pub fn for_feel(feel: Option<CameraFeel>) -> Self {
+        let mut c = Self::default();
+        let (band, safe, resp, glide) = match feel {
+            Some(CameraFeel::Steady) => (1.8, 1.25, 1.5, 1.3),
+            Some(CameraFeel::Lively) => (0.5, 0.8, 0.5, 0.7),
+            Some(CameraFeel::Locked) => {
+                c.hold_shot = true;
+                return c;
+            }
+            Some(CameraFeel::Smooth) | None => return c,
+        };
+        c.band_x *= band;
+        c.band_y *= band;
+        c.band_z *= band;
+        c.safe_x *= safe;
+        c.safe_y *= safe;
+        c.pan_s *= resp;
+        c.tilt_s *= resp;
+        c.zoom_s *= resp;
+        c.glide_base_s *= glide;
+        c.glide_per_s *= glide;
+        c.glide_min_s *= glide;
+        c.glide_max_s *= glide;
+        c
+    }
 }
 
 impl Default for CamCfg {
@@ -135,6 +175,7 @@ impl Default for CamCfg {
             glide_min_s: 0.6,
             glide_max_s: 1.2,
             min_show_s: 0.8,
+            hold_shot: false,
         }
     }
 }
@@ -507,6 +548,12 @@ fn plan_shot(
             .collect()
     };
 
+    // Locked off: the shot's one framing is what the evidence says most of
+    // the time (the median of its dominant kind), held for every frame.
+    if cfg.hold_shot {
+        return Some(hold_pose(&desired, &kinds, &weight));
+    }
+
     // --- 3. snaps ----------------------------------------------------------------
     // Discrete moves the camera cuts instead of panning:
     // - speaker switches between people who don't share a frame (no
@@ -701,6 +748,48 @@ fn plan_shot(
             })
             .collect(),
     )
+}
+
+/// The single pose a locked-off shot holds: the most common kind of
+/// framing in the shot, at the median of its (confident) desired values.
+fn hold_pose(desired: &[Ch], kinds: &[Kind], weight: &[f64]) -> Vec<Pose> {
+    let count = |k: Kind| kinds.iter().filter(|&&x| x == k).count();
+    // Ties go to the first kind seen, so the choice is stable.
+    let kind = kinds
+        .iter()
+        .copied()
+        .fold((kinds[0], count(kinds[0])), |best, k| {
+            let n = count(k);
+            if n > best.1 {
+                (k, n)
+            } else {
+                best
+            }
+        })
+        .0;
+    let of_kind = |confident: bool| -> Vec<Ch> {
+        desired
+            .iter()
+            .zip(kinds)
+            .zip(weight)
+            .filter(|((_, &k), &w)| k == kind && (!confident || w >= 0.5))
+            .map(|((d, _), _)| *d)
+            .collect()
+    };
+    let mut pool = of_kind(true);
+    if pool.is_empty() {
+        pool = of_kind(false);
+    }
+    let ch = median_ch(&pool);
+    vec![
+        Pose {
+            rect: ch.rect(),
+            ax: ch.ax,
+            ay: ch.ay,
+            kind,
+        };
+        desired.len()
+    ]
 }
 
 /// Stiffness of the safe band relative to a full-confidence sighting.
@@ -906,6 +995,19 @@ impl Default for PunchCfg {
     }
 }
 
+/// Punch tuning for a Look: `peak` (1.0..1.4, the Look's `camera.punch`)
+/// replaces the default peak zoom; absent keeps the default. Either way the
+/// peak is held to `res_cap` (the resolution floor: no mush on low-res
+/// input). A peak of 1.0 is no visible punch.
+pub fn punch_cfg(peak: Option<f64>, res_cap: f64) -> PunchCfg {
+    let mut cfg = PunchCfg::default();
+    if let Some(p) = peak {
+        cfg.zoom = p;
+    }
+    cfg.zoom = cfg.zoom.min(res_cap);
+    cfg
+}
+
 /// Punch envelope 0..1 at `t` for a window `[a, b]` (attack from `a`,
 /// hold to `b`, release after). Pure (unit-tested).
 pub fn punch_env(t: f64, a: f64, b: f64, cfg: &PunchCfg) -> f64 {
@@ -937,8 +1039,8 @@ pub fn apply_punches(
     cfg: &PunchCfg,
 ) -> usize {
     let n = poses.len();
-    if n == 0 || windows.is_empty() {
-        return 0;
+    if n == 0 || windows.is_empty() || cfg.zoom <= 1.0 {
+        return 0; // (a peak of 1.0 is no punch at all)
     }
     // Visibly moving: panning faster than 6% of the frame per second, or
     // zooming faster than 4%/s. A slow drift can carry a punch (the zoom
@@ -1370,5 +1472,214 @@ mod tests {
         let mut p = run(&tg, 6.0, &[], &[], &[]);
         let n = apply_punches(&mut p, &[(2.9, 3.4)], FPS, W, H, &PunchCfg::default());
         assert_eq!(n, 0, "never punch during a glide");
+    }
+
+    fn run_cfg(cfg: &CamCfg, targets: &[Target], secs: f64, hards: &[f64]) -> Vec<Pose> {
+        plan(
+            &PlanInput {
+                targets,
+                frames: (secs * FPS) as usize,
+                fps: FPS,
+                src_w: W,
+                src_h: H,
+                hards,
+                jumps: &[],
+                onsets: &[],
+                canvas: crate::compose::Canvas::TALL,
+            },
+            cfg,
+        )
+    }
+
+    /// A speaker who sways and drifts around the room (slow wander plus a
+    /// quicker lean), with detection noise.
+    fn wanderer() -> Vec<Target> {
+        (0..300)
+            .map(|i| {
+                let t = i as f64 / 15.0;
+                let cx = 300.0
+                    + 38.0 * (std::f64::consts::TAU * t / 7.0).sin()
+                    + 16.0 * (std::f64::consts::TAU * t / 2.3).sin()
+                    + 3.0 * noise(i);
+                tgt(t, cx)
+            })
+            .collect()
+    }
+
+    /// Total distance the window centre travels.
+    fn travel(p: &[Pose]) -> f64 {
+        p.windows(2)
+            .map(|w| (w[1].rect.cx() - w[0].rect.cx()).abs())
+            .sum()
+    }
+
+    #[test]
+    fn smooth_and_absent_feel_are_exactly_todays_camera() {
+        let tg = wanderer();
+        let today = run(&tg, 20.0, &[], &[], &[]);
+        assert!(today.windows(2).any(|w| w[0].rect != w[1].rect), "it moves");
+        for feel in [None, Some(CameraFeel::Smooth)] {
+            let cfg = CamCfg::for_feel(feel);
+            assert_eq!(format!("{cfg:?}"), format!("{:?}", CamCfg::default()));
+            assert!(run_cfg(&cfg, &tg, 20.0, &[]) == today, "{feel:?}");
+        }
+    }
+
+    #[test]
+    fn feel_sets_how_much_the_camera_moves() {
+        let tg = wanderer();
+        let steady = travel(&run_cfg(
+            &CamCfg::for_feel(Some(CameraFeel::Steady)),
+            &tg,
+            20.0,
+            &[],
+        ));
+        let smooth = travel(&run_cfg(&CamCfg::default(), &tg, 20.0, &[]));
+        let lively = travel(&run_cfg(
+            &CamCfg::for_feel(Some(CameraFeel::Lively)),
+            &tg,
+            20.0,
+            &[],
+        ));
+        assert!(steady < smooth, "steady {steady:.0} < smooth {smooth:.0}");
+        assert!(smooth < lively, "smooth {smooth:.0} < lively {lively:.0}");
+        // Clearly apart, not a rounding difference.
+        assert!(
+            steady < smooth * 0.85 && lively > smooth * 1.15,
+            "{steady:.0} {smooth:.0} {lively:.0}"
+        );
+    }
+
+    #[test]
+    fn steady_answers_a_lean_later_and_lively_sooner() {
+        // The speaker shifts 40px at 4s and stays there. The camera's top
+        // speed: steady eases over slowly, lively gets there briskly.
+        let tg: Vec<Target> = (0..150)
+            .map(|i| {
+                let t = i as f64 / 15.0;
+                tgt(t, if t < 4.0 { 300.0 } else { 340.0 })
+            })
+            .collect();
+        let at = |feel| {
+            max_step(&cxs(&run_cfg(
+                &CamCfg::for_feel(Some(feel)),
+                &tg,
+                10.0,
+                &[],
+            )))
+        };
+        let (steady, smooth, lively) = (
+            at(CameraFeel::Steady),
+            at(CameraFeel::Smooth),
+            at(CameraFeel::Lively),
+        );
+        assert!(
+            steady < smooth && smooth < lively,
+            "{steady:.1} {smooth:.1} {lively:.1}"
+        );
+    }
+
+    #[test]
+    fn locked_holds_one_framing_per_shot_and_cuts_between_shots() {
+        let tg = wanderer();
+        let p = run_cfg(
+            &CamCfg::for_feel(Some(CameraFeel::Locked)),
+            &tg,
+            20.0,
+            &[10.0],
+        );
+        assert_eq!(p.len(), 600);
+        assert!(p[..300].iter().all(|q| *q == p[0]), "shot 1 is one pose");
+        assert!(p[300..].iter().all(|q| *q == p[300]), "shot 2 is one pose");
+        // Each shot's framing sits on where the speaker mostly was.
+        assert!((p[0].rect.cx() - 300.0).abs() < 25.0, "{}", p[0].rect.cx());
+        assert!((p[300].rect.cx() - 300.0).abs() < 25.0);
+        // Without a cut the whole clip is one framing.
+        let one = run_cfg(&CamCfg::for_feel(Some(CameraFeel::Locked)), &tg, 20.0, &[]);
+        assert!(one.iter().all(|q| *q == one[0]));
+        // A walking speaker still gets two different framings across a cut.
+        let mut walk: Vec<Target> = (0..150).map(|i| tgt(i as f64 / 15.0, 220.0)).collect();
+        walk.extend((150..300).map(|i| tgt(i as f64 / 15.0, 420.0)));
+        let w = run_cfg(
+            &CamCfg::for_feel(Some(CameraFeel::Locked)),
+            &walk,
+            20.0,
+            &[10.0],
+        );
+        assert!((w[0].rect.cx() - 220.0).abs() < 1.0 && (w[599].rect.cx() - 420.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn locked_holds_the_dominant_kind_of_a_mixed_shot() {
+        let wide = |t: f64| Target {
+            t,
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: W,
+                h: H,
+            },
+            ax: W / 2.0,
+            ay: H / 2.0,
+            kind: Kind::Wide,
+            cut: false,
+            weak: false,
+        };
+        let mut tg: Vec<Target> = (0..30).map(|i| wide(i as f64 / 15.0)).collect();
+        for i in 30..120 {
+            let mut t = tgt(i as f64 / 15.0, 300.0);
+            t.cut = i == 30;
+            tg.push(t);
+        }
+        let p = run_cfg(&CamCfg::for_feel(Some(CameraFeel::Locked)), &tg, 8.0, &[]);
+        assert!(p.iter().all(|q| *q == p[0]));
+        assert_eq!(p[0].kind, Kind::Subject);
+        assert!((p[0].rect.cx() - 300.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn punch_look_sets_the_peak_and_absent_is_today() {
+        // Absent: exactly the old construction.
+        let cap = 1.5;
+        let today = PunchCfg {
+            zoom: PunchCfg::default().zoom.min(cap),
+            ..PunchCfg::default()
+        };
+        assert_eq!(format!("{:?}", punch_cfg(None, cap)), format!("{today:?}"));
+        assert_eq!(
+            punch_cfg(None, 1.1).zoom,
+            1.1,
+            "resolution floor still holds"
+        );
+        assert_eq!(punch_cfg(Some(1.3), cap).zoom, 1.3);
+        assert_eq!(punch_cfg(Some(1.4), 1.25).zoom, 1.25);
+        // The peak is what the camera reaches.
+        let tg: Vec<Target> = (0..90).map(|i| tgt(i as f64 / 15.0, 300.0)).collect();
+        let base = run(&tg, 6.0, &[], &[], &[]);
+        for peak in [1.1, 1.3, 1.4] {
+            let mut p = base.clone();
+            let n = apply_punches(
+                &mut p,
+                &[(1.8, 2.6)],
+                FPS,
+                W,
+                H,
+                &punch_cfg(Some(peak), 2.0),
+            );
+            assert_eq!(n, 1);
+            assert!(
+                (base[66].rect.w / p[66].rect.w - peak).abs() < 1e-6,
+                "{peak}"
+            );
+        }
+        // 1.0 is no visible punch: the path is untouched.
+        let mut p = base.clone();
+        apply_punches(&mut p, &[(1.8, 2.6)], FPS, W, H, &punch_cfg(Some(1.0), 2.0));
+        assert!(p == base);
+        // Absent through the planner = the old default call.
+        let (mut a, mut b) = (base.clone(), base.clone());
+        apply_punches(&mut a, &[(1.8, 2.6)], FPS, W, H, &punch_cfg(None, 9.0));
+        apply_punches(&mut b, &[(1.8, 2.6)], FPS, W, H, &PunchCfg::default());
+        assert!(a == b);
     }
 }

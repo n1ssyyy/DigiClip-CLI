@@ -786,6 +786,37 @@ pub fn window_for_face(
     (x, y, w, h)
 }
 
+/// The Look's `camera.zoom` on a single-face window `(x, y, w, h)` around
+/// the face `(ax, ay)`: the zoom multiplies the window's zoom over the base,
+/// never past the base's minimum-window limit (tighter) or the base window
+/// itself (looser). The face keeps its place in the window (centered, 40%
+/// from the top). `zoom` 1 (or a window that cannot change) returns the
+/// window untouched. Pure (unit-tested).
+#[allow(clippy::too_many_arguments)]
+pub fn zoom_window(
+    win: (f64, f64, f64, f64),
+    ax: f64,
+    ay: f64,
+    zoom: f64,
+    src_w: f64,
+    src_h: f64,
+    base: Base,
+) -> (f64, f64, f64, f64) {
+    if zoom == 1.0 || !win.2.is_finite() || win.2 <= 0.0 {
+        return win;
+    }
+    let z0 = base.w / win.2;
+    let cap = (base.h / base.min_h).max(1.0).max(z0);
+    let z = (z0 * zoom).min(cap).max(1.0);
+    if z == z0 {
+        return win;
+    }
+    let (w, h) = (base.w / z, base.h / z);
+    let x = (ax - w / 2.0).clamp(0.0, (src_w - w).max(0.0));
+    let y = (ay - h * 0.4).clamp(0.0, (src_h - h).max(0.0));
+    (x, y, w, h)
+}
+
 /// Closeness budget: a talking cluster must span at most this fraction of
 /// the base window. Window margins eat the rest, so the midpoint always
 /// lands near faces — never a zoom on the empty middle. Wider crews fall
@@ -1700,6 +1731,48 @@ mod tests {
         let mid = Base::new(1280.0, 720.0, Canvas::TALL);
         let (.., h4) = window_for_face(640.0, 360.0, 0.15, 1280.0, 720.0, mid, 0.9);
         assert!(h4 >= mid.min_h - 1e-9 && h4 < 720.0, "h={h4}");
+    }
+
+    #[test]
+    fn look_zoom_tightens_loosens_and_is_bounded() {
+        // 1080p, a small confident face: today's window is z = 1.3.
+        let b = Base::new(1920.0, 1080.0, Canvas::TALL);
+        let (fx, fy) = (900.0, 500.0);
+        let today = window_for_face(fx, fy, 0.15, 1920.0, 1080.0, b, 0.9);
+        let z = |w: (f64, f64, f64, f64)| (w.2, w.3);
+        // 1.0 changes nothing, bit for bit.
+        assert_eq!(zoom_window(today, fx, fy, 1.0, 1920.0, 1080.0, b), today);
+        // Tighter is a smaller window, but never below the resolution floor.
+        let tight = zoom_window(today, fx, fy, 1.2, 1920.0, 1080.0, b);
+        assert!(tight.2 < today.2 && tight.3 < today.3);
+        assert!(tight.3 >= b.min_h - 1e-9, "floor: {}", tight.3);
+        let max = zoom_window(today, fx, fy, 1.4, 1920.0, 1080.0, b);
+        assert!(max.3 >= b.min_h - 1e-9 && max.3 <= tight.3 + 1e-9);
+        assert!((max.2 / max.3 - b.w / b.h).abs() < 1e-9, "keeps the aspect");
+        // Looser is a larger window, never wider than the base.
+        let loose = zoom_window(today, fx, fy, 0.9, 1920.0, 1080.0, b);
+        assert!(loose.2 > today.2 && loose.2 <= b.w + 1e-9);
+        let wide = zoom_window(today, fx, fy, 0.8, 1920.0, 1080.0, b);
+        assert!(wide.2 >= loose.2 && wide.2 <= b.w + 1e-9);
+        assert!((z(zoom_window(today, fx, fy, 0.1, 1920.0, 1080.0, b)).0 - b.w).abs() < 1e-9);
+        // The face keeps its place: centered, 40% from the top.
+        for w in [tight, loose] {
+            assert!((w.0 + w.2 / 2.0 - fx).abs() < 1e-9);
+            assert!((w.1 + w.3 * 0.4 - fy).abs() < 1e-9);
+        }
+        // Stays inside the source near an edge.
+        let edge = zoom_window(today, 40.0, 60.0, 1.4, 1920.0, 1080.0, b);
+        assert!(edge.0 >= 0.0 && edge.1 >= 0.0);
+        // Already at the base window (a big face): tighter does nothing the
+        // floor allows on low-res; on 1080p it can zoom, looser cannot.
+        let big = window_for_face(fx, fy, 0.6, 1920.0, 1080.0, b, 0.9);
+        assert!((big.2 - b.w).abs() < 1e-9);
+        assert_eq!(zoom_window(big, fx, fy, 0.8, 1920.0, 1080.0, b), big);
+        assert!(zoom_window(big, fx, fy, 1.3, 1920.0, 1080.0, b).2 < b.w);
+        // A low-res source never zooms (the floor is the base itself).
+        let lo = Base::new(640.0, 360.0, Canvas::TALL);
+        let w = window_for_face(320.0, 180.0, 0.15, 640.0, 360.0, lo, 0.9);
+        assert_eq!(zoom_window(w, 320.0, 180.0, 1.4, 640.0, 360.0, lo), w);
     }
 
     #[test]

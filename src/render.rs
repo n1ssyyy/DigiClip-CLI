@@ -414,6 +414,12 @@ pub struct Look {
     pub headline: Option<crate::look::HeadlineLook>,
     /// The Look's progress bar section.
     pub bar_look: Option<crate::look::BarLook>,
+    /// The Look's camera section (feel, zoom, punch strength).
+    pub camera: Option<crate::look::CameraLook>,
+    /// The Look's effects section (vignette, grade, fill dimming).
+    pub effects: Option<crate::look::EffectsLook>,
+    /// The Look's layout section (split-screen seam).
+    pub layout: Option<crate::look::LayoutLook>,
 }
 
 /// Everything one render needs.
@@ -933,7 +939,9 @@ fn run(
     // --- compose loop (this thread) ----------------------------------------
     let mut comp = Compositor::new(dg.w, dg.h, canvas)
         .with_bar(job.look.bar)
-        .with_bar_look(job.look.bar_look.as_ref());
+        .with_bar_look(job.look.bar_look.as_ref())
+        .with_effects(job.look.effects.as_ref())
+        .with_split(job.look.layout.as_ref());
     let base = canvas.base_rect(
         job.probe.width.unwrap_or(dg.w) as f64,
         job.probe.height.unwrap_or(dg.h) as f64,

@@ -261,6 +261,218 @@ const BG_H: u32 = 64;
 /// Fill brightness (luma gain toward black): keeps the subject the brightest
 /// thing on screen.
 const BG_DIM: f32 = 0.72;
+/// The Look's `fill_dim` that gives today's [`BG_DIM`]. Below it the fill
+/// brightens linearly to untouched (`0`), above it darkens linearly to
+/// [`BG_DIM_MAX`] (`1`).
+pub const FILL_DIM_TODAY: f64 = 0.4;
+/// Fill luma gain at `fill_dim` 1: nearly black.
+const BG_DIM_MAX: f32 = 0.04;
+
+/// Luma gain of the blurred fill for the Look's `fill_dim` (0..1). Passes
+/// through today's gain at [`FILL_DIM_TODAY`]. Pure (unit-tested).
+pub fn fill_gain(dim: f64) -> f32 {
+    let d = dim.clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32, u: f64| a * (1.0 - u as f32) + b * u as f32;
+    if d <= FILL_DIM_TODAY {
+        lerp(1.0, BG_DIM, d / FILL_DIM_TODAY)
+    } else {
+        lerp(
+            BG_DIM,
+            BG_DIM_MAX,
+            (d - FILL_DIM_TODAY) / (1.0 - FILL_DIM_TODAY),
+        )
+    }
+}
+
+/// Rows of the top panel in a split-screen frame: an even half today, the
+/// Look's `layout.split` share of the height otherwise (even, so the 4:2:0
+/// chroma rows line up). Pure (unit-tested).
+pub fn split_rows(out_h: u32, split: Option<f64>) -> u32 {
+    match split {
+        Some(s) if (s - 0.5).abs() > 1e-9 => {
+            let rows = ((out_h as f64 * s / 2.0).round() as u32) * 2;
+            rows.clamp(2, (out_h.saturating_sub(2)) & !1)
+        }
+        _ => (out_h / 2) & !1,
+    }
+}
+
+/// Strength of the vignette at `vignette` 1: the corners keep this share
+/// less of their brightness.
+const VIGNETTE_MAX: f64 = 0.7;
+
+/// Vignette gain (0..1) at a normalised radius `r` (0 centre, 1 corner),
+/// for strength `v` (0..1). Smoothstep from 20% of the way out, so the
+/// middle of the frame is untouched and the falloff has no visible edge.
+/// Pure (unit-tested).
+pub fn vignette_gain(r: f64, v: f64) -> f64 {
+    let t = ((r - 0.2) / 0.8).clamp(0.0, 1.0);
+    1.0 - VIGNETTE_MAX * v.clamp(0.0, 1.0) * t * t * (3.0 - 2.0 * t)
+}
+
+/// Per-clip tables for a colour grade, indexed by (limited-range) luma:
+/// the luma curve, a chroma gain and a chroma offset. Built once; the
+/// per-frame work is table lookups.
+struct GradeTab {
+    luma: [u8; 256],
+    sat: [f32; 256],
+    du: [f32; 256],
+    dv: [f32; 256],
+}
+
+fn smooth01(e0: f64, e1: f64, x: f64) -> f64 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+impl GradeTab {
+    /// `None` for [`crate::look::Grade::None`].
+    fn new(g: crate::look::Grade) -> Option<Self> {
+        use crate::look::Grade;
+        // Chroma offsets (8-bit units) for the casts: -3.6 U / +2.8 V is
+        // about +5 on red and -7.6 on blue (of 255) at constant luma. The
+        // cast fades out into the deepest shadows so black stays black.
+        let (du, dv, punchy, mono) = match g {
+            Grade::None => return None,
+            Grade::Warm => (-3.6, 2.8, false, false),
+            Grade::Cool => (3.6, -2.8, false, false),
+            Grade::Mono => (0.0, 0.0, false, true),
+            Grade::Punchy => (0.0, 0.0, true, false),
+        };
+        let mut t = GradeTab {
+            luma: [0; 256],
+            sat: [1.0; 256],
+            du: [0.0; 256],
+            dv: [0.0; 256],
+        };
+        for i in 0..256usize {
+            let y = i as f64;
+            t.luma[i] = i as u8;
+            if punchy {
+                // A soft S-curve in the limited luma range (the ends stay
+                // put, so nothing clips) and a touch more colour in the mids.
+                let n = ((y - 16.0) / 219.0).clamp(0.0, 1.0);
+                let s = n * n * (3.0 - 2.0 * n);
+                let n2 = n + 0.30 * (s - n);
+                t.luma[i] = if (16..=235).contains(&i) {
+                    (16.0 + 219.0 * n2).round() as u8
+                } else {
+                    i as u8
+                };
+                t.sat[i] = (1.0
+                    + 0.18 * smooth01(16.0, 60.0, y) * (1.0 - smooth01(190.0, 235.0, y)))
+                    as f32;
+            }
+            if mono {
+                t.sat[i] = 0.0;
+            }
+            let fade = smooth01(16.0, 72.0, y);
+            t.du[i] = (du * fade) as f32;
+            t.dv[i] = (dv * fade) as f32;
+        }
+        Some(t)
+    }
+}
+
+/// Picture effects of one compositor: a vignette gain map (Q12 per pixel)
+/// and/or a grade. Applied to the finished picture, before the flash dip
+/// and the progress bar.
+struct Fx {
+    vig: Option<Vec<u16>>,
+    grade: Option<GradeTab>,
+}
+
+impl Fx {
+    fn new(look: &crate::look::EffectsLook, c: Canvas) -> Option<Self> {
+        let v = look.vignette.unwrap_or(0.0);
+        let vig = (v > 0.0).then(|| {
+            let (w, h) = (c.w as usize, c.h as usize);
+            let (hw, hh) = (w as f64 / 2.0, h as f64 / 2.0);
+            let mut m = Vec::with_capacity(w * h);
+            // The gain only depends on the distance from the centre, with
+            // each axis normalised to its half-size (an ellipse; the
+            // corners are r = 1).
+            let col: Vec<f64> = (0..w)
+                .map(|x| ((x as f64 + 0.5 - hw) / hw).powi(2))
+                .collect();
+            for y in 0..h {
+                let dy = ((y as f64 + 0.5 - hh) / hh).powi(2);
+                for &dx2 in &col {
+                    let r = ((dx2 + dy) / 2.0).sqrt();
+                    m.push((vignette_gain(r, v) * 4096.0).round() as u16);
+                }
+            }
+            m
+        });
+        let grade = look.grade.and_then(GradeTab::new);
+        (vig.is_some() || grade.is_some()).then_some(Fx { vig, grade })
+    }
+
+    /// Grade, then vignette, over a finished yuv420p picture.
+    fn apply(&self, out: &mut [u8], c: Canvas) {
+        let g = Geom { w: c.w, h: c.h };
+        let (w, cw) = (c.w as usize, g.cw() as usize);
+        let (oy, uv) = out.split_at_mut(g.luma_len());
+        let (ou, ov) = uv.split_at_mut(g.chroma_len());
+        if let Some(t) = &self.grade {
+            // Chroma first: it reads the ungraded luma around each sample.
+            if t.sat.iter().any(|&s| s != 1.0) || t.du.iter().any(|&d| d != 0.0) {
+                for cy in 0..g.ch() as usize {
+                    let r0 = (cy * 2).min(c.h as usize - 1) * w;
+                    let r1 = (cy * 2 + 1).min(c.h as usize - 1) * w;
+                    for cx in 0..cw {
+                        let x0 = cx * 2;
+                        let x1 = (x0 + 1).min(w - 1);
+                        let l = (oy[r0 + x0] as u32
+                            + oy[r0 + x1] as u32
+                            + oy[r1 + x0] as u32
+                            + oy[r1 + x1] as u32
+                            + 2)
+                            / 4;
+                        let i = l as usize;
+                        let k = cy * cw + cx;
+                        let f = |p: u8, d: f32| {
+                            (128.0 + (p as f32 - 128.0) * t.sat[i] + d)
+                                .round()
+                                .clamp(16.0, 240.0) as u8
+                        };
+                        ou[k] = f(ou[k], t.du[i]);
+                        ov[k] = f(ov[k], t.dv[i]);
+                    }
+                }
+            }
+            if t.luma.iter().enumerate().any(|(i, &v)| v as usize != i) {
+                for p in oy.iter_mut() {
+                    *p = t.luma[*p as usize];
+                }
+            }
+        }
+        if let Some(m) = &self.vig {
+            // Ordered dither on the rounding: a smooth falloff over 8-bit
+            // luma would otherwise band.
+            const BAYER: [i32; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+            let dither = |x: usize, y: usize| (BAYER[(y & 3) * 4 + (x & 3)] * 2 + 1) * 128;
+            for (y, (row, gains)) in oy.chunks_mut(w).zip(m.chunks(w)).enumerate() {
+                for (x, (p, &k)) in row.iter_mut().zip(gains).enumerate() {
+                    let v = (*p as i32 - 16) * k as i32 + dither(x, y);
+                    *p = (16 + (v >> 12)).clamp(0, 255) as u8;
+                }
+            }
+            for cy in 0..g.ch() as usize {
+                let gy = (cy * 2).min(c.h as usize - 1) * w;
+                for cx in 0..cw {
+                    let k = m[gy + (cx * 2).min(w - 1)] as i32;
+                    let i = cy * cw + cx;
+                    let d = dither(cx, cy);
+                    for pl in [&mut *ou, &mut *ov] {
+                        let v = (pl[i] as i32 - 128) * k + d;
+                        pl[i] = (128 + (v >> 12)).clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Reusable compositor for one source geometry and canvas.
 pub struct Compositor {
@@ -277,6 +489,13 @@ pub struct Compositor {
     /// The Look's bar: along the top edge, and the thickness multiplier.
     bar_top: bool,
     bar_height: f64,
+    /// Vignette and grade over the picture (never over the bar).
+    fx: Option<Fx>,
+    /// Luma gain of the blurred fill, and how much of its colour stays.
+    fill_gain: f32,
+    fill_chroma: f32,
+    /// The Look's split seam (top panel's share of the height).
+    split: Option<f64>,
 }
 
 impl Compositor {
@@ -302,7 +521,31 @@ impl Compositor {
             bar: None,
             bar_top: false,
             bar_height: 1.0,
+            fx: None,
+            fill_gain: BG_DIM,
+            fill_chroma: 1.0,
+            split: None,
         }
+    }
+
+    /// The Look's effects: vignette and grade over the picture, and how
+    /// dark the blurred fill is. Absent or neutral fields change nothing.
+    pub fn with_effects(mut self, look: Option<&crate::look::EffectsLook>) -> Self {
+        if let Some(l) = look {
+            self.fx = Fx::new(l, self.canvas);
+            if let Some(d) = l.fill_dim {
+                self.fill_gain = fill_gain(d);
+                // Past today's darkness the colour fades with the light.
+                self.fill_chroma = (self.fill_gain / BG_DIM).min(1.0);
+            }
+        }
+        self
+    }
+
+    /// The Look's layout: where the split-screen seam sits.
+    pub fn with_split(mut self, look: Option<&crate::look::LayoutLook>) -> Self {
+        self.split = look.and_then(|l| l.split);
+        self
     }
 
     /// Draw a progress bar (sRGB color) along the bottom edge.
@@ -367,7 +610,7 @@ impl Compositor {
         }
         let (out_w, out_h) = (self.canvas.w, self.canvas.h);
         // Even halves (4:2:0 chroma rows).
-        let half = (out_h / 2) & !1;
+        let half = split_rows(out_h, self.split);
         for (r, dy, dh) in [(top, 0, half), (bottom, half, out_h - half)] {
             let r = r.clamped(src.w as f64, src.h as f64);
             let aspect = out_w as f64 / dh as f64;
@@ -412,13 +655,17 @@ impl Compositor {
         })
     }
 
-    /// Flash dip and progress bar over the composed frame.
+    /// Picture effects, flash dip and progress bar over the composed frame
+    /// (in that order: the bar keeps its colours, the dip washes everything).
     fn finish(&mut self, flash: f32, progress: f32) {
         let canvas = self.canvas;
         let out_g = Geom {
             w: canvas.w,
             h: canvas.h,
         };
+        if let Some(fx) = &self.fx {
+            fx.apply(&mut self.out, canvas);
+        }
         if flash > 0.0 {
             let a = flash.clamp(0.0, 1.0);
             let (oy, uv) = self.out.split_at_mut(out_g.luma_len());
@@ -506,7 +753,12 @@ impl Compositor {
                 box_blur(tv, sv2, tiny_g.cw() as usize, tiny_g.ch() as usize, 1);
             }
             for p in ty.iter_mut() {
-                *p = (16.0 + (*p as f32 - 16.0).max(0.0) * BG_DIM).round() as u8;
+                *p = (16.0 + (*p as f32 - 16.0).max(0.0) * self.fill_gain).round() as u8;
+            }
+            if self.fill_chroma < 1.0 {
+                for p in tu.iter_mut().chain(tv.iter_mut()) {
+                    *p = (128.0 + (*p as f32 - 128.0) * self.fill_chroma).round() as u8;
+                }
             }
         }
         let out_g = Geom { w: out_w, h: out_h };
@@ -1038,5 +1290,391 @@ mod tests {
         draw_bar(&mut o2, c, yellow, 1.0);
         let last = &o2[(c.h as usize - 1) * c.w as usize..][..c.w as usize];
         assert!(last.iter().all(|&v| v == yellow.0));
+    }
+
+    // ---- effects, fill dimming and the split seam ---------------------------
+
+    use crate::look::{EffectsLook, Grade, LayoutLook};
+
+    fn fx(vignette: Option<f64>, grade: Option<Grade>, fill_dim: Option<f64>) -> EffectsLook {
+        EffectsLook {
+            vignette,
+            grade,
+            fill_dim,
+        }
+    }
+
+    /// A flat yuv420p frame.
+    fn flat(w: u32, h: u32, y: u8, u: u8, v: u8) -> Vec<u8> {
+        let g = Geom { w, h };
+        let mut f = vec![y; g.frame_len()];
+        f[g.luma_len()..g.luma_len() + g.chroma_len()].fill(u);
+        f[g.luma_len() + g.chroma_len()..].fill(v);
+        f
+    }
+
+    /// A picture with real range: a luma ramp across, a chroma sweep down.
+    fn colourful(w: u32, h: u32) -> Vec<u8> {
+        let g = Geom { w, h };
+        let mut f = vec![0u8; g.frame_len()];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                f[y * w as usize + x] = (16 + (x * 219) / w as usize) as u8;
+            }
+        }
+        let (cw, ch) = (g.cw() as usize, g.ch() as usize);
+        for y in 0..ch {
+            for x in 0..cw {
+                f[g.luma_len() + y * cw + x] = (64 + (y * 128) / ch) as u8;
+                f[g.luma_len() + g.chroma_len() + y * cw + x] = (64 + (x * 128) / cw) as u8;
+            }
+        }
+        f
+    }
+
+    /// sRGB (0..255, unclamped) of a limited-range BT.709 sample.
+    fn rgb(p: (u8, u8, u8)) -> (f64, f64, f64) {
+        let yy = (p.0 as f64 - 16.0) / 219.0;
+        let (cb, cr) = ((p.1 as f64 - 128.0) / 224.0, (p.2 as f64 - 128.0) / 224.0);
+        (
+            (yy + 1.5748 * cr) * 255.0,
+            (yy - 0.1873 * cb - 0.4681 * cr) * 255.0,
+            (yy + 1.8556 * cb) * 255.0,
+        )
+    }
+
+    /// The (y, u, v) of output pixel (x, y).
+    fn px(out: &[u8], c: Canvas, x: usize, y: usize) -> (u8, u8, u8) {
+        let g = Geom { w: c.w, h: c.h };
+        (
+            out[y * c.w as usize + x],
+            out[g.luma_len() + (y / 2) * g.cw() as usize + x / 2],
+            out[g.luma_len() + g.chroma_len() + (y / 2) * g.cw() as usize + x / 2],
+        )
+    }
+
+    fn compose_with(
+        c: Canvas,
+        src: &[u8],
+        r: Rect,
+        look: Option<&EffectsLook>,
+        bar: bool,
+        progress: f32,
+    ) -> Vec<u8> {
+        let mut comp = Compositor::new(640, 360, c).with_effects(look);
+        if bar {
+            comp = comp.with_bar(Some((255, 212, 0)));
+        }
+        comp.compose(src, r, 0.0, progress).unwrap().to_vec()
+    }
+
+    #[test]
+    fn absent_and_neutral_effects_render_todays_pixels() {
+        let c = Canvas::SQUARE;
+        let src = colourful(640, 360);
+        // The second rect letterboxes, so a blur fill sits behind it.
+        for r in [c.base_rect(640.0, 360.0), rect(0.0, 0.0, 640.0, 360.0)] {
+            let want = compose_with(c, &src, r, None, true, 0.4);
+            for look in [
+                EffectsLook::default(),
+                fx(Some(0.0), None, None),
+                fx(None, Some(Grade::None), None),
+                fx(Some(0.0), Some(Grade::None), None),
+                fx(None, None, Some(FILL_DIM_TODAY)),
+            ] {
+                let got = compose_with(c, &src, r, Some(&look), true, 0.4);
+                assert!(got == want, "{look:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fill_dim_passes_through_todays_darkness() {
+        assert_eq!(fill_gain(FILL_DIM_TODAY), BG_DIM);
+        assert_eq!(fill_gain(0.0), 1.0);
+        assert!(fill_gain(1.0) < 0.06 && fill_gain(1.0) > 0.0);
+        let mut last = f32::INFINITY;
+        for i in 0..=20 {
+            let g = fill_gain(i as f64 / 20.0);
+            assert!(g < last, "darker as it goes up: {i}");
+            last = g;
+        }
+        assert_eq!(fill_gain(-3.0), 1.0);
+        assert_eq!(fill_gain(9.0), fill_gain(1.0));
+    }
+
+    #[test]
+    fn fill_dim_darkens_the_fill_and_leaves_the_video_alone() {
+        let c = Canvas::TALL;
+        let src = colourful(640, 360);
+        let wide = rect(0.0, 0.0, 640.0, 360.0);
+        let lay = layout(&wide, c);
+        let (dy, dh) = (lay.dy as usize, lay.dh as usize);
+        let w = c.w as usize;
+        let at = |d: Option<f64>| {
+            let look = fx(None, None, d);
+            compose_with(c, &src, wide, Some(&look), false, 0.0)
+        };
+        let mean = |o: &[u8], rows: std::ops::Range<usize>| {
+            let s: u64 = o[rows.start * w..rows.end * w]
+                .iter()
+                .map(|&v| v as u64)
+                .sum();
+            s as f64 / ((rows.end - rows.start) * w) as f64
+        };
+        let (bright, today, dark, black) = (at(Some(0.0)), at(None), at(Some(0.8)), at(Some(1.0)));
+        assert!(today == at(Some(FILL_DIM_TODAY)));
+        let fill = 0..dy - 4;
+        let (m0, m1, m2, m3) = (
+            mean(&bright, fill.clone()),
+            mean(&today, fill.clone()),
+            mean(&dark, fill.clone()),
+            mean(&black, fill),
+        );
+        assert!(m0 > m1 && m1 > m2 && m2 > m3, "{m0} {m1} {m2} {m3}");
+        assert!(m3 < 22.0, "nearly black: {m3}");
+        assert!(m0 > m1 * 1.25, "not darkened at 0: {m0} vs {m1}");
+        // The sharp video area is the same pixels whatever the fill does.
+        let rows = (dy + 2) * w..(dy + dh - 2) * w;
+        for o in [&bright, &dark, &black] {
+            assert!(o[rows.clone()] == today[rows.clone()]);
+        }
+        // Its chroma too.
+        let g = Geom { w: c.w, h: c.h };
+        let cr = (dy / 2 + 2) * g.cw() as usize..(dy / 2 + dh / 2 - 2) * g.cw() as usize;
+        assert!(black[g.luma_len()..][cr.clone()] == today[g.luma_len()..][cr]);
+    }
+
+    #[test]
+    fn vignette_darkens_corners_not_the_centre() {
+        let c = Canvas::TALL;
+        let src = flat(640, 360, 150, 128, 128);
+        let base = c.base_rect(640.0, 360.0);
+        let plain = compose_with(c, &src, base, None, false, 0.0);
+        let (w, h) = (c.w as usize, c.h as usize);
+        let mut corners = Vec::new();
+        for v in [0.25, 0.6, 1.0] {
+            let o = compose_with(c, &src, base, Some(&fx(Some(v), None, None)), false, 0.0);
+            let centre = px(&o, c, w / 2, h / 2).0 as i32 - px(&plain, c, w / 2, h / 2).0 as i32;
+            assert!(centre.abs() <= 1, "centre moved by {centre} at {v}");
+            let corner = px(&o, c, 4, 4).0;
+            let edge = px(&o, c, w / 2, 4).0;
+            let mid = px(&o, c, w / 2, h / 4).0;
+            assert!(corner < edge && edge < px(&plain, c, w / 2, 4).0, "{v}");
+            assert!(mid >= edge, "falls off toward the edge: {mid} {edge}");
+            corners.push(corner);
+            // Smooth: along the diagonal luma never rises, and the falloff
+            // has no jump between samples 8px apart.
+            let mut prev = px(&o, c, w / 2, h / 2).0 as i32;
+            for k in (0..w / 2).step_by(8) {
+                let (x, y) = (w / 2 - k, h / 2 - k * h / w);
+                let l = px(&o, c, x, y).0 as i32;
+                assert!(l <= prev + 1, "monotone: {l} after {prev}");
+                assert!(prev - l <= 5, "no jump: {prev} -> {l} at {k}");
+                prev = l;
+            }
+        }
+        assert!(corners[0] > corners[1] && corners[1] > corners[2]);
+        // Strong but usable: full strength still leaves some light.
+        assert!(corners[2] > 16 + 20, "{}", corners[2]);
+        // Black stays black.
+        let blk = flat(640, 360, 16, 128, 128);
+        let o = compose_with(c, &blk, base, Some(&fx(Some(1.0), None, None)), false, 0.0);
+        assert!(o[..w * h].iter().all(|&v| v == 16));
+    }
+
+    #[test]
+    fn vignette_does_not_band_a_smooth_gradient() {
+        // The dithered 8-bit falloff keeps local averages on the smooth
+        // curve: the step between block means changes by well under one
+        // level from block to block (banding would show as jumps).
+        let c = Canvas::SQUARE;
+        let src = flat(640, 360, 120, 128, 128);
+        let o = compose_with(
+            c,
+            &src,
+            c.base_rect(640.0, 360.0),
+            Some(&fx(Some(0.8), None, None)),
+            false,
+            0.0,
+        );
+        let w = c.w as usize;
+        let row = c.h as usize / 2;
+        let blocks: Vec<f64> = (0..w / 16)
+            .map(|b| {
+                let mut s = 0u32;
+                for y in row..row + 16 {
+                    for x in b * 16..b * 16 + 16 {
+                        s += o[y * w + x] as u32;
+                    }
+                }
+                s as f64 / 256.0
+            })
+            .collect();
+        let steps: Vec<f64> = blocks.windows(2).map(|p| p[1] - p[0]).collect();
+        let worst = steps
+            .windows(2)
+            .map(|p| (p[1] - p[0]).abs())
+            .fold(0.0, f64::max);
+        assert!(worst < 0.8, "block means kink by {worst}");
+    }
+
+    #[test]
+    fn grades_move_the_picture_the_right_way() {
+        let c = Canvas::SQUARE;
+        let base = c.base_rect(640.0, 360.0);
+        // Skin-ish, neutral and darker mid tones.
+        for (y, u, v) in [(150u8, 112u8, 150u8), (128, 128, 128), (90, 120, 140)] {
+            let src = flat(640, 360, y, u, v);
+            let at = |g: Option<Grade>| {
+                let look = g.map(|g| fx(None, Some(g), None));
+                let o = compose_with(c, &src, base, look.as_ref(), false, 0.0);
+                px(&o, c, 540, 540)
+            };
+            let plain = rgb(at(None));
+            let warm = rgb(at(Some(Grade::Warm)));
+            let cool = rgb(at(Some(Grade::Cool)));
+            assert!(warm.0 > plain.0 + 2.0 && warm.2 < plain.2 - 2.0, "{warm:?}");
+            assert!(cool.0 < plain.0 - 2.0 && cool.2 > plain.2 + 2.0, "{cool:?}");
+            // Gentle: nothing moves by more than ~14 of 255.
+            for g in [warm, cool] {
+                assert!((g.0 - plain.0).abs() < 12.0 && (g.2 - plain.2).abs() < 14.0);
+            }
+            // Same light: the casts leave luma alone.
+            assert_eq!(at(Some(Grade::Warm)).0, y);
+            // Mono: grey, at the picture's own luma.
+            let mono = at(Some(Grade::Mono));
+            assert_eq!((mono.1, mono.2), (128, 128));
+            assert_eq!(mono.0, y);
+            let m = rgb(mono);
+            assert!((m.0 - m.1).abs() < 0.5 && (m.1 - m.2).abs() < 0.5, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn punchy_adds_contrast_and_colour_without_clipping() {
+        let c = Canvas::SQUARE;
+        let base = c.base_rect(640.0, 360.0);
+        let src = colourful(640, 360);
+        let look = fx(None, Some(Grade::Punchy), None);
+        let plain = compose_with(c, &src, base, None, false, 0.0);
+        let punchy = compose_with(c, &src, base, Some(&look), false, 0.0);
+        let g = Geom { w: c.w, h: c.h };
+        let row = c.h as usize / 2 * c.w as usize;
+        // Mid-tones spread apart.
+        let (a, b) = (c.w as usize * 2 / 5, c.w as usize * 3 / 5);
+        let spread = |o: &[u8]| o[row + b] as i32 - o[row + a] as i32;
+        assert!(spread(&punchy) > spread(&plain) + 3, "contrast");
+        assert!(punchy[..g.luma_len()]
+            .iter()
+            .all(|&v| (16..=235).contains(&v)));
+        // More colour: chroma further from neutral overall.
+        let off = |o: &[u8]| {
+            o[g.luma_len()..]
+                .iter()
+                .map(|&v| (v as f64 - 128.0).abs())
+                .sum::<f64>()
+        };
+        assert!(off(&punchy) > off(&plain) * 1.08);
+        assert!(punchy[g.luma_len()..]
+            .iter()
+            .all(|&v| (16..=240).contains(&v)));
+        // Skin stays skin.
+        let skin = flat(640, 360, 150, 112, 150);
+        let o = compose_with(c, &skin, base, Some(&look), false, 0.0);
+        let p = compose_with(c, &skin, base, None, false, 0.0);
+        let (r1, g1, b1) = rgb(px(&o, c, 540, 540));
+        let (r0, g0, b0) = rgb(px(&p, c, 540, 540));
+        assert!(r1 <= 255.0 && b1 >= 0.0, "{r1} {b1}");
+        assert!((r1 - r0).abs() < 25.0 && (g1 - g0).abs() < 25.0 && (b1 - b0).abs() < 25.0);
+    }
+
+    #[test]
+    fn effects_leave_the_progress_bar_alone() {
+        let c = Canvas::TALL;
+        let g = Geom { w: c.w, h: c.h };
+        let src = colourful(640, 360);
+        let base = c.base_rect(640.0, 360.0);
+        let bh = bar_thickness(c, 1.0) as usize;
+        let w = c.w as usize;
+        let yellow = yuv709(255, 212, 0);
+        for look in [
+            fx(Some(1.0), None, None),
+            fx(None, Some(Grade::Warm), None),
+            fx(None, Some(Grade::Mono), None),
+            fx(None, Some(Grade::Punchy), None),
+            fx(Some(0.7), Some(Grade::Cool), Some(0.9)),
+        ] {
+            let o = compose_with(c, &src, base, Some(&look), true, 1.0);
+            let plain = compose_with(c, &src, base, None, true, 1.0);
+            // The whole (full) bar: luma rows and chroma rows.
+            let y0 = (c.h as usize - bh) * w;
+            let end = c.h as usize * w;
+            assert!(o[y0..end] == plain[y0..end], "{look:?}");
+            assert!(o[y0..end].iter().all(|&v| v == yellow.0));
+            for (pl, want) in [yellow.1, yellow.2].into_iter().enumerate() {
+                let off = g.luma_len() + pl * g.chroma_len();
+                let r0 = off + (c.h as usize - bh) / 2 * g.cw() as usize;
+                let r1 = off + g.chroma_len();
+                assert!(o[r0..r1].iter().all(|&v| v == want), "{look:?}");
+            }
+            // ... while the picture did change.
+            assert!(o != plain, "{look:?}");
+            // Half-filled bar: the filled part is exact too.
+            let half = compose_with(c, &src, base, Some(&look), true, 0.5);
+            assert!(half[y0..y0 + 500].iter().all(|&v| v == yellow.0));
+        }
+    }
+
+    #[test]
+    fn split_rows_follow_the_look() {
+        assert_eq!(split_rows(1920, None), 960);
+        assert_eq!(split_rows(1920, Some(0.5)), 960);
+        assert_eq!(split_rows(1350, None), 674);
+        assert_eq!(split_rows(1350, Some(0.5)), 674);
+        assert_eq!(split_rows(1920, Some(0.6)), 1152);
+        assert_eq!(split_rows(1920, Some(0.4)), 768);
+        assert_eq!(split_rows(1920, Some(0.7)), 1344);
+        assert_eq!(split_rows(1920, Some(0.3)), 576);
+        for s in [0.3, 0.45, 0.55, 0.7] {
+            assert_eq!(split_rows(1350, Some(s)) % 2, 0);
+        }
+    }
+
+    #[test]
+    fn the_split_seam_moves_with_the_look() {
+        let c = Canvas::TALL;
+        let (w, h) = (640u32, 360u32);
+        // Bright left half, dark right half: the top panel shows the left
+        // half, the bottom the right, so the seam is where luma drops.
+        let mut src = flat(w, h, 200, 128, 128);
+        for y in 0..h as usize {
+            src[y * w as usize + w as usize / 2..(y + 1) * w as usize].fill(60);
+        }
+        let top = rect(0.0, 0.0, 300.0, 266.0);
+        let bottom = rect(340.0, 0.0, 300.0, 266.0);
+        let frame = |l: Option<LayoutLook>| {
+            Compositor::new(w, h, c)
+                .with_split(l.as_ref())
+                .compose_split(&src, top, bottom, 0.0, 0.0)
+                .unwrap()
+                .to_vec()
+        };
+        let seam = |l: Option<LayoutLook>| {
+            let o = frame(l);
+            (0..c.h as usize)
+                .find(|&y| o[y * c.w as usize + 540] < 100)
+                .unwrap()
+        };
+        let look = |s: f64| Some(LayoutLook { split: Some(s) });
+        let today = seam(None);
+        assert_eq!(today, 960);
+        assert_eq!(seam(look(0.5)), today);
+        assert_eq!(seam(Some(LayoutLook::default())), today);
+        assert_eq!(seam(look(0.6)), today + 192);
+        assert_eq!(seam(look(0.4)), today - 192);
+        // Same pixels as today when absent or 0.5.
+        assert!(frame(None) == frame(look(0.5)));
+        assert!(frame(None) == frame(Some(LayoutLook::default())));
     }
 }

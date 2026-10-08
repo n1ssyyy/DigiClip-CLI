@@ -150,12 +150,15 @@ pub struct Args {
     pub caption_anim: String,
 
     /// The Look: one JSON object that dresses the clips, or `@file.json`
-    /// to read it from a file. Today its `captions` section applies
-    /// (position `x`/`y`, `size`, `font`, `case`, `color`, `active`,
-    /// `accent`, `outline`, `outline_w`, `shadow`, `box`, `box_opacity`,
-    /// `max_words`, `anim`: pop, words, none, fade, slide, bounce);
-    /// unset fields keep the caption style's own look and bad values are
-    /// ignored. `--look '{"captions":{"x":0.5,"y":0.25,"size":1.4}}'`.
+    /// to read it from a file. Sections: `captions` (position `x`/`y`,
+    /// `size`, `font`, `case`, `color`, `active`, `accent`, `outline`,
+    /// `outline_w`, `shadow`, `box`, `box_opacity`, `max_words`, `anim`:
+    /// pop, words, none, fade, slide, bounce), `headline`, `bar`, `logo`,
+    /// `camera` (`feel`: locked, steady, smooth, lively; `zoom`; `punch`),
+    /// `effects` (`vignette`, `grade`: none, warm, cool, mono, punchy;
+    /// `fill_dim`) and `layout` (`split`). Unset fields keep today's look
+    /// and bad values are ignored.
+    /// `--look '{"captions":{"x":0.5,"y":0.25,"size":1.4}}'`.
     #[arg(long)]
     pub look: Option<String>,
 
