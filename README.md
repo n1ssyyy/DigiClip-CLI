@@ -123,6 +123,25 @@ digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked un
 - **Focus.** The LLM is told the topic, the offline scorer boosts sentences that mention it, and every candidate that covers it ranks first. When nothing matches, the best clips overall are used.
 - **Batch.** Pass several files or a folder. Each video gets its own `<name>-digiclip/` folder, under `--out-dir` when given. If one video fails, the rest still run and the run exits with an error that lists the failures.
 
+### 🖼 Exact frame (serve mode)
+
+The desktop app's Studio can ask the engine for its own pixels at one moment. Over the `/ws` socket (announced in `hello` as the `preview_frame` capability):
+
+```jsonc
+// → request
+{ "id": 7, "cmd": "preview_frame", "job": "job-…", "start_s": 128.06, "len_s": 12, "t": 3.5,
+  "options": { "style": "hormozi", "aspect": "9:16", "headline": "", "progress_bar": "#FFD400",
+               "look": { "captions": { "y": 0.35, "size": 1.4 } } } }
+// ← reply
+{ "type": "res", "id": 7, "ok": true, "data": { "file": "preview-2.jpg", "rev": 1790000000000,
+  "width": 406, "height": 720, "ms": 480, "t": 3.5, "src_t": 131.56, "words": 31, "layout": "single", "warnings": [] } }
+// ← or: { "type": "res", "id": 7, "ok": false, "error": "unknown job" }
+```
+
+`options` is the object `job_start` takes, and goes down the same path as a job's. The still is the job's source at `start_s + t` seconds, drawn as if a clip ran from `start_s` for `len_s` seconds on the canvas of the first `aspect`, centre-framed: the layout (`single`, `split` with the seam from `look.layout.split`, or `fill`, the whole frame over the blurred fill), the effects, the progress bar filled to `t / len_s`, the logo, the headline (the options' text, else the first clip's title, else the job's) and the caption line for the words spoken at `t` in the style and Look given, at its animation state for `t`. The job's transcript supplies the words. `t` outside the window is clamped; every failure (unknown job, unreachable source, ffmpeg) comes back as `ok: false`.
+
+The JPEG (about 720 px on the long side) is written into the job folder as `preview-0.jpg` … `preview-3.jpg`, four names in rotation, and fetched with `GET /art/<job>/<file>?token=…&v=<rev>`. Requests are served one at a time, in order, beside other commands. There is no face tracking, camera motion or tightening in a preview, so a `split` layout assumes one person on each side of the frame.
+
 ### 🤖 Let Claude drive it (MCP)
 
 `digiclip --serve` also runs an [MCP](https://modelcontextprotocol.io) server, so Claude Desktop, Claude Code, Cursor or any MCP app can use DigiClip the way you do: start jobs from files or links with any preset or option, wait for them, read transcripts, retitle, re-cut or add clips, look at a clip's poster frame, grab the posting kit, change settings and manage models. 21 tools, and every call shows up live in the app.

@@ -9,6 +9,24 @@
 //! - `GET /art/<job>/<file>?token=…` — job artifacts (mp4 with Range
 //!   seeks for `<video>`, posters, ass/srt/kit) via [`ServeFile`].
 //!
+//! `preview_frame` (the Studio's "Exact frame") answers one still of what
+//! the real render would draw:
+//!
+//! ```text
+//! → { id, cmd: "preview_frame", job, start_s, len_s, t, options }
+//! ← { type: "res", id, ok: true, data: { job, file, rev, width, height,
+//!       ms, t, src_t, start_s, len_s, words, layout, warnings } }
+//! ← { type: "res", id, ok: false, error }
+//! ```
+//!
+//! `options` is the same object `job_start` takes (flat options plus
+//! `look`) and goes through the same `args_for` as a job. The still is the
+//! job's source at second `start_s + t`, as if a clip ran from `start_s`
+//! for `len_s` seconds, centre-framed on the canvas of the first aspect. It
+//! is written to the job folder as `preview-0.jpg` … `preview-3.jpg` (four
+//! names in rotation) and fetched through `/art/<job>/<file>?token=…&v=<rev>`.
+//! See [`crate::preview`] for what it draws and what it leaves out.
+//!
 //! Single-user desktop assumptions: bind 127.0.0.1 only, one per-boot
 //! token (Tauri spawns the sidecar with `--token`), one GPU worker
 //! (jobs queue behind a semaphore). Pause/resume is intentionally
@@ -760,6 +778,20 @@ enum Cmd {
     TranscriptGet {
         job: String,
     },
+    /// One still of the real render at second `t` of a window of the job's
+    /// source (`start_s`, `len_s`), dressed by `options` (see
+    /// [`crate::preview`]). Replies with the JPEG's name in the job folder.
+    PreviewFrame {
+        job: String,
+        #[serde(default)]
+        start_s: f64,
+        #[serde(default = "default_preview_len")]
+        len_s: f64,
+        #[serde(default)]
+        t: f64,
+        #[serde(default)]
+        options: JobOptions,
+    },
     /// Write a redacted diagnostics bundle; replies with its path.
     Diagnostics,
     /// MCP server state (port, token, clients, activity, tools).
@@ -773,6 +805,10 @@ enum Cmd {
         #[serde(default)]
         remove: bool,
     },
+}
+
+fn default_preview_len() -> f64 {
+    crate::preview::DEFAULT_LEN_S
 }
 
 /// One server frame: a correlated `res` or an async `ev`.
@@ -877,6 +913,8 @@ struct AppState {
     bus: broadcast::Sender<ServerMsg>,
     id_counter: AtomicU64,
     mcp: mcp::Mcp,
+    /// `preview_frame`: one still at a time, and their numbering.
+    preview: crate::preview::Gate,
 }
 
 struct ModelRun {
@@ -2137,6 +2175,13 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 Err(e) => vec![err(id, e)],
             }
         }
+        Cmd::PreviewFrame {
+            job,
+            start_s,
+            len_s,
+            t,
+            options,
+        } => preview_frame(&st, id, job, (start_s, len_s, t), options).await,
         Cmd::TranscriptGet { job } => {
             let out_dir = {
                 let jobs = st.jobs.lock().await;
@@ -2163,6 +2208,82 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 None => vec![err(id, "no transcript yet")],
             }
         }
+    }
+}
+
+/// `preview_frame`: one still, behind the previews' turnstile so a burst is
+/// served one at a time in arrival order. Every failure is a reply.
+async fn preview_frame(
+    st: &Arc<AppState>,
+    id: u64,
+    job: String,
+    (start_s, len_s, t): (f64, f64, f64),
+    options: JobOptions,
+) -> Vec<ServerMsg> {
+    let began = std::time::Instant::now();
+    let (start_s, len_s, t) = match crate::preview::window(start_s, len_s, t) {
+        Ok(w) => w,
+        Err(e) => return vec![err(id, e)],
+    };
+    let (source, dir, title, first_title) = {
+        let jobs = st.jobs.lock().await;
+        match jobs.get(&job) {
+            Some(live) => (
+                PathBuf::from(&live.record.source),
+                PathBuf::from(&live.record.out_dir),
+                live.record.name.clone(),
+                live.record.clips.first().map(|c| c.title.clone()),
+            ),
+            None => return vec![err(id, "unknown job")],
+        }
+    };
+    if !source.is_file() {
+        return vec![err(
+            id,
+            format!(
+                "the job's source video is not reachable: {}",
+                source.display()
+            ),
+        )];
+    }
+    let settings = st.settings.lock().await.clone();
+    let args = match args_for(&source, &dir, &options, &settings) {
+        Ok(a) => a,
+        Err(e) => return vec![err(id, e)],
+    };
+    let _turn = st.preview.lock.lock().await;
+    let seq = st.preview.seq.fetch_add(1, Ordering::SeqCst);
+    let req = crate::preview::Request {
+        transcript: dir.join("transcript.json"),
+        headline: crate::preview::headline_text(
+            options.headline.as_deref(),
+            first_title.as_deref(),
+            &title,
+        ),
+        fill: crate::preview::wants_fill(options.layout.as_deref()),
+        source,
+        dir,
+        args,
+        start_s,
+        len_s,
+        t,
+        seq,
+    };
+    let done = tokio::task::spawn_blocking(move || crate::preview::render(&req)).await;
+    match done {
+        Ok(Ok(out)) => {
+            let mut data = serde_json::to_value(&out).unwrap_or_default();
+            data["job"] = job.into();
+            data["start_s"] = start_s.into();
+            data["len_s"] = len_s.into();
+            // A new number per picture: the app adds it to the URL so a
+            // reused file name never shows a cached picture.
+            data["rev"] = now_ms().into();
+            data["ms"] = (began.elapsed().as_millis() as u64).into();
+            vec![ok(id, Some(data))]
+        }
+        Ok(Err(e)) => vec![err(id, format!("{e:#}"))],
+        Err(_) => vec![err(id, "the preview stopped unexpectedly")],
     }
 }
 
@@ -2685,6 +2806,18 @@ async fn socket_loop(st: Arc<AppState>, socket: WebSocket) {
                 continue;
             }
         };
+        // A preview takes a moment: it runs beside the socket's other
+        // commands instead of holding them up (previews queue among
+        // themselves, see `preview_frame`).
+        if matches!(req.cmd, Cmd::PreviewFrame { .. }) {
+            let (st, out_tx) = (st.clone(), out_tx.clone());
+            tokio::spawn(async move {
+                for reply in handle_cmd(st, req).await {
+                    let _ = out_tx.send(reply);
+                }
+            });
+            continue;
+        }
         for reply in handle_cmd(st.clone(), req).await {
             if out_tx.send(reply).is_err() {
                 break;
@@ -2818,6 +2951,7 @@ pub async fn run_serve(
         bus,
         id_counter: AtomicU64::new(1),
         mcp: mcp::Mcp::default(),
+        preview: Default::default(),
     };
     st.settings = Mutex::new(st.load_settings());
     st.jobs = Mutex::new(reload_jobs());
@@ -3289,6 +3423,7 @@ mod tests {
             bus,
             id_counter: AtomicU64::new(1),
             mcp: mcp::Mcp::default(),
+            preview: Default::default(),
         });
         let msg: ClientMsg = serde_json::from_str(r#"{"id":1,"cmd":"hello"}"#).unwrap();
         let replies = handle_cmd(st, msg).await;
@@ -3311,6 +3446,230 @@ mod tests {
             assert!(caps.contains(&format!("look.{s}").as_str()), "{caps:?}");
         }
         assert_eq!(caps, crate::look::CAPS);
+        assert!(caps.contains(&"preview_frame"), "{caps:?}");
+    }
+
+    // ---- preview_frame ---------------------------------------------------
+
+    fn preview_state(name: &str) -> Arc<AppState> {
+        let (bus, _) = broadcast::channel::<ServerMsg>(8);
+        Arc::new(AppState {
+            token: "t".into(),
+            data_dir: std::env::temp_dir().join(format!("digiclip-{name}-{}", std::process::id())),
+            jobs: Mutex::new(HashMap::new()),
+            settings: Mutex::new(Settings::default()),
+            model_runs: Mutex::new(HashMap::new()),
+            worker: Semaphore::new(1),
+            bus,
+            id_counter: AtomicU64::new(1),
+            mcp: mcp::Mcp::default(),
+            preview: Default::default(),
+        })
+    }
+
+    fn job_with(id: &str, source: &Path, dir: &Path, clip_title: Option<&str>) -> LiveJob {
+        let clips: Vec<ClipState> = clip_title
+            .map(|t| {
+                serde_json::from_value(serde_json::json!({
+                    "rank": 1, "title": t, "hook": "h", "start_s": 0.0, "end_s": 4.0,
+                    "tight_dur": 4.0, "style": "karaoke", "source": "llm", "score": 1.0,
+                    "mp4": null, "poster": null, "ass": null, "srt": null, "kit": null
+                }))
+                .unwrap()
+            })
+            .into_iter()
+            .collect();
+        LiveJob::new(JobRecord {
+            id: id.into(),
+            name: "Job title".into(),
+            source: source.display().to_string(),
+            status: JobStatus::Done,
+            options: JobOptions::default(),
+            clips,
+            error: None,
+            created_ms: 1,
+            out_dir: dir.display().to_string(),
+            duration_s: 4.0,
+            url: None,
+            origin: None,
+        })
+    }
+
+    fn reply(msgs: Vec<ServerMsg>) -> (bool, Option<String>, Option<serde_json::Value>) {
+        match msgs.into_iter().next() {
+            Some(ServerMsg::Res {
+                ok, error, data, ..
+            }) => (ok, error, data),
+            other => panic!("not a reply: {other:?}"),
+        }
+    }
+
+    async fn ask(
+        st: &Arc<AppState>,
+        json: &str,
+    ) -> (bool, Option<String>, Option<serde_json::Value>) {
+        let msg: ClientMsg = serde_json::from_str(json).unwrap();
+        reply(handle_cmd(st.clone(), msg).await)
+    }
+
+    #[test]
+    fn preview_frame_frames_parse() {
+        let m: ClientMsg = serde_json::from_str(
+            r#"{"id":9,"cmd":"preview_frame","job":"job-1","start_s":128.06,"len_s":12,"t":3.5,
+                "options":{"style":"hormozi","aspect":"9:16","headline":"",
+                           "look":{"captions":{"y":0.35,"size":1.4}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(m.id, 9);
+        match m.cmd {
+            Cmd::PreviewFrame {
+                job,
+                start_s,
+                len_s,
+                t,
+                options,
+            } => {
+                assert_eq!(job, "job-1");
+                assert_eq!((start_s, len_s, t), (128.06, 12.0, 3.5));
+                assert_eq!(options.style.as_deref(), Some("hormozi"));
+                assert_eq!(options.headline.as_deref(), Some(""));
+                assert_eq!(options.look.unwrap()["captions"]["y"], 0.35);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+        // Everything but the job has a default: the Studio's 12 s window.
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"id":1,"cmd":"preview_frame","job":"j"}"#).unwrap();
+        assert!(matches!(
+            m.cmd,
+            Cmd::PreviewFrame { start_s, len_s, t, ref options, .. }
+                if start_s == 0.0 && len_s == 12.0 && t == 0.0 && options.look.is_none()
+        ));
+    }
+
+    #[tokio::test]
+    async fn preview_frame_failures_are_replies() {
+        let st = preview_state("preview-errors");
+        // Unknown job.
+        let (ok, e, data) = ask(&st, r#"{"id":1,"cmd":"preview_frame","job":"nope"}"#).await;
+        assert!(!ok && data.is_none());
+        assert_eq!(e.as_deref(), Some("unknown job"));
+        // A job whose source is gone.
+        let dir =
+            std::env::temp_dir().join(format!("digiclip-preview-gone-{}", std::process::id()));
+        st.jobs.lock().await.insert(
+            "job-x".into(),
+            job_with("job-x", &dir.join("missing.mp4"), &dir, None),
+        );
+        let (ok, e, _) = ask(&st, r#"{"id":2,"cmd":"preview_frame","job":"job-x","t":1}"#).await;
+        assert!(!ok);
+        assert!(e.unwrap().contains("source video is not reachable"));
+        // No window to speak of.
+        let (ok, e, _) = ask(
+            &st,
+            r#"{"id":3,"cmd":"preview_frame","job":"job-x","len_s":0}"#,
+        )
+        .await;
+        assert!(!ok && e.unwrap().contains("len_s"));
+        // Nothing was written next to the job.
+        assert!(!dir.join("preview-0.jpg").exists());
+    }
+
+    /// The whole path on a real (synthetic) video: needs ffmpeg with libass,
+    /// skipped without.
+    #[tokio::test]
+    async fn preview_frame_draws_a_still() {
+        let Some(ffmpeg) = crate::binaries::resolve("ffmpeg") else {
+            return;
+        };
+        if !crate::binaries::ffmpeg_has_libass(&ffmpeg) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        let made = crate::process::command(&ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=duration=4:size=640x360:rate=30")
+            .args([
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+            ])
+            .arg(&src)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            return;
+        }
+        let words: Vec<serde_json::Value> = (0..8)
+            .map(|i| {
+                serde_json::json!({"w": format!("word{i}"), "s": 0.4 * i as f64 + 0.1, "e": 0.4 * i as f64 + 0.45})
+            })
+            .collect();
+        std::fs::write(
+            dir.path().join("transcript.json"),
+            serde_json::json!({"words": words, "segments": [], "language": "en", "model": "x"})
+                .to_string(),
+        )
+        .unwrap();
+        let st = preview_state("preview-still");
+        st.jobs.lock().await.insert(
+            "job-p".into(),
+            job_with("job-p", &src, dir.path(), Some("First clip")),
+        );
+        // A bad Look still renders; t past the window is clamped to its end.
+        let (ok, e, data) = ask(
+            &st,
+            r##"{"id":1,"cmd":"preview_frame","job":"job-p","start_s":0.5,"len_s":3,"t":99,
+                "options":{"style":"hormozi","aspect":"1:1","headline":"","progress_bar":"#FF3B30",
+                           "look":{"v":9,"captions":{"y":"low","x":7,"size":1.4,"box":"#123"},"hologram":1}}}"##,
+        )
+        .await;
+        assert!(ok, "{e:?}");
+        let d = data.unwrap();
+        assert_eq!(
+            (d["width"].as_u64(), d["height"].as_u64()),
+            (Some(720), Some(720))
+        );
+        assert_eq!(d["t"], 3.0);
+        assert_eq!(d["layout"], "single");
+        assert!(d["words"].as_u64().unwrap() > 0 && d["rev"].as_u64().is_some());
+        let file = d["file"].as_str().unwrap().to_string();
+        let jpg = std::fs::read(dir.path().join(&file)).unwrap();
+        assert!(jpg.starts_with(&[0xFF, 0xD8]), "not a JPEG");
+        assert_eq!(
+            crate::render::image_size(&dir.path().join(&file)),
+            Some((720, 720))
+        );
+        // The next picture gets another name, and only a few ever exist.
+        let (ok, _, data) = ask(
+            &st,
+            r#"{"id":2,"cmd":"preview_frame","job":"job-p","start_s":0,"len_s":3,"t":1,
+                "options":{"aspect":"9:16","layout":"split"}}"#,
+        )
+        .await;
+        assert!(ok);
+        let d2 = data.unwrap();
+        assert_ne!(d2["file"].as_str().unwrap(), file);
+        assert_eq!(d2["layout"], "split");
+        assert_eq!(d2["height"], 720);
+        for i in 3..7 {
+            let (ok, ..) = ask(
+                &st,
+                &format!(r#"{{"id":{i},"cmd":"preview_frame","job":"job-p","t":0.{i}}}"#),
+            )
+            .await;
+            assert!(ok);
+        }
+        let previews = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("preview-"))
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".jpg"))
+            .count();
+        assert!(previews <= 4, "{previews} preview files");
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod look;
 pub mod models;
 pub mod openrouter;
 pub mod pipeline;
+pub mod preview;
 pub mod process;
 pub mod progress;
 pub mod prompt;

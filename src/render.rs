@@ -503,17 +503,17 @@ pub fn render(
 }
 
 /// Decoded-frame geometry and the decoder's filter chain.
-struct DecodeGeom {
-    w: u32,
-    h: u32,
-    sx: f64,
-    sy: f64,
-    vf: String,
+pub(crate) struct DecodeGeom {
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) sx: f64,
+    pub(crate) sy: f64,
+    pub(crate) vf: String,
 }
 
 /// Decode at source size (capped at 2160 on the short side — 8K sources
 /// would only burn bandwidth), as limited-range BT.709 4:2:0 on a CFR grid.
-fn decode_geom(probe: &Probe, fps: (u32, u32)) -> DecodeGeom {
+pub(crate) fn decode_geom(probe: &Probe, fps: (u32, u32)) -> DecodeGeom {
     let sw = probe.width.unwrap_or(1280).max(2);
     let sh = probe.height.unwrap_or(720).max(2);
     let s = (2160.0 / sw.min(sh) as f64).min(1.0);

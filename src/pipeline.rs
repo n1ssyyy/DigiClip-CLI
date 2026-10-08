@@ -102,7 +102,7 @@ struct Timeline {
 
 /// Canvas and overlays from the CLI flags. Missing logo/music files fail
 /// fast (they were asked for by name).
-fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
+pub fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
     let parsed = args.look.as_deref().map(crate::look::Look::from_arg);
     let logo = match &args.logo {
         Some(p) if !p.is_file() => anyhow::bail!("--logo not found: {}", p.display()),
@@ -143,7 +143,7 @@ fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
 }
 
 /// Caption options for one render on this look.
-fn ass_opts(
+pub fn ass_opts(
     look: &crate::render::Look,
     headline: Option<String>,
     dur: f64,

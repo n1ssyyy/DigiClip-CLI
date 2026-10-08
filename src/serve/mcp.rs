@@ -1835,6 +1835,7 @@ mod tests {
             bus,
             id_counter: std::sync::atomic::AtomicU64::new(1),
             mcp: Mcp::default(),
+            preview: Default::default(),
         })
     }
 

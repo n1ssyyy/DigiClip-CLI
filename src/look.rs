@@ -31,8 +31,9 @@ use serde_json::Value;
 
 use crate::captions::ass::Anim;
 
-/// What this engine can do with a look, announced to the app in the `hello`
-/// snapshot (`caps`). Later chunks append to it.
+/// What this engine can do with a look (and the commands that show one),
+/// announced to the app in the `hello` snapshot (`caps`). Later chunks
+/// append to it.
 pub const CAPS: &[&str] = &[
     "look",
     "look.captions",
@@ -42,6 +43,7 @@ pub const CAPS: &[&str] = &[
     "look.camera",
     "look.effects",
     "look.layout",
+    "preview_frame",
 ];
 
 /// The fonts libass can reach (the provisioned ones).
