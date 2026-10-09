@@ -491,9 +491,11 @@ pub struct Compositor {
     bar_height: f64,
     /// The bar's colour (sRGB) and the Look's section, kept to plan the shaped
     /// bar (inset, radius, track, glow) once both are known.
-    bar_rgb: Option<(u8, u8, u8)>,
+    bar_rgb: Option<crate::look::Rgba>,
     bar_look: Option<crate::look::BarLook>,
     bar_fx: Option<crate::bar::BarFx>,
+    /// Opacity of the plain bar's fill and of its dimmed track (1, 1 = opaque).
+    bar_alpha: (f32, f32),
     /// Vignette and grade over the picture (never over the bar).
     fx: Option<Fx>,
     /// Luma gain of the blurred fill, and how much of its colour stays.
@@ -529,6 +531,7 @@ impl Compositor {
             bar_rgb: None,
             bar_look: None,
             bar_fx: None,
+            bar_alpha: (1.0, 1.0),
             fx: None,
             fill_gain: BG_DIM,
             fill_chroma: 1.0,
@@ -557,9 +560,14 @@ impl Compositor {
     }
 
     /// Draw a progress bar (sRGB color) along the bottom edge.
-    pub fn with_bar(mut self, rgb: Option<(u8, u8, u8)>) -> Self {
-        self.bar = rgb.map(|(r, g, b)| yuv709(r, g, b));
-        self.bar_rgb = rgb;
+    pub fn with_bar(self, rgb: Option<(u8, u8, u8)>) -> Self {
+        self.with_bar_rgba(rgb.map(|(r, g, b)| crate::look::Rgba::rgb(r, g, b)))
+    }
+
+    /// [`with_bar`](Self::with_bar), the colour with its own alpha (`#RRGGBBAA`).
+    pub fn with_bar_rgba(mut self, rgba: Option<crate::look::Rgba>) -> Self {
+        self.bar = rgba.map(|c| yuv709(c.0, c.1, c.2));
+        self.bar_rgb = rgba;
         self.plan_bar()
     }
 
@@ -581,6 +589,18 @@ impl Compositor {
             (Some(rgb), Some(l)) if l.shaped() => Some(crate::bar::BarFx::new(self.canvas, l, rgb)),
             _ => None,
         };
+        // The plain bar's alpha: the fill colour's own times the Look's `opacity`
+        // for the fill, the Look's `opacity` for the dimmed track.
+        let elem = self
+            .bar_look
+            .as_ref()
+            .and_then(|l| l.opacity)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0) as f32;
+        self.bar_alpha = (
+            self.bar_rgb.map_or(1.0, |c| c.3 as f32 / 255.0) * elem,
+            elem,
+        );
         self
     }
 
@@ -700,14 +720,25 @@ impl Compositor {
         if let (Some(_), Some(fx)) = (self.bar, &self.bar_fx) {
             fx.draw(&mut self.out, progress);
         } else if let Some(color) = self.bar {
-            draw_bar_at(
-                &mut self.out,
-                canvas,
-                color,
-                progress,
-                self.bar_top,
-                self.bar_height,
-            );
+            if self.bar_alpha == (1.0, 1.0) {
+                draw_bar_at(
+                    &mut self.out,
+                    canvas,
+                    color,
+                    progress,
+                    self.bar_top,
+                    self.bar_height,
+                );
+            } else {
+                draw_bar_over(
+                    &mut self.out,
+                    canvas,
+                    color,
+                    progress,
+                    (self.bar_top, self.bar_height),
+                    self.bar_alpha,
+                );
+            }
         }
     }
 
@@ -840,16 +871,67 @@ impl Compositor {
 /// bar on and sets its colour; the Look's `bar.color` replaces the colour but
 /// never switches a bar on.
 pub fn bar_color(
-    flat: Option<(u8, u8, u8)>,
+    flat: Option<crate::look::Rgba>,
     look: Option<&crate::look::BarLook>,
-) -> Option<(u8, u8, u8)> {
-    flat.map(|f| look.and_then(|l| l.color).map_or(f, |c| (c.0, c.1, c.2)))
+) -> Option<crate::look::Rgba> {
+    flat.map(|f| look.and_then(|l| l.color).unwrap_or(f))
 }
 
 /// Progress bar along the bottom edge: the filled part in `color`, the
 /// rest a dimmed track so the bar reads on any footage. Pure (unit-tested).
 pub fn draw_bar(out: &mut [u8], c: Canvas, color: (u8, u8, u8), progress: f32) {
     draw_bar_at(out, c, color, progress, false, 1.0);
+}
+
+/// [`draw_bar_at`] with alpha: the dimmed track is laid over the picture at
+/// `track_a`, then the fill over that at `fill_a` (straight alpha, each layer
+/// rounded to 8 bits; a `fill_a` and `track_a` of 1 give [`draw_bar_at`]'s pixels).
+pub fn draw_bar_over(
+    out: &mut [u8],
+    c: Canvas,
+    color: (u8, u8, u8),
+    progress: f32,
+    (top, height): (bool, f64),
+    (fill_a, track_a): (f32, f32),
+) {
+    let mix = |from: u8, to: u8, a: f32| -> u8 {
+        let (f, t) = (from as f32, to as f32);
+        (f + (t - f) * a.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8
+    };
+    let g = Geom { w: c.w, h: c.h };
+    let bh = bar_thickness(c, height);
+    let fill = ((progress.clamp(0.0, 1.0) as f64 * c.w as f64 / 2.0).round() as u32 * 2).min(c.w);
+    let (w, y0) = (c.w as usize, if top { 0 } else { (c.h - bh) as usize });
+    let y1 = y0 + bh as usize;
+    let (oy, uv) = out.split_at_mut(g.luma_len());
+    for y in y0..y1 {
+        let row = &mut oy[y * w..(y + 1) * w];
+        for (x, p) in row.iter_mut().enumerate() {
+            let dim = 16 + (p.saturating_sub(16) as u32 * 45 / 100) as u8;
+            let under = mix(*p, dim, track_a);
+            *p = if (x as u32) < fill {
+                mix(under, color.0, fill_a)
+            } else {
+                under
+            };
+        }
+    }
+    let (cw, cl) = (g.cw() as usize, g.chroma_len());
+    let (ou, ov) = uv.split_at_mut(cl);
+    for (plane, val) in [(ou, color.1), (&mut ov[..cl], color.2)] {
+        for y in y0 / 2..y1 / 2 {
+            let row = &mut plane[y * cw..(y + 1) * cw];
+            for (x, p) in row.iter_mut().enumerate() {
+                let dim = (128 + (*p as i32 - 128) / 2) as u8;
+                let under = mix(*p, dim, track_a);
+                *p = if ((x * 2) as u32) < fill {
+                    mix(under, val, fill_a)
+                } else {
+                    under
+                };
+            }
+        }
+    }
 }
 
 /// Bar thickness in px (even): 0.65% of the height, at least 8, times the
@@ -1741,14 +1823,17 @@ mod tests {
     #[test]
     fn the_bar_colour_is_the_looks_when_the_bar_is_on() {
         use crate::look::BarLook;
-        let flat = Some((255, 212, 0));
+        let flat = Some(crate::look::Rgba::rgb(255, 212, 0));
         let red = BarLook {
-            color: Some(crate::look::Rgb(255, 59, 48)),
+            color: Some(crate::look::Rgba::rgb(255, 59, 48)),
             ..Default::default()
         };
         assert_eq!(bar_color(flat, None), flat);
         assert_eq!(bar_color(flat, Some(&BarLook::default())), flat);
-        assert_eq!(bar_color(flat, Some(&red)), Some((255, 59, 48)));
+        assert_eq!(
+            bar_color(flat, Some(&red)),
+            Some(crate::look::Rgba::rgb(255, 59, 48))
+        );
         // It never switches a bar on.
         assert_eq!(bar_color(None, Some(&red)), None);
         assert_eq!(bar_color(None, None), None);
@@ -1838,5 +1923,93 @@ mod tests {
             dressed[y_mid * w + 1080 - 44 - 8],
             out[y_mid * w + 1080 - 44 - 8]
         );
+    }
+
+    // ---- alpha: the bar over the frame -----------------------------------------
+
+    fn mixf(from: u8, to: u8, a: f32) -> u8 {
+        let (f, t) = (from as f32, to as f32);
+        (f + (t - f) * a.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8
+    }
+
+    #[test]
+    fn a_half_opaque_bar_is_laid_over_the_picture_in_straight_alpha() {
+        let c = Canvas::SQUARE;
+        let (w, h) = (c.w as usize, c.h as usize);
+        let src = colourful(640, 360);
+        let base = c.base_rect(640.0, 360.0);
+        let build = |bar: Option<crate::look::Rgba>, look: Option<&crate::look::BarLook>| {
+            Compositor::new(640, 360, c)
+                .with_bar_rgba(bar)
+                .with_bar_look(look)
+                .compose(&src, base, 0.0, 0.5)
+                .unwrap()
+                .to_vec()
+        };
+        let pic = build(None, None);
+        let yellow = crate::look::Rgba::rgb(255, 212, 0);
+        let (yy, yu, yv) = yuv709(255, 212, 0);
+        let bh = bar_thickness(c, 1.0) as usize;
+        let dim = |p: u8| 16 + (p.saturating_sub(16) as u32 * 45 / 100) as u8;
+        let dim_c = |p: u8| (128 + (p as i32 - 128) / 2) as u8;
+        let fill_to = w / 2; // progress 0.5
+        let g = Geom { w: c.w, h: c.h };
+        let cw = g.cw() as usize;
+
+        // opacity 0.5: the dimmed track at 0.5 over the picture, then the fill at 0.5.
+        let half = build(Some(yellow), Some(&bar_of(r#"{"opacity":0.5}"#)));
+        for y in h - bh..h {
+            for x in [0, 17, fill_to - 1, fill_to, fill_to + 5, w - 1] {
+                let p = pic[y * w + x];
+                let under = mixf(p, dim(p), 0.5);
+                let want = if x < fill_to {
+                    mixf(under, yy, 0.5)
+                } else {
+                    under
+                };
+                assert_eq!(half[y * w + x], want, "luma {x},{y}");
+            }
+        }
+        for (plane, val) in [(1usize, yu), (2, yv)] {
+            let base = g.luma_len() + (plane - 1) * g.chroma_len();
+            let (cy, x) = ((h - bh) / 2 + 1, 5usize);
+            let p = pic[base + cy * cw + x];
+            let want = mixf(mixf(p, dim_c(p), 0.5), val, 0.5);
+            assert_eq!(half[base + cy * cw + x], want, "chroma {plane}");
+        }
+        // Above the bar: untouched.
+        assert!(half[..(h - bh) * w] == pic[..(h - bh) * w]);
+
+        // A flat colour with an alpha: the fill at that alpha over the opaque dim track.
+        let flat = build(Some(crate::look::Rgba(255, 212, 0, 128)), None);
+        let (x, y) = (17, h - 2);
+        let p = pic[y * w + x];
+        assert_eq!(flat[y * w + x], mixf(dim(p), yy, 128.0 / 255.0));
+        let p = pic[y * w + w - 3];
+        assert_eq!(flat[y * w + w - 3], dim(p));
+
+        // Opacity 0 draws nothing; opacity 1 and an opaque colour are the bar as it was.
+        assert!(build(Some(yellow), Some(&bar_of(r#"{"opacity":0}"#))) == pic);
+        let old = build(Some(yellow), None);
+        assert!(build(Some(yellow), Some(&bar_of(r#"{"opacity":1}"#))) == old);
+        assert!(build(Some(crate::look::Rgba(255, 212, 0, 255)), None) == old);
+        let mut by_hand = pic.clone();
+        draw_bar_at(&mut by_hand, c, (yy, yu, yv), 0.5, false, 1.0);
+        assert!(old == by_hand);
+    }
+
+    #[test]
+    fn drawing_the_bar_over_with_full_alpha_is_drawing_it() {
+        let c = Canvas::PORTRAIT;
+        let g = Geom { w: c.w, h: c.h };
+        let yellow = yuv709(255, 212, 0);
+        for top in [true, false] {
+            let mut a = vec![90u8; g.frame_len()];
+            a[g.luma_len()..].fill(110);
+            let mut b = a.clone();
+            draw_bar_at(&mut a, c, yellow, 0.37, top, 2.0);
+            draw_bar_over(&mut b, c, yellow, 0.37, (top, 2.0), (1.0, 1.0));
+            assert!(a == b, "top {top}");
+        }
     }
 }

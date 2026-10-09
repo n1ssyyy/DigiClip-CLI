@@ -13,13 +13,19 @@
 //! be round, and the halo is the blur of a rectangle, which is separable (one
 //! profile per row, computed once; one per column, computed per frame).
 //!
+//! Alpha is straight alpha over what is below, each layer rounded to 8 bits:
+//! the fill at its colour's alpha times `bar.opacity`, the track at its own
+//! opacity times its colour's alpha times `bar.opacity` (the plain dimmed
+//! track: the dimmed picture blended at `bar.opacity`), the glow at its
+//! strength times its colour's alpha times `bar.opacity`.
+//!
 //! Order, bottom to top: the picture, the track, the glow, the fill. The glow
 //! is what a caption's glow is: the shape grown by 0.55 of `size` and blurred
 //! by 0.6 of `size`, at `strength` opacity (see `captions::motion`).
 
 use crate::captions::motion::{resolve_glow, GLOW_BLUR, GLOW_BORD};
 use crate::compose::{bar_thickness, Canvas, Geom};
-use crate::look::BarLook;
+use crate::look::{BarLook, Rgba};
 
 /// How much of the picture a track without a colour of its own keeps: the
 /// luma is dimmed to 45 %, the chroma halved (what the bar always did).
@@ -96,17 +102,25 @@ pub struct BarFx {
     radius: f64,
     /// Fill colour (YUV).
     fill: (u8, u8, u8),
-    /// The track's colour (YUV) and opacity; `None` is the plain dimmed track.
+    /// Opacity of the fill: its colour's own alpha times the Look's `opacity`.
+    fill_a: f32,
+    /// The track's colour (YUV) and opacity (its own, its colour's alpha and the
+    /// Look's `opacity`, multiplied); `None` is the plain dimmed track.
     track: Option<((u8, u8, u8), f32)>,
+    /// Opacity of the plain dimmed track: the Look's `opacity`.
+    dim_a: f32,
     /// Coverage of the track's shape, `(y1 - y0)` rows of `(x1 - x0)`.
     mask: Vec<u8>,
     halo: Option<Halo>,
 }
 
 impl BarFx {
-    /// Plan the bar. `fill` is the bar colour (sRGB, the flat `progress_bar`
-    /// or the Look's `bar.color`).
-    pub fn new(c: Canvas, look: &BarLook, fill: (u8, u8, u8)) -> BarFx {
+    /// Plan the bar. `fill` is the bar colour (sRGB with its alpha: the flat
+    /// `progress_bar` or the Look's `bar.color`).
+    pub fn new(c: Canvas, look: &BarLook, fill: Rgba) -> BarFx {
+        let elem = look.opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        let fill_a = (fill.opacity() * elem) as f32;
+        let fill = (fill.0, fill.1, fill.2);
         let (w, h) = (c.w as usize, c.h as usize);
         let k = crate::captions::ass::design_scale(c.w, c.h);
         let bh = bar_thickness(c, look.height.unwrap_or(1.0)) as usize;
@@ -130,12 +144,20 @@ impl BarFx {
         let yuv = |(r, g, b): (u8, u8, u8)| crate::compose::yuv709(r, g, b);
         let track = (look.track.is_some() || look.track_opacity.is_some()).then(|| {
             let col = look.track.map_or((0, 0, 0), |t| (t.0, t.1, t.2));
-            (yuv(col), look.track_opacity.unwrap_or(TRACK_OPACITY) as f32)
+            let own = look.track.map_or(1.0, |t| t.opacity());
+            let o = look.track_opacity.unwrap_or(TRACK_OPACITY) * own * elem;
+            (yuv(col), o as f32)
         });
         let halo = look
             .glow
             .as_ref()
-            .map(|g| resolve_glow(&[Some(g)], [fill.0 as f64, fill.1 as f64, fill.2 as f64], k))
+            .map(|g| {
+                resolve_glow(
+                    &[Some(g)],
+                    [fill.0 as f64, fill.1 as f64, fill.2 as f64, 255.0],
+                    k,
+                )
+            })
             .filter(|g| g.size > 0.0 && g.strength > 0.0)
             .map(|g| {
                 let grow = g.size * GLOW_BORD;
@@ -153,7 +175,7 @@ impl BarFx {
                         g.col[1].round() as u8,
                         g.col[2].round() as u8,
                     )),
-                    strength: g.strength as f32,
+                    strength: (g.strength * elem) as f32,
                     grow,
                     sigma,
                     reach,
@@ -174,7 +196,9 @@ impl BarFx {
             y1,
             radius,
             fill: yuv(fill),
+            fill_a,
             track,
+            dim_a: elem as f32,
             mask,
             halo,
         }
@@ -206,7 +230,14 @@ impl BarFx {
                     continue;
                 }
                 let dark = match self.track {
-                    None => 16 + (p.saturating_sub(16) as u32 * TRACK_LUMA_KEEP / 100) as u8,
+                    None => {
+                        let dim = 16 + (p.saturating_sub(16) as u32 * TRACK_LUMA_KEEP / 100) as u8;
+                        if self.dim_a < 1.0 {
+                            mix(*p, dim, self.dim_a)
+                        } else {
+                            dim
+                        }
+                    }
                     Some((c, o)) => mix(*p, c.0, o),
                 };
                 *p = if a == 255 {
@@ -225,7 +256,14 @@ impl BarFx {
                     }
                     let p = &mut plane[cy * cw + cx];
                     let dark = match self.track {
-                        None => (128 + (*p as i32 - 128) / 2) as u8,
+                        None => {
+                            let dim = (128 + (*p as i32 - 128) / 2) as u8;
+                            if self.dim_a < 1.0 {
+                                mix(*p, dim, self.dim_a)
+                            } else {
+                                dim
+                            }
+                        }
                         Some((c, o)) => mix(*p, if which == 1 { c.1 } else { c.2 }, o),
                     };
                     *p = if a >= 1.0 { dark } else { mix(*p, dark, a) };
@@ -259,10 +297,10 @@ impl BarFx {
         for (j, row) in cov.chunks(fw).enumerate() {
             let dst = &mut oy[(self.y0 + j) * w + self.x0..(self.y0 + j) * w + end];
             for (p, &a) in dst.iter_mut().zip(row) {
-                if a == 255 {
+                if a == 255 && self.fill_a >= 1.0 {
                     *p = self.fill.0;
                 } else if a > 0 {
-                    *p = mix(*p, self.fill.0, a as f32 / 255.0);
+                    *p = mix(*p, self.fill.0, a as f32 / 255.0 * self.fill_a);
                 }
             }
         }
@@ -282,7 +320,11 @@ impl BarFx {
                         continue;
                     }
                     let p = &mut plane[cy * cw + cx];
-                    *p = if a >= 1.0 { val } else { mix(*p, val, a) };
+                    *p = if a >= 1.0 && self.fill_a >= 1.0 {
+                        val
+                    } else {
+                        mix(*p, val, a * self.fill_a)
+                    };
                 }
             }
         }
@@ -349,7 +391,7 @@ fn mix(from: u8, to: u8, a: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::look::{GlowLook, Look, Rgb};
+    use crate::look::{GlowLook, Look, Rgba};
 
     const C: Canvas = Canvas::TALL;
 
@@ -379,6 +421,7 @@ mod tests {
     }
 
     const YELLOW: (u8, u8, u8) = (255, 212, 0);
+    const YELLOW_A: Rgba = Rgba::rgb(255, 212, 0);
 
     fn yellow_yuv() -> (u8, u8, u8) {
         crate::compose::yuv709(YELLOW.0, YELLOW.1, YELLOW.2)
@@ -386,14 +429,14 @@ mod tests {
 
     #[test]
     fn inset_is_the_margin_from_the_sides_and_the_edge_it_sits_on() {
-        let fx = BarFx::new(C, &look(r#"{"inset":0.04}"#), YELLOW);
+        let fx = BarFx::new(C, &look(r#"{"inset":0.04}"#), YELLOW_A);
         // 4 % of 1080 is 43.2 px: the nearest even number, 44.
         let bh = bar_thickness(C, 1.0) as usize;
         assert_eq!(fx.bounds(), (44, 1920 - 44 - bh, 1080 - 44, 1920 - 44));
-        let top = BarFx::new(C, &look(r#"{"inset":0.04,"pos":"top"}"#), YELLOW);
+        let top = BarFx::new(C, &look(r#"{"inset":0.04,"pos":"top"}"#), YELLOW_A);
         assert_eq!(top.bounds(), (44, 44, 1080 - 44, 44 + bh));
         // No inset: the bar runs to the frame's edges as before.
-        let flat = BarFx::new(C, &look(r#"{"radius":0}"#), YELLOW);
+        let flat = BarFx::new(C, &look(r#"{"radius":0}"#), YELLOW_A);
         assert_eq!(flat.bounds(), (0, 1920 - bh, 1080, 1920));
         // Pixels: the fill starts at the inset and not before, rows likewise.
         let mut f = frame();
@@ -416,7 +459,7 @@ mod tests {
 
     #[test]
     fn the_fill_ends_where_the_progress_says_and_the_track_is_the_plain_dimming() {
-        let fx = BarFx::new(C, &look(r#"{"inset":0}"#), YELLOW);
+        let fx = BarFx::new(C, &look(r#"{"inset":0}"#), YELLOW_A);
         let mut f = frame();
         let before = f.clone();
         fx.draw(&mut f, 0.4);
@@ -464,7 +507,7 @@ mod tests {
         let fx = BarFx::new(
             C,
             &look(r##"{"track":"#FFFFFF","track_opacity":0.3}"##),
-            YELLOW,
+            YELLOW_A,
         );
         fx.draw(&mut f, 0.2);
         let (_, y0, x1, y1) = fx.bounds();
@@ -475,21 +518,21 @@ mod tests {
         assert!(luma(&f, x, mid) > luma(&before, x, mid).min(200));
         // A track colour alone has the strength of the plain dimming (55 %).
         let mut g = before.clone();
-        BarFx::new(C, &look(r##"{"track":"#FFFFFF"}"##), YELLOW).draw(&mut g, 0.2);
+        BarFx::new(C, &look(r##"{"track":"#FFFFFF"}"##), YELLOW_A).draw(&mut g, 0.2);
         assert_eq!(luma(&g, x, mid), mix(luma(&before, x, mid), 235, 0.55));
         // An opacity alone dims towards black.
         let mut g = before.clone();
-        BarFx::new(C, &look(r#"{"track_opacity":0.8}"#), YELLOW).draw(&mut g, 0.2);
+        BarFx::new(C, &look(r#"{"track_opacity":0.8}"#), YELLOW_A).draw(&mut g, 0.2);
         assert_eq!(luma(&g, x, mid), mix(luma(&before, x, mid), 16, 0.8));
         // Fully clear: the picture shows through.
         let mut g = before.clone();
-        BarFx::new(C, &look(r#"{"track_opacity":0}"#), YELLOW).draw(&mut g, 0.2);
+        BarFx::new(C, &look(r#"{"track_opacity":0}"#), YELLOW_A).draw(&mut g, 0.2);
         assert_eq!(luma(&g, x, mid), luma(&before, x, mid));
     }
 
     #[test]
     fn radius_rounds_the_ends_of_the_bar_and_the_leading_end_of_the_fill() {
-        let fx = BarFx::new(C, &look(r#"{"inset":0.04,"radius":1}"#), YELLOW);
+        let fx = BarFx::new(C, &look(r#"{"inset":0.04,"radius":1}"#), YELLOW_A);
         let (x0, y0, x1, y1) = fx.bounds();
         let bh = y1 - y0;
         let mut f = frame();
@@ -516,12 +559,12 @@ mod tests {
         let edge = luma(&f, x0 + 1, y0 + 1);
         assert!(edge != yellow_yuv().0 && edge != luma(&before, x0 + 1, y0 + 1));
         // Square ends where radius is 0.
-        let sq = BarFx::new(C, &look(r#"{"inset":0.04,"radius":0}"#), YELLOW);
+        let sq = BarFx::new(C, &look(r#"{"inset":0.04,"radius":0}"#), YELLOW_A);
         let mut g = before.clone();
         sq.draw(&mut g, 0.5);
         assert_eq!(luma(&g, x0, y0), yellow_yuv().0);
         // A half radius is half as round: the corner pixel is mostly covered.
-        let half = BarFx::new(C, &look(r#"{"inset":0.04,"radius":0.5}"#), YELLOW);
+        let half = BarFx::new(C, &look(r#"{"inset":0.04,"radius":0.5}"#), YELLOW_A);
         let mut g = before.clone();
         half.draw(&mut g, 0.5);
         assert_ne!(luma(&g, x0, y0), yellow_yuv().0);
@@ -530,7 +573,7 @@ mod tests {
     #[test]
     fn the_glow_hugs_the_fill_and_stays_near_the_bar() {
         let l = look(r##"{"inset":0.04,"radius":1,"glow":{"size":20,"strength":0.9}}"##);
-        let fx = BarFx::new(C, &l, YELLOW);
+        let fx = BarFx::new(C, &l, YELLOW_A);
         let (x0, y0, x1, y1) = fx.bounds();
         let mut f = frame();
         let before = f.clone();
@@ -594,11 +637,11 @@ mod tests {
 
     #[test]
     fn a_glow_takes_its_own_colour_and_none_means_the_fill_colour() {
-        let fill = BarFx::new(C, &look(r#"{"glow":{"size":16}}"#), YELLOW);
+        let fill = BarFx::new(C, &look(r#"{"glow":{"size":16}}"#), YELLOW_A);
         let blue = BarFx::new(
             C,
             &look(r##"{"glow":{"size":16,"color":"#0000FF"}}"##),
-            YELLOW,
+            YELLOW_A,
         );
         let (mut a, mut b) = (frame(), frame());
         fill.draw(&mut a, 0.5);
@@ -613,22 +656,22 @@ mod tests {
             let mut g = frame();
             let want = {
                 let mut w = frame();
-                BarFx::new(C, &look(r#"{"inset":0}"#), YELLOW).draw(&mut w, 0.5);
+                BarFx::new(C, &look(r#"{"inset":0}"#), YELLOW_A).draw(&mut w, 0.5);
                 w
             };
             let l = look(j);
-            let fx = BarFx::new(C, &l, YELLOW);
+            let fx = BarFx::new(C, &l, YELLOW_A);
             fx.draw(&mut g, 0.5);
             assert_eq!(g, want, "{j}");
         }
-        let _ = (GlowLook::default(), Rgb(0, 0, 0));
+        let _ = (GlowLook::default(), Rgba::rgb(0, 0, 0));
     }
 
     #[test]
     fn glow_sizes_scale_with_the_canvas_like_captions_do() {
         // 9:16 at 1080 wide is the design size: 20 px reaches 11 + 36 px.
-        let a = BarFx::new(C, &look(r#"{"glow":{"size":20}}"#), YELLOW);
-        let b = BarFx::new(Canvas::SQUARE, &look(r#"{"glow":{"size":20}}"#), YELLOW);
+        let a = BarFx::new(C, &look(r#"{"glow":{"size":20}}"#), YELLOW_A);
+        let b = BarFx::new(Canvas::SQUARE, &look(r#"{"glow":{"size":20}}"#), YELLOW_A);
         let ra = a.halo.as_ref().unwrap().reach;
         let rb = b.halo.as_ref().unwrap().reach;
         assert!(rb < ra, "{rb} {ra}");
@@ -636,7 +679,7 @@ mod tests {
 
     #[test]
     fn progress_extremes_are_empty_and_full() {
-        let fx = BarFx::new(C, &look(r#"{"inset":0.02,"radius":1}"#), YELLOW);
+        let fx = BarFx::new(C, &look(r#"{"inset":0.02,"radius":1}"#), YELLOW_A);
         let (x0, y0, x1, y1) = fx.bounds();
         let mid = (y0 + y1) / 2;
         let mut f = frame();
@@ -649,5 +692,97 @@ mod tests {
         let mut f = frame();
         fx.draw(&mut f, 7.0);
         assert_eq!(luma(&f, x1 - 20, mid), yellow_yuv().0);
+    }
+
+    // ---- alpha ---------------------------------------------------------------
+
+    #[test]
+    fn bar_opacity_and_colour_alpha_lay_track_glow_and_fill_over_the_picture() {
+        let yy = yellow_yuv();
+        let dim = |p: u8| 16 + (p.saturating_sub(16) as u32 * 45 / 100) as u8;
+        let fx = BarFx::new(
+            C,
+            &look(r##"{"inset":0,"track":"#FFFFFF","track_opacity":0.8,"opacity":0.5}"##),
+            Rgba(255, 212, 0, 128),
+        );
+        let mut f = frame();
+        let before = f.clone();
+        fx.draw(&mut f, 0.5);
+        let (x0, y0, x1, y1) = fx.bounds();
+        let mid = (y0 + y1) / 2;
+        let white = crate::compose::yuv709(255, 255, 255).0;
+        // Track: its opacity 0.8, times the bar's 0.5 (a six-digit colour is opaque).
+        let track_a = (0.8 * 1.0 * 0.5) as f32;
+        // Fill: the colour's alpha (128/255) times the bar's 0.5, over the track.
+        let fill_a = (128.0 / 255.0 * 0.5) as f32;
+        let x_fill = x0 + 10;
+        let under = mix(luma(&before, x_fill, mid), white, track_a);
+        assert_eq!(luma(&f, x_fill, mid), mix(under, yy.0, fill_a));
+        let x_track = x1 - 10;
+        assert_eq!(
+            luma(&f, x_track, mid),
+            mix(luma(&before, x_track, mid), white, track_a)
+        );
+        // Outside the bar the picture is untouched.
+        assert_eq!(luma(&f, x_fill, y0 - 1), luma(&before, x_fill, y0 - 1));
+        // The plain dimmed track is blended at the bar's opacity.
+        let fx = BarFx::new(
+            C,
+            &look(r#"{"inset":0,"opacity":0.5}"#),
+            Rgba::rgb(255, 212, 0),
+        );
+        let mut g = before.clone();
+        fx.draw(&mut g, 0.5);
+        let p = luma(&before, x_track, mid);
+        assert_eq!(luma(&g, x_track, mid), mix(p, dim(p), 0.5));
+        // Opacity 0 draws nothing; 1 is the bar as it was.
+        let mut z = before.clone();
+        BarFx::new(C, &look(r#"{"inset":0,"opacity":0}"#), YELLOW_A).draw(&mut z, 0.5);
+        assert!(z == before);
+        let (mut a, mut b) = (before.clone(), before.clone());
+        BarFx::new(
+            C,
+            &look(r#"{"inset":0.02,"radius":1,"glow":{"size":10}}"#),
+            YELLOW_A,
+        )
+        .draw(&mut a, 0.5);
+        BarFx::new(
+            C,
+            &look(
+                r##"{"inset":0.02,"radius":1,"glow":{"size":10,"color":"#FFD400FF"},"opacity":1}"##,
+            ),
+            Rgba(255, 212, 0, 255),
+        )
+        .draw(&mut b, 0.5);
+        assert!(a == b);
+    }
+
+    #[test]
+    fn the_glow_takes_the_glow_colours_alpha_and_the_bar_opacity() {
+        let strong = |j: &str| {
+            let mut f = frame();
+            let fx = BarFx::new(C, &look(j), YELLOW_A);
+            fx.draw(&mut f, 0.5);
+            let (x0, y0, _, _) = fx.bounds();
+            // A pixel just above the bar, inside the halo.
+            luma(&f, x0 + 200, y0 - 3)
+        };
+        let full = strong(r##"{"inset":0.04,"glow":{"size":20,"color":"#FFFFFF"}}"##);
+        let half_colour = strong(r##"{"inset":0.04,"glow":{"size":20,"color":"#FFFFFF80"}}"##);
+        let half_bar =
+            strong(r##"{"inset":0.04,"glow":{"size":20,"color":"#FFFFFF"},"opacity":0.5}"##);
+        let none = strong(r##"{"inset":0.04,"opacity":0.5}"##);
+        // The halo lifts the picture; half the strength lifts it about half as far.
+        assert!(full > none && half_colour > none && half_bar > none);
+        assert!(half_colour < full && half_bar < full);
+        let lift = |v: u8| v as i32 - none as i32;
+        assert!(
+            (lift(half_colour) * 2 - lift(full)).abs() <= 2,
+            "{half_colour} {full} {none}"
+        );
+        assert!(
+            (lift(half_bar) * 2 - lift(full)).abs() <= 3,
+            "{half_bar} {full} {none}"
+        );
     }
 }

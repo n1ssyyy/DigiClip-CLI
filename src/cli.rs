@@ -176,7 +176,7 @@ pub struct Args {
     pub headline: Option<String>,
 
     /// Progress bar along the bottom edge. Bare = yellow, or a #RRGGBB
-    /// color: `--progress-bar "#FF3B30"`.
+    /// color: `--progress-bar "#FF3B30"` (`#RRGGBBAA` adds an opacity).
     #[arg(long, num_args = 0..=1, default_missing_value = "#FFD400", value_parser = parse_color)]
     pub progress_bar: Option<String>,
 
@@ -372,9 +372,15 @@ fn parse_aspect(s: &str) -> Result<String, String> {
 }
 
 fn parse_color(s: &str) -> Result<String, String> {
-    crate::compose::parse_hex(s)
-        .map(|(r, g, b)| format!("#{r:02X}{g:02X}{b:02X}"))
-        .ok_or_else(|| format!("bad color '{s}' (use #RRGGBB)"))
+    crate::look::Rgba::parse(s)
+        .map(|c| {
+            if c.3 == 255 {
+                format!("#{:02X}{:02X}{:02X}", c.0, c.1, c.2)
+            } else {
+                format!("#{:02X}{:02X}{:02X}{:02X}", c.0, c.1, c.2, c.3)
+            }
+        })
+        .ok_or_else(|| format!("bad color '{s}' (use #RRGGBB or #RRGGBBAA)"))
 }
 
 impl Args {

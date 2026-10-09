@@ -8,7 +8,7 @@
 use super::motion;
 use crate::look::{
     AccentWord, BoxFxLook, BoxLook, BoxPer, CaptionsLook, Case, Ease, EnterKind, EnterLook,
-    ExitKind, ExitLook, HeadlineAnim, HeadlineLook, KeywordLook, Rgb, WordMode, WordsLook,
+    ExitKind, ExitLook, HeadlineAnim, HeadlineLook, KeywordLook, Rgba, WordMode, WordsLook,
 };
 use crate::whisper::Word;
 
@@ -642,7 +642,13 @@ pub fn headline_text(raw: &str, max: usize) -> String {
 
 /// Headline as ASS text: two balanced lines once it's long enough to
 /// wrap, one keyword in the accent color.
-fn headline_markup(h: &str, ink: &str, accent: &str) -> String {
+/// With the accent word's and the other words' fill alpha
+/// bytes (`\1a`) said when they differ (`alphas` = accent, ink).
+fn headline_markup(h: &str, ink: &str, accent: &str, alphas: Option<(u8, u8)>) -> String {
+    let (acc_a, ink_a) = match alphas {
+        Some((a, i)) => (format!("\\1a&H{a:02X}&"), format!("\\1a&H{i:02X}&")),
+        None => (String::new(), String::new()),
+    };
     let words: Vec<&str> = h.split(' ').collect();
     let pick = accent_pick(&words);
     // Balanced break: the split that minimizes the longer line.
@@ -661,7 +667,7 @@ fn headline_markup(h: &str, ink: &str, accent: &str) -> String {
             out.push_str(if Some(i) == brk { "\\N" } else { " " });
         }
         if Some(i) == pick {
-            out.push_str(&format!("{{\\1c{accent}&}}{w}{{\\1c{ink}&}}"));
+            out.push_str(&format!("{{\\1c{accent}&{acc_a}}}{w}{{\\1c{ink}&{ink_a}}}"));
         } else {
             out.push_str(w);
         }
@@ -739,13 +745,13 @@ fn headline_v2(
             Some(BoxLook::Color(c)) => Some(c),
             _ => None,
         })
-        .unwrap_or(Rgb(255, 255, 255));
+        .unwrap_or(Rgba::rgb(255, 255, 255));
     let card_op = card.and_then(|c| c.opacity).unwrap_or(1.0);
     let pad = card.and_then(|c| c.pad).unwrap_or(HEADLINE_PAD * size);
     let radius = card.and_then(|c| c.radius).unwrap_or(0.0);
     // Ink, and the stroke: a card needs none, bare type gets today's dark edge.
-    let ink_rgb = hl.ink.or(no_card.then_some(Rgb(255, 255, 255)));
-    let ink = ink_rgb.map_or_else(|| HEADLINE_INK.to_string(), |c| c.ass(0));
+    let ink_rgb = hl.ink.or(no_card.then_some(Rgba::rgb(255, 255, 255)));
+    let ink = ink_rgb.map_or_else(|| HEADLINE_INK.to_string(), |c| c.ass_own());
     let dark_ink = ink_rgb
         .is_none_or(|c| (0.2126 * c.0 as f64 + 0.7152 * c.1 as f64 + 0.0722 * c.2 as f64) < 90.0);
     let mut stroke_c = if dark_ink { "&H00FFFFFF" } else { "&H00000000" }.to_string();
@@ -756,7 +762,7 @@ fn headline_v2(
     };
     if let Some(st) = &hl.stroke {
         if let Some(c) = st.color {
-            stroke_c = c.ass(0);
+            stroke_c = c.ass_own();
         }
         if let Some(w) = st.width {
             stroke_w = w * k;
@@ -764,7 +770,7 @@ fn headline_v2(
     }
     let accent = hl
         .accent
-        .map_or_else(|| HEADLINE_ACCENT.to_string(), |c| c.ass(0));
+        .map_or_else(|| HEADLINE_ACCENT.to_string(), |c| c.ass_own());
     // The words, as typed and as drawn.
     let raw: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
     let upper = hl.case == Some(Case::Upper);
@@ -904,6 +910,7 @@ fn headline_v2(
         stroke: hl.stroke.clone(),
         shadow_fx: hl.shadow.clone(),
         glow: hl.glow.clone(),
+        opacity: hl.opacity,
         box_fx: (!no_card).then_some(BoxFxLook {
             color: Some(card_col),
             opacity: Some(card_op),
@@ -989,6 +996,22 @@ fn with_alpha(c: &str, alpha: u8) -> String {
     format!("&H{alpha:02X}{}", c.get(4..).unwrap_or("000000"))
 }
 
+/// The alpha byte of an `&HAABBGGRR` colour (00 opaque, FF clear).
+fn ass_alpha(c: &str) -> u8 {
+    u8::from_str_radix(c.get(2..4).unwrap_or("00"), 16).unwrap_or(0)
+}
+
+/// The colour with its opacity multiplied by `o` (0..1): the opacity
+/// `(255 - t) / 255` of its alpha byte `t` times `o`, back to a byte as
+/// `round((1 - opacity) * 255)`. An `o` of 1 leaves the colour as it is.
+fn faded(c: &str, o: f64) -> String {
+    if o >= 1.0 {
+        return c.to_string();
+    }
+    let op = (255 - ass_alpha(c)) as f64 / 255.0 * o.clamp(0.0, 1.0);
+    with_alpha(c, ((1.0 - op) * 255.0).round() as u8)
+}
+
 /// Build the .ass file for any canvas, with an optional headline.
 pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) -> String {
     let name = valid_preset(preset_name);
@@ -1032,7 +1055,9 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         4.0,
         hard_chars.is_some(),
     );
-    if cap.is_some_and(|c| c.show == Some(false)) {
+    // The element's opacity (an element at 0 draws nothing).
+    let elem = cap.and_then(|c| c.opacity).unwrap_or(1.0);
+    if cap.is_some_and(|c| c.show == Some(false)) || elem <= 0.0 {
         lines.clear();
     }
     if moving {
@@ -1126,10 +1151,10 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     // Sung colour: `active`, else `color`; unsung colour: `color`.
     let primary = cap
         .and_then(|c| c.active.or(c.color))
-        .map_or_else(|| style.primary.to_string(), |c| c.ass(0));
+        .map_or_else(|| style.primary.to_string(), |c| c.ass_own());
     let secondary = cap
         .and_then(|c| c.color)
-        .map_or_else(|| style.secondary.to_string(), |c| c.ass(0));
+        .map_or_else(|| style.secondary.to_string(), |c| c.ass_own());
     // Box (BorderStyle 3 draws it in the outline colour, `outline_w` wide).
     let box_alpha = |op: f64| ((1.0 - op.clamp(0.0, 1.0)) * 255.0).round() as u8;
     let mut border = style.border;
@@ -1140,7 +1165,7 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     let vector_box = cap.is_some_and(|c| c.box_fx.is_some());
     // The box the style or a v1 `box` colour gives (the shape's default colour).
     let own_box = match cap.and_then(|c| c.box_) {
-        Some(BoxLook::Color(c)) => Some(c.ass(0)),
+        Some(BoxLook::Color(c)) => Some(c.ass_own()),
         Some(BoxLook::None) => None,
         None => (style.border == 3).then(|| style.outline.to_string()),
     };
@@ -1149,7 +1174,7 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         Some(BoxLook::None) => border = 1,
         Some(BoxLook::Color(c)) => {
             let op = cap.and_then(|c| c.box_opacity).unwrap_or(1.0);
-            outline = c.ass(box_alpha(op));
+            outline = c.ass(box_alpha(op * c.opacity()));
             if border != 3 {
                 border = 3;
                 outline_w = px(BOX_PAD) as f64;
@@ -1163,7 +1188,7 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     }
     if border != 3 {
         if let Some(c) = cap.and_then(|c| c.outline) {
-            outline = c.ass(0);
+            outline = c.ass_own();
         }
     }
     if vector_box && style.border == 3 {
@@ -1184,7 +1209,7 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     let mut stroke_w = if border == 3 { 0.0 } else { outline_w };
     if let Some(st) = stroke_look {
         if let Some(c) = st.color {
-            stroke_c = c.ass(0);
+            stroke_c = c.ass_own();
         }
         if let Some(w) = st.width {
             stroke_w = w * k;
@@ -1206,16 +1231,25 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         "[Script Info]\nTitle: DigiClip {display}\nScriptType: v4.00+\nPlayResX: {pw}\nPlayResY: {ph}\nScaledBorderAndShadow: yes\nWrapStyle: 0\n\n"
     );
     out.push_str("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
+    // The line writer puts the element's opacity into the style's colours (the
+    // word-level writer carries it in every event instead).
+    let fade = |c: &str| {
+        if word_level.is_some() {
+            c.to_string()
+        } else {
+            faded(c, elem)
+        }
+    };
     let row = |name: &str, prim: &str, sec: &str, outl: &str, border: u32, ow: f64, sh: f64| {
         format!(
             "Style: {},{},{},{},{},{},{},{},0,0,0,100,100,0,0,{},{},{},{},{cap_l},{cap_r},{},1\n",
             name,
             font,
             font_px,
-            prim,
-            sec,
-            outl,
-            style.back,
+            fade(prim),
+            fade(sec),
+            fade(outl),
+            fade(style.back),
             style.bold,
             border,
             ass_num(ow),
@@ -1232,7 +1266,7 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     // gets its own style and one event per line (a single run of invisible
     // text under the real one); a box that is opaque all the time needs neither.
     let fading = moving && anim != Anim::Words;
-    let soft_box = border == 3 && (!outline.starts_with("&H00") || fading);
+    let soft_box = border == 3 && (!outline.starts_with("&H00") || fading || elem < 1.0);
     let box_name = format!("{display}Box");
     // The word-level writer always draws the box as its own event(s).
     let split_box = if word_level.is_some() {
@@ -1273,7 +1307,9 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         .headline
         .as_deref()
         .map(|h| headline_text(h, HEADLINE_MAX))
-        .filter(|h| !h.is_empty() && o.dur > 0.0);
+        .filter(|h| !h.is_empty() && o.dur > 0.0)
+        // A headline at opacity 0 draws nothing.
+        .filter(|_| o.headline_look.as_ref().and_then(|l| l.opacity) != Some(0.0));
     let mut headline_event = None;
     let hl_v2 = headline.as_ref().and_then(|h| {
         let hl = o.headline_look.as_ref().filter(|l| l.positioned())?;
@@ -1290,11 +1326,11 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         let no_card = hl.card == Some(BoxLook::None);
         let ink_rgb = hl
             .ink
-            .or(no_card.then_some(crate::look::Rgb(255, 255, 255)));
-        let ink = ink_rgb.map_or_else(|| HEADLINE_INK.to_string(), |c| c.ass(0));
+            .or(no_card.then_some(crate::look::Rgba::rgb(255, 255, 255)));
+        let ink = ink_rgb.map_or_else(|| HEADLINE_INK.to_string(), |c| c.ass_own());
         let accent = hl
             .accent
-            .map_or_else(|| HEADLINE_ACCENT.to_string(), |c| c.ass(0));
+            .map_or_else(|| HEADLINE_ACCENT.to_string(), |c| c.ass_own());
         let (border, edge, edge_w) = if no_card {
             // No card: a dark outline keeps the type readable on footage (a
             // light one when the ink itself is dark).
@@ -1305,13 +1341,21 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
             (1, e.to_string(), px(HEADLINE_EDGE * size))
         } else {
             let e = match hl.card {
-                Some(BoxLook::Color(c)) => c.ass(0),
+                Some(BoxLook::Color(c)) => c.ass_own(),
                 _ => "&H00FFFFFF".to_string(),
             };
             (4, e, px(HEADLINE_PAD * size))
         };
         let font_px = px(HEADLINE_PX * size);
-        let markup = headline_markup(h, &ink, &accent);
+        // The element's opacity goes into the style's colours; the accent word
+        // names its own alpha when it differs from the other words'.
+        let hop = hl.opacity.unwrap_or(1.0);
+        let (ink_a, acc_a) = (
+            ass_alpha(&faded(&ink, hop)),
+            ass_alpha(&faded(&accent, hop)),
+        );
+        let markup = headline_markup(h, &ink, &accent, (ink_a != acc_a).then_some((acc_a, ink_a)));
+        let (ink, edge) = (faded(&ink, hop), faded(&edge, hop));
         // Where: today's top-centre, or anchored on a point by its middle.
         let place = (hl.x.is_some() || hl.y.is_some()).then(|| {
             let (w, s) = (pw as f64, side_h as f64);
@@ -1412,7 +1456,7 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     }
     let accent = cap
         .and_then(|c| c.accent)
-        .map_or_else(|| accent_for(&name).to_string(), |c| c.ass(0));
+        .map_or_else(|| accent_for(&name).to_string(), |c| c.ass_own());
     if let Some(c) = word_level {
         let cfg = motion::Cfg::resolve(
             c,
@@ -1453,6 +1497,7 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
                     (shadow > 0.0).then(|| alpha_of(style.back)),
                 )
             }),
+            text_back: (shadow > 0.0 && !split_box).then(|| alpha_of(style.back)),
             caps,
         };
         // At most `lines` rows in a block: longer blocks are cut into more.
@@ -1467,6 +1512,19 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         out.push_str(&motion::events(&cfg, &geo, &draw, &lines, &spans, offset));
         return out;
     }
+    // The line writer's alpha: the style's colours already carry the element's
+    // opacity and each colour's own alpha. A keyword (its own colour) and a
+    // word that fades in (`words`) set the parts' alpha themselves, so they
+    // need the style's alphas by name. Without any alpha in play none of that
+    // is written and the output is what it always was.
+    let alpha_mode = elem < 1.0 || cap.is_some_and(|c| c.has_alpha());
+    let (prim_a, sec_a, outl_a, back_a) = (
+        ass_alpha(&faded(&primary, elem)),
+        ass_alpha(&faded(&secondary, elem)),
+        ass_alpha(&faded(&outline, elem)),
+        ass_alpha(&faded(style.back, elem)),
+    );
+    let accent_a = ass_alpha(&faded(&accent, elem));
     let mut fresh = true; // next word opens a sentence (tracked across lines)
     for (line, &(t0, t1)) in lines.iter().zip(&spans) {
         let mut text = String::new();
@@ -1495,9 +1553,15 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
             }
             if key {
                 tags.push_str(&format!("\\1c{accent}&"));
+                if alpha_mode && accent_a != prim_a {
+                    tags.push_str(&format!("\\1a&H{accent_a:02X}&"));
+                }
                 accented = true;
             } else if accented {
                 tags.push_str(&format!("\\1c{primary}&"));
+                if alpha_mode && accent_a != prim_a {
+                    tags.push_str(&format!("\\1a&H{prim_a:02X}&"));
+                }
                 accented = false;
             }
             if let Some((_, settled)) = scale {
@@ -1512,7 +1576,15 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
                 }
             }
             if anim == Anim::Words && i > 0 {
-                tags.push_str(&format!("\\alpha&HFF&\\t({dt},{},\\alpha&H00&)", dt + 80));
+                let shown = if alpha_mode {
+                    let fill = if key { accent_a } else { prim_a };
+                    format!(
+                        "\\1a&H{fill:02X}&\\2a&H{sec_a:02X}&\\3a&H{outl_a:02X}&\\4a&H{back_a:02X}&"
+                    )
+                } else {
+                    "\\alpha&H00&".to_string()
+                };
+                tags.push_str(&format!("\\alpha&HFF&\\t({dt},{},{shown})", dt + 80));
             }
             text.push_str(&format!("{{{tags}}}{word} "));
             plain.push_str(&format!("{word} "));
@@ -1584,15 +1656,25 @@ mod tests {
 
     #[test]
     fn headline_is_one_card_on_two_balanced_lines() {
-        let m = headline_markup("The secret to growing fast", "&H00111111", "&H001E3CFF");
+        let m = headline_markup(
+            "The secret to growing fast",
+            "&H00111111",
+            "&H001E3CFF",
+            None,
+        );
         assert_eq!(
             m,
             "The {\\1c&H001E3CFF&}secret{\\1c&H00111111&} to\\Ngrowing fast"
         );
-        let m = headline_markup("I made $1 million", "&H00111111", "&H001E3CFF");
+        let m = headline_markup("I made $1 million", "&H00111111", "&H001E3CFF", None);
         assert_eq!(m, "I made {\\1c&H001E3CFF&}$1{\\1c&H00111111&} million");
         // "I'm" is capitalized, not a keyword.
-        let m = headline_markup("Feel like I'm in a coffin", "&H00111111", "&H001E3CFF");
+        let m = headline_markup(
+            "Feel like I'm in a coffin",
+            "&H00111111",
+            "&H001E3CFF",
+            None,
+        );
         assert!(m.contains("{\\1c&H001E3CFF&}coffin"), "{m}");
         let ass = build_for(
             &words(),
@@ -5268,5 +5350,199 @@ mod tests {
         let ass = build_look("karaoke", r#"{"font":"Ass Added TT"}"#);
         assert_eq!(style_line(&ass, "Karaoke")[1], "Archivo Black");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- alpha ---------------------------------------------------------------
+
+    #[test]
+    fn faded_colours_multiply_opacities_and_round_once() {
+        assert_eq!(faded("&H0035E1FF", 1.0), "&H0035E1FF");
+        // 0.4 opaque: round(0.6 * 255) = 153 = 0x99.
+        assert_eq!(faded("&H0035E1FF", 0.4), "&H9935E1FF");
+        assert_eq!(faded("&H0035E1FF", 0.0), "&HFF35E1FF");
+        // An alpha already there multiplies: 0x80 is 127/255 opaque, times 0.4
+        // is 0.199, and round(0.801 * 255) = 204 = 0xCC.
+        assert_eq!(faded("&H80000000", 0.4), "&HCC000000");
+        assert_eq!(ass_alpha("&HCC000000"), 0xCC);
+    }
+
+    #[test]
+    fn the_line_writer_puts_the_element_opacity_in_the_styles_colours() {
+        let ass = build_look("karaoke", r#"{"opacity":0.4}"#);
+        let s = style_line(&ass, "Karaoke");
+        // Fill (sung, unsung), outline and the style's own shadow colour.
+        assert_eq!(
+            (s[3], s[4], s[5], s[6]),
+            ("&H9935E1FF", "&H99FFFFFF", "&H99000000", "&HCC000000")
+        );
+        // The entrance fade is libass's own, multiplied on top.
+        assert!(dialogues(&ass)[0].contains("\\fad(80,60)"), "{ass}");
+        // Opacity 1 and `FF` alphas are the look without them, byte for byte.
+        let plain = build_look("karaoke", "{}");
+        assert_eq!(build_look("karaoke", r#"{"opacity":1}"#), plain);
+        assert_eq!(
+            build_look(
+                "karaoke",
+                r##"{"color":"#FFFFFFFF","active":"#35E1FFFF","accent":"#FFD400FF","outline":"#000000FF"}"##
+            ),
+            build_look(
+                "karaoke",
+                r##"{"color":"#FFFFFF","active":"#35E1FF","accent":"#FFD400","outline":"#000000"}"##
+            ),
+        );
+        // Opacity 0 draws nothing.
+        assert!(dialogues(&build_look("karaoke", r#"{"opacity":0}"#)).is_empty());
+    }
+
+    #[test]
+    fn colour_alpha_reaches_the_style_and_a_keyword_names_its_own() {
+        let ass = build_look(
+            "karaoke",
+            r##"{"color":"#FFFFFF80","active":"#FF3B3040","accent":"#00FF0080","outline":"#00000020"}"##,
+        );
+        let s = style_line(&ass, "Karaoke");
+        // 0x40 opaque is transparency 0xBF; 0x80 is 0x7F; 0x20 is 0xDF.
+        assert_eq!(
+            (s[3], s[4], s[5]),
+            ("&HBF303BFF", "&H7FFFFFFF", "&HDF000000")
+        );
+        let l = dialogues(&ass).join("\n");
+        // A keyword sets its own fill alpha; the next word puts the sung one back.
+        assert!(l.contains("\\1c&H7F00FF00&\\1a&H7F&"), "{l}");
+        assert!(l.contains("\\1c&HBF303BFF&\\1a&HBF&"), "{l}");
+        // Alpha in the box colour: a see-through box is its own style and event.
+        let b = build_look("karaoke", r##"{"box":"#10203080","box_opacity":0.5}"##);
+        let s = style_line(&b, "KaraokeBox");
+        // 0.502 * 0.5 = 0.251 opaque -> transparency round(0.749 * 255) = 191 = 0xBF.
+        assert_eq!(s[5], "&HBF302010", "{b}");
+    }
+
+    #[test]
+    fn a_word_that_fades_in_says_every_part_of_its_final_alpha() {
+        let words = |j: &str| build_look("minimal", &format!(r#"{{"anim":"words",{j}}}"#));
+        // Untouched when nothing has an alpha.
+        let l = dialogues(&words(r#""opacity":1"#)).join("\n");
+        assert!(l.contains("\\alpha&HFF&\\t(400,480,\\alpha&H00&)"), "{l}");
+        // Element opacity 0.4: the word ends at 0x99 in fill, unsung fill and
+        // outline, and at the style's own shadow alpha times 0.4.
+        let l = dialogues(&words(r#""opacity":0.4"#)).join("\n");
+        assert!(
+            l.contains("\\alpha&HFF&\\t(400,480,\\1a&H99&\\2a&H99&\\3a&H99&\\4a&H"),
+            "{l}"
+        );
+        assert!(!l.contains("\\alpha&H00&"), "{l}");
+    }
+
+    #[test]
+    fn the_word_level_writer_multiplies_the_element_opacity_into_every_part() {
+        let a = build_look(
+            "karaoke",
+            r##"{"anim":"none","opacity":0.4,"stroke":{"color":"#102030","width":4},
+                "shadow":{"color":"#000000","opacity":0.6},
+                "glow":{"color":"#FFD400","size":20,"strength":0.5},
+                "box":{"color":"#101010","opacity":0.5}}"##,
+        );
+        let text = layer(&a, 3)[0];
+        // Fill and stroke: 0.4 -> 0x99; each part names its own.
+        assert!(
+            tg(text).contains("\\1a&H99&") && tg(text).contains("\\3a&H99&"),
+            "{text}"
+        );
+        assert!(!tg(text).contains("\\alpha"), "{text}");
+        // Shadow 0.6 * 0.4 = 0.24 -> round(0.76 * 255) = 194 = 0xC2.
+        assert!(tg(layer(&a, 1)[0]).contains("\\alpha&HC2&"), "{a}");
+        // Glow 0.5 * 0.4 = 0.2 -> 0xCC. Box 0.5 * 0.4 = 0.2 -> 0xCC.
+        assert!(tg(layer(&a, 2)[0]).contains("\\alpha&HCC&"), "{a}");
+        assert!(tg(layer(&a, 0)[0]).contains("\\alpha&HCC&"), "{a}");
+        // Without it: the word's alpha is one \alpha, and only when it is not 0.
+        let b = build_look("karaoke", r##"{"anim":"none","stroke":{"width":4}}"##);
+        assert!(!tg(layer(&b, 3).first().copied().unwrap_or(layer(&b, 0)[0])).contains("\\1a"));
+        // Opacity 0 draws nothing at all.
+        let z = build_look(
+            "karaoke",
+            r#"{"anim":"none","opacity":0,"glow":{"size":9}}"#,
+        );
+        assert!(z.lines().all(|l| !l.starts_with("Dialogue:")), "{z}");
+    }
+
+    #[test]
+    fn colour_alpha_is_per_part_in_the_word_level_writer() {
+        let a = build_look(
+            "karaoke",
+            r##"{"anim":"none","color":"#FFFFFF80","active":"#FFFFFF80",
+                "stroke":{"color":"#10203040","width":4},
+                "shadow":{"color":"#00000080","opacity":0.5},
+                "glow":{"color":"#FFD40080","size":20,"strength":0.5},
+                "box":{"color":"#10101080","opacity":0.5}}"##,
+        );
+        let text = layer(&a, 3)[0];
+        // Fill 0x80 -> 0x7F, stroke 0x40 -> 0xBF.
+        assert!(
+            tg(text).contains("\\1a&H7F&") && tg(text).contains("\\3a&HBF&"),
+            "{text}"
+        );
+        // Shadow 0.502 * 0.5 = 0.251 -> 0xBF; glow the same; box the same.
+        for n in [0u8, 1, 2] {
+            assert!(tg(layer(&a, n)[0]).contains("\\alpha&HBF&"), "{n} {a}");
+        }
+        // `FF` alphas and opacity 1 are the six-digit look, byte for byte.
+        let six = r##"{"anim":"none","color":"#FFFFFF","stroke":{"color":"#102030","width":4},
+            "shadow":{"color":"#000000"},"glow":{"color":"#FFD400","size":20},
+            "box":{"color":"#101010","opacity":0.5}}"##;
+        let ff = six
+            .replace("\"#FFFFFF\"", "\"#FFFFFFFF\"")
+            .replace("\"#102030\"", "\"#102030FF\"")
+            .replace("\"#000000\"", "\"#000000FF\"")
+            .replace("\"#FFD400\"", "\"#FFD400FF\"")
+            .replace("\"#101010\"", "\"#101010FF\"");
+        assert_ne!(six, ff);
+        assert_eq!(build_look("karaoke", six), build_look("karaoke", &ff));
+        let one = six.replace("\"anim\"", "\"opacity\":1,\"anim\"");
+        assert_eq!(build_look("karaoke", six), build_look("karaoke", &one));
+    }
+
+    #[test]
+    fn the_v1_headline_carries_the_element_opacity_and_its_colours_alpha() {
+        let ass = tall(r#"{"opacity":0.4}"#);
+        let h = style_line(&ass, "Headline");
+        assert_eq!(
+            (h[3], h[4], h[5], h[6]),
+            ("&H99111111", "&H99111111", "&H99FFFFFF", "&H99FFFFFF")
+        );
+        assert!(head_event(&ass).contains("\\fad(160,0)"));
+        // A card colour with an alpha.
+        let h = style_line(&tall(r##"{"card":"#FFFFFF80"}"##), "Headline").join(",");
+        assert!(h.contains(",&H7FFFFFFF,&H7FFFFFFF,"), "{h}");
+        // The accent word names its own fill alpha, and the rest puts it back.
+        let e = head_event(&tall(r##"{"accent":"#FFD40080"}"##)).to_string();
+        // (libass takes the colour from `\1c` and ignores the alpha byte there.)
+        assert!(e.contains("{\\1c&H7F00D4FF&\\1a&H7F&}"), "{e}");
+        assert!(e.contains("{\\1c&H00111111&\\1a&H00&}"), "{e}");
+        // Nothing to say without an alpha, and opacity 1 is today's headline.
+        assert_eq!(tall(r#"{"opacity":1}"#), tall("{}"));
+        // Opacity 0 draws nothing.
+        assert!(hl_events(&tall(r#"{"opacity":0}"#)).is_empty());
+    }
+
+    #[test]
+    fn the_positioned_headline_multiplies_the_element_opacity_into_every_layer() {
+        let ass = tall(
+            r##"{"opacity":0.4,"card":{"radius":0.4},"shadow":{"y":8},"glow":{"size":14},"stroke":{"width":3}}"##,
+        );
+        let alpha = |n: u8| hl_parts(hl_layer(&ass, n)[0]).0.to_string();
+        // Card 1 * 0.4 = 0x99; shadow 0.6 * 0.4 -> 0xC2; glow 0.8 * 0.4 = 0.32 -> 0xAD.
+        assert!(alpha(10).contains("\\alpha&H99&"), "{}", alpha(10));
+        assert!(alpha(11).contains("\\alpha&HC2&"), "{}", alpha(11));
+        assert!(alpha(12).contains("\\alpha&HAD&"), "{}", alpha(12));
+        // The text: fill and stroke apart.
+        let t = alpha(13);
+        assert!(t.contains("\\1a&H99&") && t.contains("\\3a&H99&"), "{t}");
+        // A card colour's alpha multiplies with the card's opacity.
+        let c = tall(r##"{"card":{"color":"#FFFFFF80","opacity":0.5}}"##);
+        let e = hl_parts(hl_layer(&c, 10)[0]).0.to_string();
+        // 0.502 * 0.5 -> 0xBF.
+        assert!(e.contains("\\alpha&HBF&"), "{e}");
+        // Opacity 0 draws nothing.
+        assert!(hl_events(&tall(r#"{"opacity":0,"card":{"radius":1}}"#)).is_empty());
     }
 }

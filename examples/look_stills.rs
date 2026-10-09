@@ -5,7 +5,7 @@
 //!
 //! Run: `cargo run --example look_stills -- <out_dir> [--look <json|@file>]
 //!       [--style <name>] [--aspect 9:16] [--headline "<text>"]
-//!       [--bar <#RRGGBB>] [--logo <png> [--logo-pos tl|tr|bl|br]]
+//!       [--bar <#RRGGBB[AA]>] [--logo <png> [--logo-pos tl|tr|bl|br]]
 //!       [--scene flat|crop|letterbox|split] [--width 540]
 //!       [--data-dir <dir>] [--add-font <ttf|otf>]...`
 //!
@@ -33,6 +33,12 @@
 //! `--bar` and `--logo` use the real compositor (`look.bar`) and the real
 //! logo filter graph (`look.logo`) on the grey frame, so a bar position or
 //! a logo placement can be seen exactly as a render draws it.
+//!
+//! Alpha (`look.alpha`) shows as it renders: eight-digit colours and the
+//! elements' `opacity` go through the same writers, the compositor's bar and
+//! the logo graph. A translucent bar or logo is easier to judge over `--scene
+//! crop` than over the flat grey. `--bar` switches the bar on (its colour may
+//! carry an alpha, `#RRGGBBAA`); a Look's `bar` section alone does not.
 //!
 //! `--scene` picks what is under the text. `flat` (the default) is the plain
 //! grey frame. A look with an `effects` section switches to `crop`: a test
@@ -96,7 +102,7 @@ fn secs(stamp: &str) -> f64 {
 fn usage() -> ! {
     eprintln!(
         "usage: look_stills <out_dir> [--look <json|@file>] [--style <name>] [--aspect 9:16] \
-         [--headline \"<text>\"] [--bar <#RRGGBB>] [--logo <png> [--logo-pos tr]] \
+         [--headline \"<text>\"] [--bar <#RRGGBB[AA]>] [--logo <png> [--logo-pos tr]] \
          [--scene flat|crop|letterbox|split] [--strip <word index>] [--hstrip enter|exit] [--at <s>,<s>...] [--width <px>] \n         [--data-dir <dir>] [--add-font <file>]..."
     );
     std::process::exit(2)
@@ -220,7 +226,7 @@ fn scene_source(scene: Scene, canvas: Canvas) -> (u32, u32, Vec<u8>) {
 fn composed_background(
     ffmpeg: &Path,
     canvas: Canvas,
-    bar: Option<(u8, u8, u8)>,
+    bar: Option<digiclip_rs::look::Rgba>,
     look: &Look,
     progress: f32,
     dir: &Path,
@@ -228,7 +234,7 @@ fn composed_background(
 ) -> Option<PathBuf> {
     let (scene, (sw, sh, src)) = scene;
     let mut comp = Compositor::new(*sw, *sh, canvas)
-        .with_bar(bar)
+        .with_bar_rgba(bar)
         .with_bar_look(look.bar.as_ref())
         .with_effects(look.effects.as_ref())
         .with_split(look.layout.as_ref());
@@ -412,8 +418,8 @@ fn main() {
         std::process::exit(2)
     });
     let bar = bar.map(|c| {
-        compose::parse_hex(&c).unwrap_or_else(|| {
-            eprintln!("--bar wants a colour like #FFD400");
+        digiclip_rs::look::Rgba::parse(&c).unwrap_or_else(|| {
+            eprintln!("--bar wants a colour like #FFD400 or #FFD40080");
             std::process::exit(2)
         })
     });

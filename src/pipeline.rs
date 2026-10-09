@@ -129,7 +129,7 @@ pub fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
         bar: crate::compose::bar_color(
             args.progress_bar
                 .as_deref()
-                .and_then(crate::compose::parse_hex),
+                .and_then(crate::look::Rgba::parse),
             parsed.as_ref().and_then(|l| l.bar.as_ref()),
         ),
         logo,
@@ -2926,11 +2926,17 @@ mod tests {
         };
         let look = r##"{"bar":{"color":"#FF3B30","inset":0.04,"radius":1}}"##;
         // Flat colour alone, as ever.
-        assert_eq!(bar(&["--progress-bar", "#00FF00"]).bar, Some((0, 255, 0)));
-        assert_eq!(bar(&["--progress-bar"]).bar, Some((255, 212, 0)));
+        assert_eq!(
+            bar(&["--progress-bar", "#00FF00"]).bar,
+            Some(crate::look::Rgba::rgb(0, 255, 0))
+        );
+        assert_eq!(
+            bar(&["--progress-bar"]).bar,
+            Some(crate::look::Rgba::rgb(255, 212, 0))
+        );
         // The Look's colour replaces it; the flag still switches the bar on.
         let l = bar(&["--progress-bar", "#00FF00", "--look", look]);
-        assert_eq!(l.bar, Some((255, 59, 48)));
+        assert_eq!(l.bar, Some(crate::look::Rgba::rgb(255, 59, 48)));
         let shape = l.bar_look.unwrap();
         assert_eq!((shape.inset, shape.radius), (Some(0.04), Some(1.0)));
         // No flag: no bar, whatever the Look says.
@@ -2944,6 +2950,21 @@ mod tests {
             "--look",
             r#"{"bar":{"pos":"top"}}"#,
         ]);
-        assert_eq!(l.bar, Some((0, 255, 0)));
+        assert_eq!(l.bar, Some(crate::look::Rgba::rgb(0, 255, 0)));
+        // The flat colour takes an alpha; the Look's own colour (alpha included) wins.
+        assert_eq!(
+            bar(&["--progress-bar", "#00FF0080"]).bar,
+            Some(crate::look::Rgba(0, 255, 0, 128))
+        );
+        let l = bar(&[
+            "--progress-bar",
+            "#00FF0080",
+            "--look",
+            r##"{"bar":{"color":"#FF3B3040"}}"##,
+        ]);
+        assert_eq!(l.bar, Some(crate::look::Rgba(255, 59, 48, 64)));
+        // And the element opacity rides in the section.
+        let l = bar(&["--progress-bar", "--look", r#"{"bar":{"opacity":0.5}}"#]);
+        assert_eq!(l.bar_look.and_then(|b| b.opacity), Some(0.5));
     }
 }
