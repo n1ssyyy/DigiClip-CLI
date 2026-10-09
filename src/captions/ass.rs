@@ -6,7 +6,10 @@
 //! An optional headline is pinned at the top for the whole clip.
 
 use super::motion;
-use crate::look::{BoxLook, CaptionsLook, Case, HeadlineAnim, HeadlineLook};
+use crate::look::{
+    AccentWord, BoxFxLook, BoxLook, BoxPer, CaptionsLook, Case, Ease, EnterKind, EnterLook,
+    ExitKind, ExitLook, HeadlineAnim, HeadlineLook, KeywordLook, Rgb, WordMode, WordsLook,
+};
 use crate::whisper::Word;
 
 pub const PLAY_W: u32 = 1080;
@@ -641,22 +644,7 @@ pub fn headline_text(raw: &str, max: usize) -> String {
 /// wrap, one keyword in the accent color.
 fn headline_markup(h: &str, ink: &str, accent: &str) -> String {
     let words: Vec<&str> = h.split(' ').collect();
-    // Accent: a keyword, else the longest content word.
-    // "I", "I'm"… are capitalized but never the point.
-    let pick = (1..words.len())
-        .find(|&i| {
-            is_keyword(words[i], false)
-                && !bare(words[i]).starts_with("i'")
-                && bare(words[i]) != "i"
-        })
-        .or_else(|| {
-            (0..words.len())
-                .filter(|&i| {
-                    let b = bare(words[i]);
-                    b.chars().count() >= 5 && !DANGLING.contains(&b.as_str())
-                })
-                .max_by_key(|&i| (words[i].chars().count(), usize::MAX - i))
-        });
+    let pick = accent_pick(&words);
     // Balanced break: the split that minimizes the longer line.
     let total = h.chars().count();
     let brk = if total > 18 && words.len() > 1 {
@@ -681,6 +669,31 @@ fn headline_markup(h: &str, ink: &str, accent: &str) -> String {
     out
 }
 
+/// The word of a headline the engine accents: a keyword, else the longest
+/// content word. "I", "I'm"… are capitalized but never the point.
+fn accent_pick(words: &[&str]) -> Option<usize> {
+    (1..words.len())
+        .find(|&i| {
+            is_keyword(words[i], false)
+                && !bare(words[i]).starts_with("i'")
+                && bare(words[i]) != "i"
+        })
+        .or_else(|| {
+            (0..words.len())
+                .filter(|&i| {
+                    let b = bare(words[i]);
+                    b.chars().count() >= 5 && !DANGLING.contains(&b.as_str())
+                })
+                .max_by_key(|&i| (words[i].chars().count(), usize::MAX - i))
+        })
+}
+
+/// The scale of the 1080-wide design on a canvas: type, strokes, glows and
+/// padding all shrink by it on canvases shorter than the tall one.
+pub fn design_scale(w: u32, h: u32) -> f64 {
+    (w as f64 / PLAY_W as f64).min(h as f64 / 1200.0).min(1.0)
+}
+
 /// Sentence-case the first letter (transcript hooks often start lower).
 fn upper_first(s: &str) -> String {
     let mut c = s.chars();
@@ -688,6 +701,262 @@ fn upper_first(s: &str) -> String {
         Some(f) => f.to_uppercase().chain(c).collect(),
         None => String::new(),
     }
+}
+
+/// The headline written by the word-level machinery (`motion`), for a Look
+/// that has any field beyond the v1 ones (`HeadlineLook::positioned`): the
+/// card is a vector shape around every row, the words are laid out from the
+/// font's metrics, shadow and glow are copies of the text under it, and the
+/// entrance and exit are the captions' own. Returns the `Headline` style row
+/// and the events, or `None` when the font has no metrics to lay out with (the
+/// one-event writer then draws the headline).
+///
+/// What the v1 fields mean here is what they mean there: `x`/`y` centre the
+/// card, `size` multiplies the type and the default padding, `ink`, `accent` and
+/// a `card` colour recolour, `anim` is the entrance (`pop` 340 ms, `fade`
+/// 200 ms, `none`) unless `enter` says otherwise, `seconds` is the time on
+/// screen, counted from the moment the headline enters (`delay_s`), and a
+/// headline that ends early fades out for 200 ms unless `exit` says otherwise.
+fn headline_v2(
+    text: &str,
+    hl: &HeadlineLook,
+    o: &AssOpts,
+    (pw, ph): (u32, u32),
+    k: f64,
+    tall: bool,
+) -> Option<(String, String)> {
+    let font = hl.font.unwrap_or("Archivo Black");
+    super::metrics::face(font)?;
+    let size = hl.size.unwrap_or(1.0);
+    let px = |v: f64| ((v * k).round() as u32).max(1);
+    let font_px = px(HEADLINE_PX * size);
+    // The card: a colour or an object; `none` (or an invisible object) is no card.
+    let card = hl.card_fx.as_ref();
+    let no_card = hl.card == Some(BoxLook::None) || card.is_some_and(|c| c.opacity == Some(0.0));
+    let card_col = card
+        .and_then(|c| c.color)
+        .or(match hl.card {
+            Some(BoxLook::Color(c)) => Some(c),
+            _ => None,
+        })
+        .unwrap_or(Rgb(255, 255, 255));
+    let card_op = card.and_then(|c| c.opacity).unwrap_or(1.0);
+    let pad = card.and_then(|c| c.pad).unwrap_or(HEADLINE_PAD * size);
+    let radius = card.and_then(|c| c.radius).unwrap_or(0.0);
+    // Ink, and the stroke: a card needs none, bare type gets today's dark edge.
+    let ink_rgb = hl.ink.or(no_card.then_some(Rgb(255, 255, 255)));
+    let ink = ink_rgb.map_or_else(|| HEADLINE_INK.to_string(), |c| c.ass(0));
+    let dark_ink = ink_rgb
+        .is_none_or(|c| (0.2126 * c.0 as f64 + 0.7152 * c.1 as f64 + 0.0722 * c.2 as f64) < 90.0);
+    let mut stroke_c = if dark_ink { "&H00FFFFFF" } else { "&H00000000" }.to_string();
+    let mut stroke_w = if no_card {
+        px(HEADLINE_EDGE * size) as f64
+    } else {
+        0.0
+    };
+    if let Some(st) = &hl.stroke {
+        if let Some(c) = st.color {
+            stroke_c = c.ass(0);
+        }
+        if let Some(w) = st.width {
+            stroke_w = w * k;
+        }
+    }
+    let accent = hl
+        .accent
+        .map_or_else(|| HEADLINE_ACCENT.to_string(), |c| c.ass(0));
+    // The words, as typed and as drawn.
+    let raw: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+    let upper = hl.case == Some(Case::Upper);
+    let drawn = |w: &str| {
+        if upper {
+            w.to_uppercase()
+        } else {
+            w.to_string()
+        }
+    };
+    // Room: the text block's width, and the most the card allows.
+    let side = (90.0 * pw as f64 / PLAY_W as f64).round();
+    let edge = 12.0 * k;
+    let (ml, mr) = match o.clear {
+        Some(c) if c.top => {
+            let wide = side.max(c.px as f64);
+            if c.left {
+                (wide, side)
+            } else {
+                (side, wide)
+            }
+        }
+        _ => (side, side),
+    };
+    let placed_x = hl.x.is_some();
+    let (cx, room) = if placed_x {
+        (hl.x.unwrap_or(0.5) * pw as f64, pw as f64 - 2.0 * side)
+    } else {
+        ((ml + pw as f64 - mr) / 2.0, pw as f64 - ml - mr)
+    };
+    let want = hl.width.map_or(room, |w| (w * pw as f64).min(pw as f64));
+    let card_ex = (if no_card { 0.0 } else { pad * k }) + stroke_w + edge;
+    let safe = (pw as f64 - 2.0 * card_ex).max(40.0);
+    let avail = want.min(safe);
+    // Rows: as many as the width needs, two once it is long enough to wrap
+    // (as today), at most `max_lines` (3 when not set). When that does not
+    // fit, the block widens up to the card's room, and after that the headline
+    // loses words from its end (never ending on a word that hangs).
+    let max_rows = hl.max_lines.unwrap_or(3);
+    let spacing = hl.spacing.unwrap_or(0.0) * font_px as f64;
+    let mut kept = raw.len();
+    let (rows, avail) = loop {
+        let words: Vec<String> = raw[..kept].iter().map(|w| drawn(w)).collect();
+        let long = raw[..kept].join(" ").chars().count() > 18 && kept > 1;
+        let min_rows = if long && max_rows >= 2 { 2 } else { 1 };
+        if let Some(r) = motion::headline_rows(
+            font,
+            font_px as f64,
+            spacing,
+            &words,
+            (avail, safe),
+            (min_rows, max_rows),
+        ) {
+            break r;
+        }
+        if kept <= 1 {
+            break (1, safe);
+        }
+        kept -= 1;
+        while kept > 2 && DANGLING.contains(&bare(raw[kept - 1]).as_str()) {
+            kept -= 1;
+        }
+    };
+    let last = raw[kept - 1].trim_end_matches([',', ';', ':', '.', '-', '\u{2014}']);
+    let mut shown: Vec<&str> = raw[..kept].to_vec();
+    shown[kept - 1] = last;
+    let words: Vec<String> = shown.iter().map(|w| drawn(w)).collect();
+    let pick = match hl.accent_word.unwrap_or(AccentWord::Auto) {
+        AccentWord::Auto => accent_pick(&shown),
+        AccentWord::None => None,
+        AccentWord::First => Some(0),
+        AccentWord::Last => Some(shown.len() - 1),
+    };
+    // Time: from `delay_s`, for `seconds` (else to the end of the clip).
+    let start = hl.delay_s.unwrap_or(0.0);
+    let end = match hl.seconds.filter(|&s| s > 0.0) {
+        Some(s) if start + s < o.dur => start + s,
+        _ => o.dur,
+    };
+    let early = end < o.dur - 1e-9;
+    let en0 = match hl.anim.unwrap_or(HeadlineAnim::Pop) {
+        HeadlineAnim::Pop => motion::Enter {
+            kind: EnterKind::Pop,
+            ms: 340.0,
+            ease: None,
+        },
+        HeadlineAnim::Fade => motion::Enter {
+            kind: EnterKind::Fade,
+            ms: HEADLINE_FADE_IN as f64,
+            ease: Some(Ease::Linear),
+        },
+        HeadlineAnim::None => motion::Enter {
+            kind: EnterKind::None,
+            ms: 0.0,
+            ease: None,
+        },
+    };
+    let ex0 = if early {
+        motion::Exit {
+            kind: ExitKind::Fade,
+            ms: (HEADLINE_FADE_OUT as f64).min((end - start) * 1000.0),
+        }
+    } else {
+        motion::Exit {
+            kind: ExitKind::None,
+            ms: 0.0,
+        }
+    };
+    // An exit with a time and no kind is a fade.
+    let look_exit = hl.exit.clone().map(|e| ExitLook {
+        kind: e.kind.or(Some(ExitKind::Fade)),
+        ..e
+    });
+    let (enter, exit) = motion::merge_motion(hl.enter.as_ref(), look_exit.as_ref(), en0, ex0);
+    // The Look the word-level model reads: the headline's fields under the
+    // names the captions use, every word on screen together, no keyword bump.
+    let cap = CaptionsLook {
+        words: Some(WordsLook {
+            mode: Some(WordMode::All),
+            keyword: KeywordLook {
+                scale: Some(1.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        enter: Some(EnterLook {
+            kind: Some(enter.kind),
+            ms: Some(enter.ms),
+            ease: enter.ease,
+        }),
+        exit: Some(ExitLook {
+            kind: Some(exit.kind),
+            ms: Some(exit.ms),
+        }),
+        spacing: hl.spacing,
+        align: hl.align,
+        stroke: hl.stroke.clone(),
+        shadow_fx: hl.shadow.clone(),
+        glow: hl.glow.clone(),
+        box_fx: (!no_card).then_some(BoxFxLook {
+            color: Some(card_col),
+            opacity: Some(card_op),
+            pad_x: Some(pad),
+            pad_y: Some(pad),
+            radius: Some(radius),
+            per: Some(BoxPer::Line),
+        }),
+        ..Default::default()
+    };
+    let ink_col = motion::col_of_ass(&ink);
+    let cfg = motion::Cfg::resolve(
+        &cap,
+        Anim::Static,
+        ink_col,
+        ink_col,
+        motion::col_of_ass(&accent),
+        k,
+        &motion::Base {
+            stroke: motion::Stroke {
+                col: motion::col_of_ass(&stroke_c),
+                w: stroke_w,
+            },
+            box_col: None,
+            box_opacity: card_op,
+            font_px: font_px as f64,
+        },
+    );
+    let top = (ph as f64 * if tall { 0.085 } else { 0.05 }).round();
+    let draw = motion::HeadlineDraw {
+        cfg,
+        pw,
+        ph,
+        font,
+        font_px,
+        text_style: "Headline",
+        words,
+        accent: pick,
+        rows,
+        avail,
+        cx,
+        y: hl.y.map_or(motion::HeadlineY::Top(top), |y| {
+            motion::HeadlineY::Centre(y * ph as f64)
+        }),
+        start,
+        end,
+        margin: edge,
+    };
+    let style = format!(
+        "Style: Headline,{font},{font_px},{ink},{ink},{stroke_c},{stroke_c},0,0,0,0,100,100,0,0,1,{},0,5,0,0,0,1\n",
+        ass_num(stroke_w),
+    );
+    Some((style, motion::headline_events(&draw)))
 }
 
 /// Build the .ass file for the default 9:16 canvas. `offset` shifts
@@ -791,7 +1060,7 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
     let spans = spans_of(&lines);
     let (pw, ph) = (o.w.max(2), o.h.max(2));
     // Type is designed at 1080 wide; shorter canvases scale it down a bit.
-    let k = (pw as f64 / PLAY_W as f64).min(ph as f64 / 1200.0).min(1.0);
+    let k = design_scale(pw, ph);
     let px = |v: f64| ((v * k).round() as u32).max(1);
     let tall = (pw as f64 / ph as f64) < 0.6;
     let (alignment, margin_v) = if o.seam {
@@ -1006,7 +1275,14 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         .map(|h| headline_text(h, HEADLINE_MAX))
         .filter(|h| !h.is_empty() && o.dur > 0.0);
     let mut headline_event = None;
-    if let Some(h) = &headline {
+    let hl_v2 = headline.as_ref().and_then(|h| {
+        let hl = o.headline_look.as_ref().filter(|l| l.positioned())?;
+        headline_v2(h, hl, o, (pw, ph), k, tall)
+    });
+    if let Some((style_row, events)) = &hl_v2 {
+        out.push_str(style_row);
+        headline_event = Some(events.clone());
+    } else if let Some(h) = &headline {
         let hl = o.headline_look.clone().unwrap_or_default();
         let size = hl.size.unwrap_or(1.0);
         let top = (ph as f64 * if tall { 0.085 } else { 0.05 }).round() as u32;
@@ -2054,6 +2330,23 @@ mod tests {
 
     fn tall(json: &str) -> String {
         head_ass(json, 1080, 1920, 9.0)
+    }
+
+    /// A headline long enough for three rows.
+    const LONG: &str = "Why most founders quit too early and what to do instead";
+
+    fn tall_long(json: &str) -> String {
+        build_for(
+            &sample(),
+            "karaoke",
+            0.0,
+            &AssOpts {
+                dur: 9.0,
+                headline: Some(LONG.into()),
+                headline_look: headline_of(json),
+                ..AssOpts::default()
+            },
+        )
     }
 
     fn head_event(ass: &str) -> &str {
@@ -4129,5 +4422,767 @@ mod tests {
         let m: Vec<usize> = (0..=3u8).map(|l| layer(&c, l).len()).collect();
         eprintln!("steady: {m:?}");
         assert!(m[0] <= 6 && m[1] <= 6 && m[2] <= 6, "{m:?}");
+    }
+
+    // ---- headline: the positioned writer ---------------------------------------
+
+    /// The headline's events of one layer (10 card, 11 shadow, 12 glow, 13 text).
+    fn hl_layer(ass: &str, n: u8) -> Vec<&str> {
+        let key = format!("Dialogue: {n},");
+        ass.lines().filter(|l| l.starts_with(&key)).collect()
+    }
+
+    /// The events of the topmost headline layer: the text.
+    fn hl_text(ass: &str) -> Vec<&str> {
+        let layer = |e: &str| -> u8 {
+            e["Dialogue: ".len()..]
+                .split(',')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let top = hl_events(ass).iter().map(|e| layer(e)).max();
+        hl_events(ass)
+            .into_iter()
+            .filter(|e| Some(layer(e)) == top)
+            .collect()
+    }
+
+    fn hl_events(ass: &str) -> Vec<&str> {
+        ass.lines()
+            .filter(|l| l.starts_with("Dialogue: ") && l.contains(",Headline,"))
+            .collect()
+    }
+
+    /// Tags and text of an event.
+    fn hl_parts(e: &str) -> (&str, &str) {
+        let body = e.splitn(10, ',').nth(9).unwrap_or("");
+        let body = body.strip_prefix('{').unwrap_or(body);
+        body.split_once('}').unwrap_or((body, ""))
+    }
+
+    /// First two numbers of the event's `\pos(` or `\move(`.
+    fn hl_xy(e: &str) -> (f64, f64) {
+        let t = hl_parts(e).0;
+        let at = t
+            .find("\\pos(")
+            .map(|i| i + 5)
+            .or_else(|| t.find("\\move(").map(|i| i + 6))
+            .unwrap();
+        let n: Vec<f64> = t[at..]
+            .split(')')
+            .next()
+            .unwrap()
+            .split(',')
+            .take(2)
+            .map(|v| v.parse().unwrap())
+            .collect();
+        (n[0], n[1])
+    }
+
+    /// The settled word events (text layer, the last event of each word).
+    fn hl_words(ass: &str) -> Vec<(String, f64, f64)> {
+        let mut seen: Vec<(String, f64, f64)> = Vec::new();
+        for e in hl_text(ass) {
+            let text = hl_parts(e).1.to_string();
+            let (x, y) = hl_xy(e);
+            match seen.iter_mut().find(|w| w.0 == text) {
+                Some(w) => *w = (text, x, y),
+                None => seen.push((text, x, y)),
+            }
+        }
+        seen
+    }
+
+    fn hl2(json: &str, w: u32, h: u32, dur: f64) -> String {
+        head_ass(json, w, h, dur)
+    }
+
+    /// Rows of a headline's words: the text of each row, top to bottom.
+    fn hl_rows(ass: &str) -> Vec<Vec<String>> {
+        let mut ws = hl_words(ass);
+        ws.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.1.total_cmp(&b.1)));
+        let mut rows: Vec<(f64, Vec<String>)> = Vec::new();
+        for (t, _, y) in ws {
+            match rows.last_mut() {
+                Some((ry, r)) if (y - *ry).abs() < 3.0 => r.push(t),
+                _ => rows.push((y, vec![t])),
+            }
+        }
+        rows.into_iter().map(|r| r.1).collect()
+    }
+
+    fn arch() -> &'static crate::captions::metrics::Face {
+        crate::captions::metrics::face("Archivo Black").unwrap()
+    }
+
+    /// The centre and size (px) of the card's drawing: its event's position and
+    /// the path's extent (the drawing is in eighths of a pixel).
+    fn card_box(ass: &str) -> (f64, f64, f64, f64) {
+        let e = hl_layer(ass, 10).last().copied().unwrap();
+        let (x, y) = hl_xy(e);
+        let nums: Vec<f64> = hl_parts(e)
+            .1
+            .split_whitespace()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        let xs: Vec<f64> = nums.iter().step_by(2).copied().collect();
+        let ys: Vec<f64> = nums.iter().skip(1).step_by(2).copied().collect();
+        let ext = |v: &[f64]| {
+            (v.iter().cloned().fold(f64::MIN, f64::max)
+                - v.iter().cloned().fold(f64::MAX, f64::min))
+                / 8.0
+        };
+        (x, y, ext(&xs), ext(&ys))
+    }
+
+    fn cs_of(stamp: &str) -> i64 {
+        (stamp_secs(stamp) * 100.0).round() as i64
+    }
+
+    fn times_of(e: &str) -> (i64, i64) {
+        let f: Vec<&str> = e.splitn(10, ',').collect();
+        (cs_of(f[1]), cs_of(f[2]))
+    }
+
+    #[test]
+    fn v1_headline_fields_keep_the_one_event_writer_and_any_new_field_switches() {
+        for j in [
+            "{}",
+            r##"{"x":0.5,"y":0.3,"size":1.2,"ink":"#FFFFFF","card":"#101010","accent":"#FFD400","anim":"fade","seconds":3}"##,
+            r#"{"card":"none"}"#,
+        ] {
+            let ass = tall(j);
+            assert_eq!(hl_events(&ass).len(), 1, "{j}");
+            assert!(ass.contains("Dialogue: 1,"), "{j}");
+            assert!(
+                hl_events(&ass)
+                    .iter()
+                    .all(|e| e.starts_with("Dialogue: 1,")),
+                "{j}"
+            );
+        }
+        for j in [
+            r#"{"font":"Anton"}"#,
+            r#"{"glow":{"size":10}}"#,
+            r#"{"card":{"radius":1}}"#,
+            r#"{"delay_s":0.5}"#,
+        ] {
+            let ass = tall(j);
+            assert!(hl_events(&ass).len() > 4, "{j}");
+            assert!(!ass.contains("Dialogue: 1,"), "{j}");
+            assert!(
+                !hl_text(&ass).is_empty() && hl_text(&ass)[0].starts_with("Dialogue: 1"),
+                "{j}"
+            );
+            // The style row is the positioned one: outline type, centred, no margins.
+            let h = style_line(&ass, "Headline");
+            assert_eq!(
+                (h[15], h[18], h[19], h[20], h[21]),
+                ("1", "5", "0", "0", "0"),
+                "{j}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_headline_layers_are_card_shadow_glow_text_above_the_captions() {
+        let ass = tall(
+            r##"{"card":{"radius":0.4},"shadow":{"y":8},"glow":{"size":14},"stroke":{"width":3}}"##,
+        );
+        let order: Vec<u8> = hl_events(&ass)
+            .iter()
+            .map(|e| {
+                e["Dialogue: ".len()..]
+                    .split(',')
+                    .next()
+                    .unwrap()
+                    .parse::<u8>()
+                    .unwrap()
+            })
+            .collect();
+        for n in [10u8, 11, 12, 13] {
+            assert!(order.contains(&n), "layer {n} missing: {order:?}");
+        }
+        assert!(order.iter().all(|n| (10..=13).contains(n)));
+        // The file lists them bottom to top.
+        let first = |n: u8| order.iter().position(|x| *x == n).unwrap();
+        assert!(first(10) < first(11) && first(11) < first(12) && first(12) < first(13));
+        // Every caption layer is below every headline layer.
+        let cap_max = ass
+            .lines()
+            .filter(|l| l.starts_with("Dialogue: ") && !l.contains(",Headline,"))
+            .map(|l| {
+                l["Dialogue: ".len()..]
+                    .split(',')
+                    .next()
+                    .unwrap()
+                    .parse::<u8>()
+                    .unwrap()
+            })
+            .max();
+        assert!(cap_max.is_none_or(|m| m < 10));
+        // No card, no shadow, no glow: only the text layer.
+        let ass = tall(r##"{"card":"none","font":"Anton"}"##);
+        let layers: Vec<&str> = hl_events(&ass)
+            .into_iter()
+            .map(|e| e.split(',').next().unwrap())
+            .collect();
+        assert!(layers.iter().all(|l| *l == layers[0]), "{layers:?}");
+    }
+
+    #[test]
+    fn rows_follow_max_lines_and_width() {
+        // Today's rule: long enough to wrap = two balanced rows.
+        let rows = hl_rows(&tall(r#"{"font":"Archivo Black"}"#));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows.concat().join(" "), HEAD);
+        // A short text stays on one row.
+        let ass = build_for(
+            &sample(),
+            "karaoke",
+            0.0,
+            &AssOpts {
+                dur: 9.0,
+                headline: Some("Big news".into()),
+                headline_look: headline_of(r#"{"font":"Archivo Black"}"#),
+                ..AssOpts::default()
+            },
+        );
+        assert_eq!(hl_rows(&ass).len(), 1);
+        // max_lines 1: one row, and the headline gives up words from its end to fit.
+        let one = hl_rows(&tall_long(r#"{"max_lines":1}"#));
+        assert_eq!(one.len(), 1, "{one:?}");
+        let kept = one[0].join(" ");
+        assert!(LONG.starts_with(&kept) && kept.len() < LONG.len(), "{kept}");
+        // It stays inside the frame.
+        let w = arch().width(&kept, 64.0);
+        assert!(w <= 1080.0 - 2.0 * (24.0 + 12.0), "{w}");
+        // A narrow width wraps to three rows when three are allowed...
+        let three = hl_rows(&tall_long(r#"{"width":0.5,"max_lines":3}"#));
+        assert_eq!(three.len(), 3, "{three:?}");
+        for r in &three {
+            let w = arch().width(&r.join(" "), 64.0);
+            assert!(w <= 0.5 * 1080.0 + 1.0, "{r:?} {w}");
+        }
+        // ...and with two allowed the block widens (up to the card's room) to hold the words.
+        let two = hl_rows(&tall_long(r#"{"width":0.3,"max_lines":2}"#));
+        assert_eq!(two.len(), 2, "{two:?}");
+        assert!(two
+            .iter()
+            .any(|r| arch().width(&r.join(" "), 64.0) > 0.3 * 1080.0));
+        // Never more rows than max_lines.
+        for n in 1..=3 {
+            let rows = hl_rows(&tall_long(&format!(r#"{{"max_lines":{n},"width":0.5}}"#)));
+            assert!(rows.len() <= n, "{n}: {rows:?}");
+        }
+        // The width is the widest the block may be, as a share of the frame.
+        let wide = hl_rows(&tall_long(r#"{"width":1,"max_lines":3}"#));
+        let narrow = hl_rows(&tall_long(r#"{"width":0.5,"max_lines":3}"#));
+        assert!(wide.len() <= narrow.len(), "{wide:?} {narrow:?}");
+    }
+
+    #[test]
+    fn align_places_the_rows_inside_the_card() {
+        let edges = |json: &str| -> Vec<(f64, f64)> {
+            let ass = tall_long(json);
+            let ws = hl_words(&ass);
+            hl_rows(&ass)
+                .iter()
+                .map(|r| {
+                    let first = ws.iter().find(|w| w.0 == r[0]).unwrap();
+                    let last = ws.iter().find(|w| &w.0 == r.last().unwrap()).unwrap();
+                    (
+                        first.1 - arch().width(&first.0, 64.0) / 2.0,
+                        last.1 + arch().width(&last.0, 64.0) / 2.0,
+                    )
+                })
+                .collect()
+        };
+        let left = edges(r#"{"align":"left","width":0.5,"max_lines":3}"#);
+        let right = edges(r#"{"align":"right","width":0.5,"max_lines":3}"#);
+        let centre = edges(r#"{"align":"center","width":0.5,"max_lines":3}"#);
+        assert_eq!(left.len(), 3);
+        for r in &left {
+            assert!((r.0 - left[0].0).abs() < 1.5, "{left:?}");
+        }
+        for r in &right {
+            assert!((r.1 - right[0].1).abs() < 1.5, "{right:?}");
+        }
+        let mid = |r: &(f64, f64)| (r.0 + r.1) / 2.0;
+        for r in &centre {
+            assert!((mid(r) - mid(&centre[0])).abs() < 1.5, "{centre:?}");
+        }
+        // The rows are not all the same width, so the three alignments differ.
+        assert!(
+            left.iter().any(|r| (r.1 - left[0].1).abs() > 5.0),
+            "{left:?}"
+        );
+        assert!((left[1].0 - right[1].0).abs() > 1.0 || (left[0].0 - right[0].0).abs() > 1.0);
+    }
+
+    #[test]
+    fn the_accent_word_is_auto_first_last_or_none() {
+        let accent_of = |json: &str| -> Vec<String> {
+            let ass = tall(json);
+            hl_text(&ass)
+                .into_iter()
+                .filter(|e| {
+                    hl_parts(e).0.contains("\\1c&H1E3CFF&")
+                        || hl_parts(e).0.contains("\\1c&H001E3CFF&")
+                })
+                .map(|e| hl_parts(e).1.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let auto = accent_of(r#"{"font":"Archivo Black"}"#);
+        assert_eq!(auto, vec!["founders".to_string()]);
+        // `auto` is what the one-event writer picks for the same words.
+        let words: Vec<&str> = HEAD.split(' ').collect();
+        assert_eq!(accent_pick(&words).map(|i| words[i]), Some("founders"));
+        assert_eq!(accent_of(r#"{"accent_word":"auto"}"#), auto);
+        assert_eq!(
+            accent_of(r#"{"accent_word":"first"}"#),
+            vec!["Why".to_string()]
+        );
+        assert_eq!(
+            accent_of(r#"{"accent_word":"last"}"#),
+            vec!["early".to_string()]
+        );
+        assert!(accent_of(r#"{"accent_word":"none"}"#).is_empty());
+        // Cased, and with the accent colour of the Look.
+        let ass = tall(r##"{"accent_word":"last","case":"upper","accent":"#00FF00"}"##);
+        assert!(hl_text(&ass)
+            .iter()
+            .any(|e| hl_parts(e).1 == "EARLY" && hl_parts(e).0.contains("\\1c&H00FF00&")));
+    }
+
+    #[test]
+    fn enter_exit_and_delay_land_on_the_expected_centiseconds() {
+        // Static: no enter, no exit, the delay moves the start.
+        let ass = hl2(
+            r#"{"enter":{"kind":"none"},"delay_s":0.5,"card":{"radius":0.3}}"#,
+            1080,
+            1920,
+            9.0,
+        );
+        for e in hl_events(&ass) {
+            assert_eq!(times_of(e), (50, 900), "{e}");
+        }
+        // No delay: from the very start.
+        let ass = hl2(
+            r#"{"enter":{"kind":"none"},"card":{"radius":0.3}}"#,
+            1080,
+            1920,
+            9.0,
+        );
+        assert!(hl_events(&ass).iter().all(|e| times_of(e) == (0, 900)));
+        // seconds counts from the moment the headline enters, and it fades out for 200 ms.
+        let ass = hl2(
+            r#"{"enter":{"kind":"none"},"delay_s":0.5,"seconds":2,"card":{"radius":0.3}}"#,
+            1080,
+            1920,
+            9.0,
+        );
+        let text: Vec<(i64, i64)> = hl_text(&ass).iter().map(|e| times_of(e)).collect();
+        assert_eq!(text.iter().map(|t| t.0).min(), Some(50));
+        assert_eq!(text.iter().map(|t| t.1).max(), Some(250));
+        // The fade-out is the last 200 ms of the event: 1.80 to 2.00 into it.
+        assert!(
+            hl_text(&ass)
+                .iter()
+                .all(|e| hl_parts(e).0.contains("\\t(1800,2000,\\alpha&HFF&)")),
+            "{ass}"
+        );
+        // An explicit exit: its own kind and time (a slide up over 300 ms).
+        let ass = hl2(
+            r#"{"enter":{"kind":"none"},"seconds":2,"exit":{"kind":"slide_up","ms":300},"card":{"radius":0.3}}"#,
+            1080,
+            1920,
+            9.0,
+        );
+        let text: Vec<(i64, i64)> = hl_text(&ass).iter().map(|e| times_of(e)).collect();
+        assert!(text.iter().any(|t| t.0 == 170), "{text:?}");
+        assert_eq!(text.iter().map(|t| t.1).max(), Some(200));
+        // An exit at the end of the clip: exit is cut from the window's end.
+        let ass = hl2(
+            r#"{"enter":{"kind":"none"},"exit":{"kind":"fade","ms":400}}"#,
+            1080,
+            1920,
+            5.0,
+        );
+        let text: Vec<(i64, i64)> = hl_text(&ass).iter().map(|e| times_of(e)).collect();
+        assert!(text.iter().all(|t| *t == (0, 500)), "{text:?}");
+        assert!(hl_text(&ass)
+            .iter()
+            .all(|e| hl_parts(e).0.contains("\\t(4600,5000,\\alpha&HFF&)")));
+        // An exit with a time and no kind is a fade.
+        let ass = hl2(
+            r#"{"enter":{"kind":"none"},"exit":{"ms":400}}"#,
+            1080,
+            1920,
+            5.0,
+        );
+        assert!(hl_text(&ass)
+            .iter()
+            .all(|e| hl_parts(e).0.contains("\\t(4600,5000,\\alpha&HFF&)")));
+        // A delay at or past the end of the clip: nothing to draw.
+        let ass = hl2(r#"{"delay_s":5}"#, 1080, 1920, 4.0);
+        assert!(hl_events(&ass).is_empty());
+    }
+
+    #[test]
+    fn the_entrance_runs_from_the_delay_for_its_time() {
+        // A 400 ms slide down: moves for 40 ms slices from 0.50 to 0.90, y rising
+        // to its place, then a single steady event.
+        let ass = hl2(
+            r#"{"enter":{"kind":"slide_down","ms":400},"delay_s":0.5,"card":{"radius":0.3}}"#,
+            1080,
+            1920,
+            9.0,
+        );
+        let words = hl_text(&ass);
+        let first_word = hl_parts(words[0]).1.to_string();
+        let evs: Vec<&&str> = words
+            .iter()
+            .filter(|e| hl_parts(e).1 == first_word)
+            .collect();
+        assert_eq!(times_of(evs[0]).0, 50);
+        let ends: Vec<i64> = evs.iter().map(|e| times_of(e).1).collect();
+        assert!(ends.contains(&90), "{ends:?}");
+        assert!(evs.len() >= 5, "{ends:?}");
+        // The last event is steady from 0.90 to the end.
+        let last = evs.last().unwrap();
+        assert_eq!(times_of(last), (90, 900));
+        assert!(hl_parts(last).0.contains("\\pos("));
+        // It starts above its place (slide_down comes from above): y of the first slice < y at rest.
+        assert!(hl_xy(evs[0]).1 < hl_xy(last).1 - 10.0);
+        // v1 anim is the shorthand: fade is a 200 ms fade, none is no motion, and
+        // an explicit enter wins.
+        let fade = hl2(r#"{"anim":"fade","font":"Archivo Black"}"#, 1080, 1920, 9.0);
+        assert_eq!(times_of(hl_text(&fade)[0]), (0, 900));
+        assert!(
+            hl_text(&fade)
+                .iter()
+                .all(|e| hl_parts(e).0.contains("\\t(0,200,\\alpha&H00&)")),
+            "fade in over 200 ms"
+        );
+        let none = hl2(r#"{"anim":"none","font":"Archivo Black"}"#, 1080, 1920, 9.0);
+        assert!(hl_events(&none).iter().all(|e| times_of(e) == (0, 900)));
+        let both = hl2(
+            r#"{"anim":"none","enter":{"kind":"zoom","ms":300}}"#,
+            1080,
+            1920,
+            9.0,
+        );
+        assert!(hl_events(&both).iter().any(|e| times_of(e).1 == 30));
+        // pop is the default entrance: 340 ms.
+        let pop = hl2(r#"{"font":"Archivo Black"}"#, 1080, 1920, 9.0);
+        assert!(hl_text(&pop).iter().any(|e| times_of(e).1 == 34));
+    }
+
+    #[test]
+    fn the_card_object_sets_colour_opacity_padding_and_radius() {
+        let colour_of = |ass: &str| {
+            let e = hl_layer(ass, 10).last().copied().unwrap();
+            let t = hl_parts(e).0.to_string();
+            let c = t
+                .split("\\1c&H")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_string();
+            let a = t
+                .split("\\alpha&H")
+                .nth(1)
+                .map_or("00", |a| a.split('&').next().unwrap())
+                .to_string();
+            (c, a)
+        };
+        let ass = tall(r##"{"card":{"color":"#102030","opacity":0.5}}"##);
+        assert_eq!(colour_of(&ass), ("302010".to_string(), "80".to_string()));
+        // Defaults: white, opaque, square, 24 px of padding.
+        let plain = tall(r#"{"card":{"pad":24}}"#);
+        assert_eq!(colour_of(&plain), ("FFFFFF".to_string(), "00".to_string()));
+        assert!(
+            !hl_parts(hl_layer(&plain, 10).last().unwrap())
+                .1
+                .contains(" b "),
+            "square"
+        );
+        let rounded = tall(r#"{"card":{"pad":24,"radius":1}}"#);
+        assert!(
+            hl_parts(hl_layer(&rounded, 10).last().unwrap())
+                .1
+                .contains(" b "),
+            "rounded"
+        );
+        // A v1 colour string still sets the colour when the card is an object elsewhere... and on its own.
+        let v1 = tall(r##"{"card":"#102030","glow":{"size":6}}"##);
+        assert_eq!(colour_of(&v1).0, "302010");
+        // Padding: 24 px more on every side makes the card 48 px wider and taller.
+        let (_, _, w24, h24) = card_box(&plain);
+        let (_, _, w48, h48) = card_box(&tall(r#"{"card":{"pad":48}}"#));
+        assert!((w48 - w24 - 48.0).abs() < 1.5, "{w24} {w48}");
+        assert!((h48 - h24 - 48.0).abs() < 1.5, "{h24} {h48}");
+        // pad 0: the card hugs the ink.
+        let (_, _, w0, _) = card_box(&tall(r#"{"card":{"pad":0}}"#));
+        assert!((w24 - w0 - 48.0).abs() < 1.5, "{w0} {w24}");
+        // The default padding is 24 px times `size`.
+        let (_, _, ws, _) = card_box(&tall(r#"{"card":{"radius":0},"size":1.5}"#));
+        assert!(ws > w24, "{ws} {w24}");
+        // The shape is a fraction of half the shorter side: radius 1 on a card
+        // gives round ends, so the first curve is half the card's height.
+        let e = hl_layer(&rounded, 10).last().copied().unwrap();
+        let (_, _, _, h) = card_box(&rounded);
+        let first_x: f64 = hl_parts(e)
+            .1
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((first_x / 8.0 - h / 2.0).abs() < 1.0, "{first_x} {h}");
+        // `none` is no card; an object with no opacity is no card either.
+        for j in [
+            r#"{"card":"none","font":"Anton"}"#,
+            r#"{"card":{"opacity":0}}"#,
+        ] {
+            assert!(
+                !hl_events(&tall(j))
+                    .iter()
+                    .any(|e| hl_parts(e).0.contains(r"\p4")),
+                "{j}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_wraps_every_row_once_and_stays_in_the_frame() {
+        let ass =
+            tall_long(r##"{"card":{"radius":0.2},"width":0.5,"max_lines":3,"align":"left"}"##);
+        assert_eq!(hl_rows(&ass).len(), 3);
+        // One card event per time slice (here: one steady one).
+        let cards = hl_layer(&ass, 10);
+        assert!(cards.iter().all(|e| hl_parts(e).1.starts_with("m ")));
+        let (x, y, w, h) = card_box(&ass);
+        // All the words are inside the card.
+        for (t, wx, wy) in hl_words(&ass) {
+            let half = arch().width(&t, 64.0) / 2.0;
+            assert!(wx - half > x - w / 2.0 && wx + half < x + w / 2.0, "{t}");
+            assert!(wy > y - h / 2.0 && wy < y + h / 2.0, "{t}");
+        }
+        // Whole card inside every canvas, wherever it is asked to be.
+        for (cw, ch) in [(1080, 1920), (1080, 1080), (1920, 1080), (1080, 1350)] {
+            for (px, py) in [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0), (0.5, 0.5)] {
+                let a = hl2(
+                    &format!(r#"{{"x":{px},"y":{py},"card":{{"radius":0.3}},"size":2}}"#),
+                    cw,
+                    ch,
+                    9.0,
+                );
+                let (x, y, w, h) = card_box(&a);
+                assert!(
+                    x - w / 2.0 >= -0.5 && x + w / 2.0 <= cw as f64 + 0.5,
+                    "{cw}x{ch} {px},{py}: {x} {w}"
+                );
+                assert!(
+                    y - h / 2.0 >= -0.5 && y + h / 2.0 <= ch as f64 + 0.5,
+                    "{cw}x{ch} {px},{py}: {y} {h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn position_size_and_the_logo_clearance_still_mean_what_they_did() {
+        // Centred by default, below the top bar.
+        let ass = tall(r#"{"card":{"radius":0.2}}"#);
+        let (x, y, w, h) = card_box(&ass);
+        assert!((x - 540.0).abs() < 1.5, "{x}");
+        assert!(w < 1080.0);
+        // Its top edge is where today's card starts: 8.5 % down on a tall canvas.
+        assert!(
+            (y - h / 2.0 - 163.0).abs() < 1.5,
+            "{} (want 163)",
+            y - h / 2.0
+        );
+        // y puts the middle of the card.
+        let (x, y, _, _) = card_box(&tall(r#"{"x":0.5,"y":0.7,"card":{"radius":0.2}}"#));
+        assert!(
+            (x - 540.0).abs() < 1.5 && (y - 1344.0).abs() < 1.5,
+            "{x} {y}"
+        );
+        let (x, _, _, _) = card_box(&tall(r#"{"x":0.3,"y":0.5,"card":{"radius":0.2}}"#));
+        assert!((x - 324.0).abs() < 1.5, "{x}");
+        // Type size: the style row and the words scale.
+        let h = style_line(&tall(r#"{"size":1.5,"font":"Archivo Black"}"#), "Headline").join(",");
+        assert!(h.contains(",Archivo Black,96,"), "{h}");
+        // A corner logo at the top: the block centres in what is left.
+        let clear = AssOpts {
+            dur: 9.0,
+            headline: Some(HEAD.into()),
+            headline_look: headline_of(r#"{"card":{"radius":0.2}}"#),
+            clear: Some(Clear {
+                top: true,
+                left: false,
+                px: 260,
+            }),
+            ..AssOpts::default()
+        };
+        let a = build_for(&sample(), "karaoke", 0.0, &clear);
+        let (x, _, w, _) = card_box(&a);
+        assert!(x < 540.0 - 20.0, "shifted left of the logo: {x}");
+        assert!(x + w / 2.0 <= 1080.0 - 260.0 + 2.0 + 24.0 + 12.0, "{x} {w}");
+        // A hand-placed headline ignores the logo.
+        let clear = AssOpts {
+            headline_look: headline_of(r#"{"x":0.5,"card":{"radius":0.2}}"#),
+            ..clear
+        };
+        let (x, _, _, _) = card_box(&build_for(&sample(), "karaoke", 0.0, &clear));
+        assert!((x - 540.0).abs() < 1.5);
+    }
+
+    #[test]
+    fn font_case_and_spacing_are_the_captions_fields() {
+        for f in crate::look::FONTS {
+            let ass = tall(&format!(r#"{{"font":"{f}"}}"#));
+            let h = style_line(&ass, "Headline");
+            assert_eq!(h[1], f);
+            assert!(!hl_words(&ass).is_empty(), "{f}");
+        }
+        let up = tall(r#"{"case":"upper"}"#);
+        assert!(hl_words(&up).iter().all(|w| w.0 == w.0.to_uppercase()));
+        let asis = tall(r#"{"case":"asis"}"#);
+        assert_eq!(hl_rows(&asis).concat().join(" "), HEAD);
+        // Spacing is em of the type size: 0.1 em of 64 px is 6.4 px per character.
+        let sp = tall(r#"{"spacing":0.1}"#);
+        let e = hl_text(&sp)[0];
+        assert!(hl_parts(e).0.contains("\\fsp6.4"), "{}", hl_parts(e).0);
+        // And it widens the rows.
+        let wide_row = |ass: &str| hl_rows(ass)[0].join(" ").len();
+        let _ = wide_row(&sp);
+        let w0 = hl_words(&tall(r#"{"font":"Archivo Black"}"#));
+        let w1 = hl_words(&sp);
+        let span = |w: &[(String, f64, f64)]| {
+            let r: Vec<_> = w.iter().filter(|x| (x.2 - w[0].2).abs() < 3.0).collect();
+            r.iter().map(|x| x.1).fold(f64::MIN, f64::max)
+                - r.iter().map(|x| x.1).fold(f64::MAX, f64::min)
+        };
+        assert!(span(&w1) > span(&w0) - 1.0);
+    }
+
+    #[test]
+    fn stroke_shadow_and_glow_are_drawn_like_the_captions() {
+        // Bare type: today's dark edge on the style row; a Look stroke wins.
+        let ass = tall(r#"{"card":"none","font":"Archivo Black"}"#);
+        let h = style_line(&ass, "Headline");
+        assert_eq!(
+            (h[3], h[5], h[15], h[16]),
+            ("&H00FFFFFF", "&H00000000", "1", "5")
+        );
+        let ass = tall(r##"{"card":"none","stroke":{"color":"#FF0000","width":9}}"##);
+        let h = style_line(&ass, "Headline");
+        assert_eq!((h[5], h[16]), ("&H000000FF", "9"));
+        assert!(hl_text(&ass)[0].contains("\\bord9"));
+        // A card has no stroke unless the Look gives one.
+        let ass = tall(r#"{"card":{"radius":0.2}}"#);
+        assert_eq!(style_line(&ass, "Headline")[16], "0");
+        // Shadow: an offset, blurred copy of the text in the shadow colour, under it.
+        let ass = tall(
+            r##"{"card":"none","shadow":{"color":"#102030","x":6,"y":9,"blur":7,"opacity":0.5},"stroke":{"width":0}}"##,
+        );
+        let sh = hl_layer(&ass, 11);
+        assert!(!sh.is_empty());
+        assert!(
+            hl_parts(sh[0]).0.contains("\\blur7"),
+            "{}",
+            hl_parts(sh[0]).0
+        );
+        assert!(hl_parts(sh[0]).0.contains("\\1c&H302010&"));
+        assert!(hl_parts(sh[0]).0.contains("\\alpha&H80&"));
+        let text_y = hl_text(&ass)[0];
+        let rows = hl_rows(&ass).len();
+        // Steady rows share one shadow event per row, shifted by (x, y).
+        assert_eq!(
+            hl_layer(&ass, 11)
+                .iter()
+                .filter(|e| times_of(e).1 == 900)
+                .count(),
+            rows
+        );
+        let _ = text_y;
+        // Glow: grown by 0.55 of the size, blurred by 0.6 of it.
+        let ass = tall(
+            r##"{"card":"none","stroke":{"width":0},"glow":{"color":"#00E5FF","size":20,"strength":0.5}}"##,
+        );
+        let g = hl_layer(&ass, 12);
+        assert!(!g.is_empty());
+        let t = hl_parts(g[0]).0;
+        assert!(t.contains("\\blur12") && t.contains("\\bord11"), "{t}");
+        assert!(
+            t.contains("\\1c&HFFE500&") && t.contains("\\alpha&H80&"),
+            "{t}"
+        );
+        // Defaults of an object with one field: the captions'.
+        let ass = tall(r#"{"card":"none","glow":{"strength":1}}"#);
+        let t = hl_parts(hl_layer(&ass, 12)[0]).0;
+        assert!(t.contains("\\blur7.2"), "{t}");
+    }
+
+    #[test]
+    fn the_positioned_headline_works_on_every_style_canvas_and_font() {
+        for (w, h) in [(1080, 1920), (1080, 1350), (1080, 1080), (1920, 1080)] {
+            for f in crate::look::FONTS {
+                let ass = hl2(
+                    &format!(
+                        r##"{{"font":"{f}","card":{{"color":"#101010","opacity":0.8,"radius":0.5}},"ink":"#FFFFFF",
+                           "glow":{{"size":10}},"shadow":{{"y":6}},"enter":{{"kind":"drop"}},"exit":{{"kind":"zoom"}},"seconds":3}}"##
+                    ),
+                    w,
+                    h,
+                    6.0,
+                );
+                assert!(!hl_text(&ass).is_empty(), "{w}x{h} {f}");
+                let (x, y, cw, ch) = card_box(&ass);
+                assert!(
+                    x - cw / 2.0 >= -0.5 && x + cw / 2.0 <= w as f64 + 0.5,
+                    "{w}x{h} {f}"
+                );
+                assert!(
+                    y - ch / 2.0 >= -0.5 && y + ch / 2.0 <= h as f64 + 0.5,
+                    "{w}x{h} {f}"
+                );
+            }
+        }
+        // And an unreadable headline text is still nothing.
+        let none = build_for(
+            &sample(),
+            "karaoke",
+            0.0,
+            &AssOpts {
+                dur: 5.0,
+                headline: Some("{}".into()),
+                headline_look: headline_of(r#"{"font":"Anton"}"#),
+                ..AssOpts::default()
+            },
+        );
+        assert!(hl_events(&none).is_empty());
+    }
+
+    #[test]
+    fn a_minute_long_headline_stays_a_few_dozen_events() {
+        let ass = hl2(
+            r##"{"card":{"radius":0.4},"shadow":{"y":6},"glow":{"size":14},"stroke":{"width":3},"enter":{"kind":"bounce","ms":500},"exit":{"kind":"blur","ms":300}}"##,
+            1080,
+            1920,
+            60.0,
+        );
+        let n = hl_events(&ass).len();
+        assert!((10..250).contains(&n), "{n} events");
     }
 }

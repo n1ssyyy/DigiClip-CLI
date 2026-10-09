@@ -489,6 +489,11 @@ pub struct Compositor {
     /// The Look's bar: along the top edge, and the thickness multiplier.
     bar_top: bool,
     bar_height: f64,
+    /// The bar's colour (sRGB) and the Look's section, kept to plan the shaped
+    /// bar (inset, radius, track, glow) once both are known.
+    bar_rgb: Option<(u8, u8, u8)>,
+    bar_look: Option<crate::look::BarLook>,
+    bar_fx: Option<crate::bar::BarFx>,
     /// Vignette and grade over the picture (never over the bar).
     fx: Option<Fx>,
     /// Luma gain of the blurred fill, and how much of its colour stays.
@@ -521,6 +526,9 @@ impl Compositor {
             bar: None,
             bar_top: false,
             bar_height: 1.0,
+            bar_rgb: None,
+            bar_look: None,
+            bar_fx: None,
             fx: None,
             fill_gain: BG_DIM,
             fill_chroma: 1.0,
@@ -551,7 +559,8 @@ impl Compositor {
     /// Draw a progress bar (sRGB color) along the bottom edge.
     pub fn with_bar(mut self, rgb: Option<(u8, u8, u8)>) -> Self {
         self.bar = rgb.map(|(r, g, b)| yuv709(r, g, b));
-        self
+        self.bar_rgb = rgb;
+        self.plan_bar()
     }
 
     /// Where the Look puts the bar and how thick it is.
@@ -559,7 +568,19 @@ impl Compositor {
         if let Some(l) = look {
             self.bar_top = l.pos == Some(crate::look::BarPos::Top);
             self.bar_height = l.height.unwrap_or(1.0);
+            self.bar_look = Some(l.clone());
         }
+        self.plan_bar()
+    }
+
+    /// The shaped bar (inset, rounded ends, track, glow), planned once for the
+    /// clip when the Look asks for one. A bar without those fields is the plain
+    /// drawing.
+    fn plan_bar(mut self) -> Self {
+        self.bar_fx = match (self.bar_rgb, &self.bar_look) {
+            (Some(rgb), Some(l)) if l.shaped() => Some(crate::bar::BarFx::new(self.canvas, l, rgb)),
+            _ => None,
+        };
         self
     }
 
@@ -676,7 +697,9 @@ impl Compositor {
                 *p = (128.0 + (*p as f32 - 128.0) * (1.0 - a)).round() as u8;
             }
         }
-        if let Some(color) = self.bar {
+        if let (Some(_), Some(fx)) = (self.bar, &self.bar_fx) {
+            fx.draw(&mut self.out, progress);
+        } else if let Some(color) = self.bar {
             draw_bar_at(
                 &mut self.out,
                 canvas,
@@ -811,6 +834,16 @@ impl Compositor {
         )?;
         Ok(())
     }
+}
+
+/// The colour of the progress bar: the flat `progress_bar` option switches the
+/// bar on and sets its colour; the Look's `bar.color` replaces the colour but
+/// never switches a bar on.
+pub fn bar_color(
+    flat: Option<(u8, u8, u8)>,
+    look: Option<&crate::look::BarLook>,
+) -> Option<(u8, u8, u8)> {
+    flat.map(|f| look.and_then(|l| l.color).map_or(f, |c| (c.0, c.1, c.2)))
 }
 
 /// Progress bar along the bottom edge: the filled part in `color`, the
@@ -1149,6 +1182,7 @@ mod tests {
                 Some(crate::look::BarLook {
                     pos: Some(crate::look::BarPos::Bottom),
                     height: Some(1.0),
+                    ..Default::default()
                 }),
             ] {
                 let mut comp = Compositor::new(640, 360, c)
@@ -1246,6 +1280,7 @@ mod tests {
         let look = crate::look::BarLook {
             pos: Some(crate::look::BarPos::Top),
             height: Some(2.0),
+            ..Default::default()
         };
         let mut comp = Compositor::new(640, 360, c)
             .with_bar(Some((255, 212, 0)))
@@ -1676,5 +1711,132 @@ mod tests {
         // Same pixels as today when absent or 0.5.
         assert!(frame(None) == frame(look(0.5)));
         assert!(frame(None) == frame(Some(LayoutLook::default())));
+    }
+
+    // ---- Look: the dressed bar through the compositor -----------------------
+
+    fn bar_of(json: &str) -> crate::look::BarLook {
+        crate::look::Look::parse(&format!(r#"{{"bar":{json}}}"#))
+            .bar
+            .unwrap()
+    }
+
+    fn with_bar_look(
+        c: Canvas,
+        look: Option<&crate::look::BarLook>,
+        effects: Option<&EffectsLook>,
+        p: f32,
+    ) -> Vec<u8> {
+        let src = colourful(640, 360);
+        let base = c.base_rect(640.0, 360.0);
+        Compositor::new(640, 360, c)
+            .with_effects(effects)
+            .with_bar(Some((255, 212, 0)))
+            .with_bar_look(look)
+            .compose(&src, base, 0.0, p)
+            .unwrap()
+            .to_vec()
+    }
+
+    #[test]
+    fn the_bar_colour_is_the_looks_when_the_bar_is_on() {
+        use crate::look::BarLook;
+        let flat = Some((255, 212, 0));
+        let red = BarLook {
+            color: Some(crate::look::Rgb(255, 59, 48)),
+            ..Default::default()
+        };
+        assert_eq!(bar_color(flat, None), flat);
+        assert_eq!(bar_color(flat, Some(&BarLook::default())), flat);
+        assert_eq!(bar_color(flat, Some(&red)), Some((255, 59, 48)));
+        // It never switches a bar on.
+        assert_eq!(bar_color(None, Some(&red)), None);
+        assert_eq!(bar_color(None, None), None);
+    }
+
+    #[test]
+    fn a_bar_look_without_shape_fields_is_the_plain_bar_to_the_byte() {
+        let c = Canvas::TALL;
+        let want = with_bar_look(c, None, None, 0.4);
+        for j in [
+            "{}",
+            r#"{"pos":"bottom","height":1}"#,
+            r##"{"color":"#FFD400"}"##,
+        ] {
+            let l = bar_of(j);
+            assert!(!l.shaped(), "{j}");
+            assert!(with_bar_look(c, Some(&l), None, 0.4) == want, "{j}");
+        }
+        // A bar look with the bar off draws nothing.
+        let src = colourful(640, 360);
+        let base = c.base_rect(640.0, 360.0);
+        let l = bar_of(r#"{"inset":0.04,"radius":1,"glow":{"size":20}}"#);
+        let mut off = Compositor::new(640, 360, c).with_bar_look(Some(&l));
+        let mut none = Compositor::new(640, 360, c);
+        assert!(
+            off.compose(&src, base, 0.0, 0.5).unwrap()
+                == none.compose(&src, base, 0.0, 0.5).unwrap()
+        );
+    }
+
+    #[test]
+    fn square_unglowed_untracked_bar_through_the_shaped_path_matches_the_plain_one() {
+        // Shaped by `radius: 0` alone: same pixels at the whole-pixel fills.
+        let c = Canvas::TALL;
+        let l = bar_of(r#"{"radius":0}"#);
+        assert!(l.shaped());
+        for p in [0.0f32, 0.5, 1.0] {
+            let want = with_bar_look(c, None, None, p);
+            assert!(with_bar_look(c, Some(&l), None, p) == want, "{p}");
+        }
+    }
+
+    #[test]
+    fn a_shaped_bar_is_inset_rounded_and_drawn_over_the_effects() {
+        let c = Canvas::TALL;
+        let g = Geom { w: c.w, h: c.h };
+        let w = c.w as usize;
+        let cw = g.cw() as usize;
+        let bh = bar_thickness(c, 1.0) as usize;
+        let l = bar_of(r##"{"inset":0.04,"radius":1,"track":"#FFFFFF","track_opacity":0.3}"##);
+        let yellow = yuv709(255, 212, 0);
+        let src = colourful(640, 360);
+        let base_rect = c.base_rect(640.0, 360.0);
+        let bare = Compositor::new(640, 360, c)
+            .compose(&src, base_rect, 0.0, 0.0)
+            .unwrap()
+            .to_vec();
+        let out = with_bar_look(c, Some(&l), None, 0.5);
+        // Bottom bar, 44 px in from the left and right and from the bottom.
+        let y_mid = c.h as usize - 44 - bh / 2;
+        assert_eq!(out[y_mid * w + 44 + 8], yellow.0);
+        assert_ne!(
+            out[y_mid * w + 1080 - 44 - 8],
+            yellow.0,
+            "unfilled half is track"
+        );
+        // Outside the inset, and under the bar, the picture is untouched.
+        assert_eq!(out[y_mid * w + 10], bare[y_mid * w + 10]);
+        assert_eq!(
+            out[(c.h as usize - 20) * w + 540],
+            bare[(c.h as usize - 20) * w + 540]
+        );
+        // Chroma carries the fill colour on the filled part.
+        let u = |o: &[u8], x: usize, y: usize| o[g.luma_len() + (y / 2) * cw + x / 2];
+        assert_eq!(u(&out, 100, y_mid & !1), yellow.1);
+        // The effects run before the bar, so it keeps its colours under a
+        // vignette and a mono grade, while the track shows the graded picture.
+        let fxl = EffectsLook {
+            vignette: Some(1.0),
+            grade: Some(Grade::Mono),
+            fill_dim: None,
+        };
+        let dressed = with_bar_look(c, Some(&l), Some(&fxl), 0.5);
+        assert_eq!(dressed[y_mid * w + 44 + 8], yellow.0);
+        assert_eq!(u(&dressed, 100, y_mid & !1), yellow.1);
+        assert_ne!(
+            dressed[y_mid * w + 1080 - 44 - 8],
+            out[y_mid * w + 1080 - 44 - 8]
+        );
     }
 }

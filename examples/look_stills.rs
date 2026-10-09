@@ -17,6 +17,10 @@
 //! `--at <s>[,<s>...]` writes stills at those clip times only
 //! (`still-at-<ms>ms.png`).
 //!
+//! `--hstrip enter|exit` is the same strip for the headline: stills every
+//! 40 ms across its entrance (from just before it starts) or its exit (to
+//! just after it ends), and `strip-sheet.png`, the top third of all of them.
+//!
 //! `--width <px>` is the width of the stills (540 by default; the full canvas
 //! width shows glow and edges pixel for pixel).
 //!
@@ -87,7 +91,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: look_stills <out_dir> [--look <json|@file>] [--style <name>] [--aspect 9:16] \
          [--headline \"<text>\"] [--bar <#RRGGBB>] [--logo <png> [--logo-pos tr]] \
-         [--scene flat|crop|letterbox|split] [--strip <word index>] [--at <s>,<s>...]          [--width <px>]"
+         [--scene flat|crop|letterbox|split] [--strip <word index>] [--hstrip enter|exit]          [--at <s>,<s>...] [--width <px>]"
     );
     std::process::exit(2)
 }
@@ -306,8 +310,14 @@ fn strip_sheet(
     ass: &str,
     canvas: Canvas,
     width: u32,
+    headline: bool,
 ) {
-    let (top, band) = caption_band(ass, canvas, width);
+    let (top, band) = if headline {
+        let h = (canvas.h as f64 * width as f64 / canvas.w as f64 * 0.32).round() as u32;
+        (0, h & !1)
+    } else {
+        caption_band(ass, canvas, width)
+    };
     let list = dir.join("strip-list.txt");
     let body: String = stills
         .iter()
@@ -350,6 +360,7 @@ fn main() {
         (None, None, None, String::from("tr"));
     let mut scene_arg: Option<String> = None;
     let mut strip: Option<usize> = None;
+    let mut hstrip: Option<String> = None;
     let mut at: Vec<f64> = Vec::new();
     let mut width = 540u32;
     let mut it = std::env::args().skip(1);
@@ -378,6 +389,7 @@ fn main() {
                     .map(|v| v.clamp(120, 4096) & !1)
                     .unwrap_or_else(|| usage())
             }
+            "--hstrip" => hstrip = Some(it.next().unwrap_or_else(|| usage())),
             "--strip" => strip = it.next().and_then(|v| v.parse().ok()).or_else(|| usage()),
             _ if a.starts_with("--") => usage(),
             _ if out_dir.is_none() => out_dir = Some(PathBuf::from(a)),
@@ -421,6 +433,8 @@ fn main() {
         .map_or(out_dir, PathBuf::from);
 
     let look = look_arg.as_deref().map(Look::from_arg).unwrap_or_default();
+    // The Look's bar colour wins over the flat one, which still switches the bar on.
+    let bar = compose::bar_color(bar, look.bar.as_ref());
     // The logo as a render would build it: corner, then the Look's section.
     let logo = logo_file.as_ref().map(|p| {
         if !p.is_file() {
@@ -508,18 +522,23 @@ fn main() {
     .collect();
     // The headline enters at 0: fading in, mid-pop, settled, and (when the
     // Look ends it early) just after it has gone.
-    if text.contains("Dialogue: 1,") {
-        marks.insert(0, ("h1-entrance".into(), 0.06));
-        marks.insert(1, ("h2-entrance-mid".into(), 0.22));
-        marks.insert(2, ("h3-settled".into(), 0.80));
-        if let Some(end) = text
-            .lines()
-            .find(|l| l.starts_with("Dialogue: 1,"))
-            .and_then(|l| l.split(',').nth(2))
+    // (The positioned headline is many events, on layers 10 and up.)
+    let head_lines: Vec<&str> = text.lines().filter(|l| l.contains(",Headline,")).collect();
+    let head_t = |i: usize| -> Vec<f64> {
+        head_lines
+            .iter()
+            .filter_map(|l| l.split(',').nth(i))
             .map(secs)
-            .filter(|&e| e + 0.15 < dur)
-        {
-            marks.insert(3, ("h4-after-seconds".into(), end + 0.15));
+            .collect()
+    };
+    let head_start = head_t(1).into_iter().fold(f64::INFINITY, f64::min);
+    let head_end = head_t(2).into_iter().fold(0.0, f64::max);
+    if !head_lines.is_empty() {
+        marks.insert(0, ("h1-entrance".into(), head_start + 0.06));
+        marks.insert(1, ("h2-entrance-mid".into(), head_start + 0.22));
+        marks.insert(2, ("h3-settled".into(), head_start + 0.80));
+        if head_end + 0.15 < dur {
+            marks.insert(3, ("h4-after-seconds".into(), head_end + 0.15));
         }
     }
     // A strip: fine steps around one word instead.
@@ -535,7 +554,18 @@ fn main() {
             .map(|t| (format!("strip-{:05}ms", (t * 1000.0).round() as i64), t))
             .collect();
     }
-    if !at.is_empty() && strip.is_none() {
+    if let (Some(which), false) = (hstrip.as_deref(), head_lines.is_empty()) {
+        let (a, b) = match which {
+            "exit" => ((head_end - 0.6).max(0.0), (head_end + 0.08).min(dur)),
+            _ => ((head_start - 0.04).max(0.0), head_start + 0.6),
+        };
+        marks = (0..)
+            .map(|i| a + 0.04 * i as f64)
+            .take_while(|t| *t <= b + 1e-9)
+            .map(|t| (format!("hstrip-{:05}ms", (t * 1000.0).round() as i64), t))
+            .collect();
+    }
+    if !at.is_empty() && strip.is_none() && hstrip.is_none() {
         marks = at
             .iter()
             .map(|&t| (format!("at-{:05}ms", (t * 1000.0).round() as i64), t))
@@ -611,8 +641,16 @@ fn main() {
         }
     }
     let _ = std::fs::remove_file(out_dir.join("background.png"));
-    if strip.is_some() && !made.is_empty() {
-        strip_sheet(&ffmpeg, &out_dir, &made, &text, canvas, width);
+    if (strip.is_some() || hstrip.is_some()) && !made.is_empty() {
+        strip_sheet(
+            &ffmpeg,
+            &out_dir,
+            &made,
+            &text,
+            canvas,
+            width,
+            hstrip.is_some(),
+        );
     }
     println!("{}", ass_path.display());
     if failed {

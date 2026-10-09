@@ -50,6 +50,23 @@
 //!            keyword: { glow: { color, size, strength } } } }
 //! ```
 //!
+//! and the headline, progress bar and logo take the same depth:
+//!
+//! ```text
+//! headline: { ...,
+//!   font, case: upper|asis, spacing, align, max_lines, width,
+//!   stroke: { color, width },
+//!   shadow: { color, x, y, blur, opacity },
+//!   glow:   { color, size, strength },
+//!   card:   "#RRGGBB" | "none" | { color, opacity, pad, radius },
+//!   accent_word: auto|none|first|last,
+//!   enter: { kind, ms, ease }, exit: { kind, ms }, delay_s }
+//! bar:  { ..., color, track, track_opacity, inset, radius,
+//!         glow: { color, size, strength } }
+//! logo: { ..., rotate, shadow: { color, x, y, blur, opacity },
+//!         glow: { color, size, strength } }
+//! ```
+//!
 //! `x`/`y` are the centre of an element as a fraction of the output frame
 //! (0..1, right and down). Sizes multiply today's size. Colours are
 //! `#RRGGBB` strings.
@@ -71,8 +88,11 @@ pub const CAPS: &[&str] = &[
     "look.captions.fx",
     "look.captions.type",
     "look.headline",
+    "look.headline.v2",
     "look.bar",
+    "look.bar.v2",
     "look.logo",
+    "look.logo.v2",
     "look.camera",
     "look.effects",
     "look.layout",
@@ -424,6 +444,32 @@ pub enum HeadlineAnim {
     None,
 }
 
+/// Which word of the headline takes the accent colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccentWord {
+    /// The engine's own choice (a keyword, else the longest content word).
+    Auto,
+    /// No word: the whole headline is in the ink colour.
+    None,
+    First,
+    Last,
+}
+
+/// The headline's card as an object.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CardLook {
+    /// White unless set.
+    pub color: Option<Rgb>,
+    /// 0..1 (1 unless set).
+    pub opacity: Option<f64>,
+    /// Room between the letters and the card, 0..80 px at a 1080-wide frame
+    /// (today's 24 px times `size` unless set).
+    pub pad: Option<f64>,
+    /// 0 = square corners, 1 = round ends: a fraction of half the card's
+    /// shorter side.
+    pub radius: Option<f64>,
+}
+
 /// Headline section. Only matters while a headline is on.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HeadlineLook {
@@ -441,6 +487,53 @@ pub struct HeadlineLook {
     pub anim: Option<HeadlineAnim>,
     /// Seconds on screen, >= 0 (0 = the whole clip).
     pub seconds: Option<f64>,
+    /// One of [`FONTS`] (Archivo Black unless set).
+    pub font: Option<&'static str>,
+    pub case: Option<Case>,
+    /// Letter spacing, -0.05..0.3 em.
+    pub spacing: Option<f64>,
+    /// How the rows sit inside the card.
+    pub align: Option<Align>,
+    /// Most rows of text, 1..3.
+    pub max_lines: Option<usize>,
+    /// Widest the text block may be, as a fraction of the frame's width,
+    /// 0.4..1.
+    pub width: Option<f64>,
+    pub stroke: Option<StrokeLook>,
+    pub shadow: Option<ShadowLook>,
+    pub glow: Option<GlowLook>,
+    /// The card as an object (a colour or `none` is `card`).
+    pub card_fx: Option<CardLook>,
+    pub accent_word: Option<AccentWord>,
+    pub enter: Option<EnterLook>,
+    pub exit: Option<ExitLook>,
+    /// Seconds after the clip starts before the headline enters, 0..5.
+    pub delay_s: Option<f64>,
+}
+
+impl HeadlineLook {
+    /// Does this headline need the positioned writer (every word its own
+    /// event, laid out from the font's metrics, with a vector card)? It does as
+    /// soon as it has any field beyond the v1 ones (`x`, `y`, `size`, `ink`,
+    /// `card` as a colour or `none`, `accent`, `anim`, `seconds`). A headline
+    /// without any of them goes through the one-event writer, byte for byte as
+    /// it always did.
+    pub fn positioned(&self) -> bool {
+        self.font.is_some()
+            || self.case.is_some()
+            || self.spacing.is_some()
+            || self.align.is_some()
+            || self.max_lines.is_some()
+            || self.width.is_some()
+            || self.stroke.is_some()
+            || self.shadow.is_some()
+            || self.glow.is_some()
+            || self.card_fx.is_some()
+            || self.accent_word.is_some()
+            || self.enter.is_some()
+            || self.exit.is_some()
+            || self.delay_s.is_some()
+    }
 }
 
 /// Where the progress bar runs.
@@ -456,6 +549,33 @@ pub struct BarLook {
     pub pos: Option<BarPos>,
     /// Thickness multiplier, 0.5..3.
     pub height: Option<f64>,
+    /// Colour of the filled part; wins over the flat `progress_bar` colour
+    /// (which still switches the bar on).
+    pub color: Option<Rgb>,
+    /// Colour of the unfilled part (a dark translucent track unless set).
+    pub track: Option<Rgb>,
+    /// Opacity of the track, 0..1.
+    pub track_opacity: Option<f64>,
+    /// Margin from the frame's left and right edges and from the edge the bar
+    /// sits on, as a fraction of the frame's width, 0..0.1.
+    pub inset: Option<f64>,
+    /// 0 = square ends, 1 = round ends: a fraction of half the bar's thickness.
+    pub radius: Option<f64>,
+    /// A soft halo of the fill colour around the filled part.
+    pub glow: Option<GlowLook>,
+}
+
+impl BarLook {
+    /// Does this bar need the shaped drawing (`bar::BarFx`)? It does when it has
+    /// a track colour or opacity, an inset, a radius or a glow. Position,
+    /// height and colour alone keep the plain drawing, pixel for pixel.
+    pub fn shaped(&self) -> bool {
+        self.track.is_some()
+            || self.track_opacity.is_some()
+            || self.inset.is_some()
+            || self.radius.is_some()
+            || self.glow.is_some()
+    }
 }
 
 /// Logo section. Only matters while a logo file is set.
@@ -469,6 +589,12 @@ pub struct LogoLook {
     pub size: Option<f64>,
     /// 0..1.
     pub opacity: Option<f64>,
+    /// Turn about the logo's centre, -30..30 degrees, positive = clockwise.
+    pub rotate: Option<f64>,
+    /// A blurred copy of the logo's shape in one colour, under it.
+    pub shadow: Option<ShadowLook>,
+    /// A soft halo of the logo's shape, under it.
+    pub glow: Option<GlowLook>,
 }
 
 /// How the virtual camera moves.
@@ -846,6 +972,46 @@ fn exit(o: &Obj) -> ExitLook {
     }
 }
 
+fn font(o: &Obj) -> Option<&'static str> {
+    o.get("font").and_then(Value::as_str).and_then(|f| {
+        FONTS
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(f.trim()))
+            .copied()
+    })
+}
+
+fn case(o: &Obj) -> Option<Case> {
+    match word(o, "case").as_deref() {
+        Some("upper") => Some(Case::Upper),
+        Some("asis") => Some(Case::AsIs),
+        _ => None,
+    }
+}
+
+fn align(o: &Obj) -> Option<Align> {
+    match word(o, "align").as_deref() {
+        Some("left") => Some(Align::Left),
+        Some("center" | "centre") => Some(Align::Center),
+        Some("right") => Some(Align::Right),
+        _ => None,
+    }
+}
+
+fn card_fx(o: &Obj) -> CardLook {
+    CardLook {
+        color: color(o, "color"),
+        opacity: num(o, "opacity", 0.0, 1.0),
+        pad: num(o, "pad", 0.0, 80.0),
+        radius: num(o, "radius", 0.0, 1.0),
+    }
+}
+
+/// A section that ended up with nothing in it is no section.
+fn nonempty<T: Default + PartialEq>(v: T) -> Option<T> {
+    (v != T::default()).then_some(v)
+}
+
 fn headline(o: &Obj) -> HeadlineLook {
     HeadlineLook {
         x: num(o, "x", 0.0, 1.0),
@@ -866,6 +1032,26 @@ fn headline(o: &Obj) -> HeadlineLook {
             _ => None,
         },
         seconds: num(o, "seconds", 0.0, 3600.0),
+        font: font(o),
+        case: case(o),
+        spacing: num(o, "spacing", -0.05, 0.3),
+        align: align(o),
+        max_lines: num(o, "max_lines", 1.0, 3.0).map(|n| n.round() as usize),
+        width: num(o, "width", 0.4, 1.0),
+        stroke: sect(o, "stroke").map(stroke).and_then(nonempty),
+        shadow: sect(o, "shadow").map(shadow_fx).and_then(nonempty),
+        glow: sect(o, "glow").map(glow).and_then(nonempty),
+        card_fx: sect(o, "card").map(card_fx).and_then(nonempty),
+        accent_word: match word(o, "accent_word").as_deref() {
+            Some("auto") => Some(AccentWord::Auto),
+            Some("none") => Some(AccentWord::None),
+            Some("first") => Some(AccentWord::First),
+            Some("last") => Some(AccentWord::Last),
+            _ => None,
+        },
+        enter: sect(o, "enter").map(enter).and_then(nonempty),
+        exit: sect(o, "exit").map(exit).and_then(nonempty),
+        delay_s: num(o, "delay_s", 0.0, 5.0),
     }
 }
 
@@ -877,6 +1063,12 @@ fn bar(o: &Obj) -> BarLook {
             _ => None,
         },
         height: num(o, "height", 0.5, 3.0),
+        color: color(o, "color"),
+        track: color(o, "track"),
+        track_opacity: num(o, "track_opacity", 0.0, 1.0),
+        inset: num(o, "inset", 0.0, 0.1),
+        radius: num(o, "radius", 0.0, 1.0),
+        glow: sect(o, "glow").map(glow).and_then(nonempty),
     }
 }
 
@@ -886,6 +1078,9 @@ fn logo(o: &Obj) -> LogoLook {
         y: num(o, "y", 0.0, 1.0),
         size: num(o, "size", 0.4, 2.5),
         opacity: num(o, "opacity", 0.0, 1.0),
+        rotate: num(o, "rotate", -30.0, 30.0),
+        shadow: sect(o, "shadow").map(shadow_fx).and_then(nonempty),
+        glow: sect(o, "glow").map(glow).and_then(nonempty),
     }
 }
 
@@ -1289,5 +1484,238 @@ mod tests {
     fn caps_announce_the_dressing() {
         assert!(CAPS.contains(&"look.captions.fx"));
         assert!(CAPS.contains(&"look.captions.type"));
+    }
+
+    fn headline_of(json: &str) -> HeadlineLook {
+        Look::parse(&format!(r##"{{"headline":{json}}}"##))
+            .headline
+            .unwrap()
+    }
+
+    #[test]
+    fn headline_dressing_fields_parse_clamp_and_fall_back() {
+        let h = headline_of(
+            r##"{"font":"jetbrains mono","case":"Upper","spacing":9,"align":"Right","max_lines":9,
+                "width":0.1,"delay_s":99,
+                "stroke":{"color":"#102030","width":99},
+                "shadow":{"color":"#000000","x":-99,"y":99,"blur":99,"opacity":9},
+                "glow":{"color":"#FFD400","size":99,"strength":-1},
+                "accent_word":"LAST",
+                "enter":{"kind":"slide_down","ms":9999,"ease":"back"},
+                "exit":{"kind":"blur","ms":-5}}"##,
+        );
+        assert_eq!(h.font, Some("JetBrains Mono"));
+        assert_eq!(
+            (h.case, h.spacing, h.align),
+            (Some(Case::Upper), Some(0.3), Some(Align::Right))
+        );
+        assert_eq!(
+            (h.max_lines, h.width, h.delay_s),
+            (Some(3), Some(0.4), Some(5.0))
+        );
+        assert_eq!(
+            h.stroke,
+            Some(StrokeLook {
+                color: Some(Rgb(0x10, 0x20, 0x30)),
+                width: Some(12.0)
+            })
+        );
+        let sh = h.shadow.unwrap();
+        assert_eq!(
+            (sh.x, sh.y, sh.blur, sh.opacity),
+            (Some(-30.0), Some(30.0), Some(20.0), Some(1.0))
+        );
+        let g = h.glow.unwrap();
+        assert_eq!(
+            (g.color, g.size, g.strength),
+            (Some(Rgb(255, 212, 0)), Some(40.0), Some(0.0))
+        );
+        assert_eq!(h.accent_word, Some(AccentWord::Last));
+        let e = h.enter.unwrap();
+        assert_eq!(
+            (e.kind, e.ms, e.ease),
+            (Some(EnterKind::SlideDown), Some(800.0), Some(Ease::Back))
+        );
+        let x = h.exit.unwrap();
+        assert_eq!((x.kind, x.ms), (Some(ExitKind::Blur), Some(0.0)));
+        // The lower ends.
+        let h = headline_of(
+            r#"{"spacing":-9,"max_lines":0,"width":9,"delay_s":-3,"font":"anton","align":"centre"}"#,
+        );
+        assert_eq!(
+            (h.spacing, h.max_lines, h.width, h.delay_s),
+            (Some(-0.05), Some(1), Some(1.0), Some(0.0))
+        );
+        assert_eq!((h.font, h.align), (Some("Anton"), Some(Align::Center)));
+        for (j, want) in [
+            ("first", AccentWord::First),
+            ("Auto", AccentWord::Auto),
+            ("none", AccentWord::None),
+        ] {
+            let h = headline_of(&format!(r#"{{"accent_word":"{j}"}}"#));
+            assert_eq!(h.accent_word, Some(want));
+        }
+    }
+
+    #[test]
+    fn bad_headline_values_are_absent_and_empty_objects_are_nothing() {
+        for j in [
+            r#"{"headline":{"font":"Comic Sans","case":"title","align":"middle","accent_word":"second"}}"#,
+            r#"{"headline":{"spacing":"wide","max_lines":"two","width":null,"delay_s":"soon"}}"#,
+            r#"{"headline":{"stroke":{},"shadow":{},"glow":{},"card":{},"enter":{},"exit":{}}}"#,
+            r#"{"headline":{"stroke":5,"shadow":[1],"glow":"big","enter":"pop","exit":3}}"#,
+            r#"{"headline":{"enter":{"kind":"spin","ease":"wobble"},"exit":{"kind":"slide_left"}}}"#,
+            r##"{"headline":{"glow":{"color":"gold"},"card":{"color":"teal","pad":"big"}}}"##,
+        ] {
+            let l = Look::parse(j);
+            assert!(l.is_empty(), "{j}: {l:?}");
+            assert!(!l.headline.unwrap().positioned(), "{j}");
+        }
+        assert!(!Look::parse(r#"{"headline":{"width":0.7}}"#).is_empty());
+        assert!(!Look::parse(r#"{"headline":{"delay_s":0}}"#).is_empty());
+    }
+
+    #[test]
+    fn the_headline_card_is_a_colour_none_or_an_object() {
+        // v1 forms stay v1: they do not make the headline positioned.
+        for j in [
+            r##"{"card":"#111111"}"##,
+            r#"{"card":"none"}"#,
+            r#"{"card":null}"#,
+            r##"{"x":0.5,"y":0.2,"size":1.2,"ink":"#FFFFFF","accent":"#FF0000","anim":"fade","seconds":2}"##,
+        ] {
+            let h = headline_of(j);
+            assert!(!h.positioned(), "{j}");
+            assert!(h.card_fx.is_none(), "{j}");
+        }
+        // The object lands in its own field and leaves the v1 slot empty.
+        let h = headline_of(r##"{"card":{"color":"#102030","opacity":2,"pad":999,"radius":-1}}"##);
+        assert!(h.card.is_none() && h.positioned());
+        assert_eq!(
+            h.card_fx,
+            Some(CardLook {
+                color: Some(Rgb(0x10, 0x20, 0x30)),
+                opacity: Some(1.0),
+                pad: Some(80.0),
+                radius: Some(0.0)
+            })
+        );
+        // An object with a single field is enough.
+        assert!(headline_of(r#"{"card":{"radius":1}}"#).positioned());
+        // Each other field on its own makes it positioned.
+        for j in [
+            r#"{"font":"Anton"}"#,
+            r#"{"case":"asis"}"#,
+            r#"{"spacing":0}"#,
+            r#"{"align":"left"}"#,
+            r#"{"max_lines":2}"#,
+            r#"{"width":0.8}"#,
+            r#"{"stroke":{"width":1}}"#,
+            r#"{"shadow":{"y":1}}"#,
+            r#"{"glow":{"size":1}}"#,
+            r#"{"accent_word":"none"}"#,
+            r#"{"enter":{"kind":"none"}}"#,
+            r#"{"exit":{"kind":"fade"}}"#,
+            r#"{"delay_s":1}"#,
+        ] {
+            assert!(headline_of(j).positioned(), "{j}");
+        }
+    }
+
+    #[test]
+    fn bar_fields_parse_clamp_and_fall_back() {
+        let b = Look::parse(
+            r##"{"bar":{"pos":"top","height":2,"color":"#FF3B30","track":"#FFFFFF","track_opacity":9,
+                "inset":0.5,"radius":-2,"glow":{"color":"#00E5FF","size":99,"strength":0.5}}}"##,
+        )
+        .bar
+        .unwrap();
+        assert_eq!((b.pos, b.height), (Some(BarPos::Top), Some(2.0)));
+        assert_eq!(
+            (b.color, b.track),
+            (Some(Rgb(255, 59, 48)), Some(Rgb(255, 255, 255)))
+        );
+        assert_eq!(
+            (b.track_opacity, b.inset, b.radius),
+            (Some(1.0), Some(0.1), Some(0.0))
+        );
+        let g = b.glow.unwrap();
+        assert_eq!(
+            (g.color, g.size, g.strength),
+            (Some(Rgb(0, 229, 255)), Some(40.0), Some(0.5))
+        );
+        let b = Look::parse(r#"{"bar":{"inset":-1,"track_opacity":-1,"radius":9}}"#)
+            .bar
+            .unwrap();
+        assert_eq!(
+            (b.inset, b.track_opacity, b.radius),
+            (Some(0.0), Some(0.0), Some(1.0))
+        );
+        // Bad values are absent; an empty glow is no glow.
+        let l = Look::parse(
+            r##"{"bar":{"color":"red","track":"#12","track_opacity":"half","inset":"wide","radius":null,"glow":{}}}"##,
+        );
+        assert!(l.is_empty(), "{l:?}");
+    }
+
+    #[test]
+    fn a_bar_is_shaped_only_by_the_fields_that_change_its_shape() {
+        let bar = |j: &str| Look::parse(&format!(r#"{{"bar":{j}}}"#)).bar.unwrap();
+        // v1 fields and the colour keep the plain drawing.
+        for j in [
+            r#"{}"#,
+            r#"{"pos":"top","height":2}"#,
+            r##"{"color":"#FF0000"}"##,
+        ] {
+            assert!(!bar(j).shaped(), "{j}");
+        }
+        for j in [
+            r##"{"track":"#000000"}"##,
+            r#"{"track_opacity":0.5}"#,
+            r#"{"inset":0}"#,
+            r#"{"radius":0}"#,
+            r#"{"glow":{"size":1}}"#,
+        ] {
+            assert!(bar(j).shaped(), "{j}");
+        }
+    }
+
+    #[test]
+    fn logo_fields_parse_clamp_and_fall_back() {
+        let g = Look::parse(
+            r##"{"logo":{"rotate":-99,"shadow":{"color":"#000000","x":99,"y":-99,"blur":99,"opacity":-1},
+                "glow":{"color":"#FFD400","size":99,"strength":9}}}"##,
+        )
+        .logo
+        .unwrap();
+        assert_eq!(g.rotate, Some(-30.0));
+        let sh = g.shadow.unwrap();
+        assert_eq!(
+            (sh.x, sh.y, sh.blur, sh.opacity),
+            (Some(30.0), Some(-30.0), Some(20.0), Some(0.0))
+        );
+        let gl = g.glow.unwrap();
+        assert_eq!((gl.size, gl.strength), (Some(40.0), Some(1.0)));
+        let g = Look::parse(r#"{"logo":{"rotate":99}}"#).logo.unwrap();
+        assert_eq!(g.rotate, Some(30.0));
+        for j in [
+            r#"{"logo":{"rotate":"left","shadow":{},"glow":5}}"#,
+            r#"{"logo":{"shadow":[1],"glow":{"color":"red"}}}"#,
+        ] {
+            assert!(Look::parse(j).is_empty(), "{j}");
+        }
+        // v1 fields are untouched by the new ones.
+        let g = Look::parse(r#"{"logo":{"x":0.2,"size":1.5,"opacity":0.5}}"#)
+            .logo
+            .unwrap();
+        assert_eq!((g.x, g.size, g.opacity), (Some(0.2), Some(1.5), Some(0.5)));
+        assert!(g.rotate.is_none() && g.shadow.is_none() && g.glow.is_none());
+    }
+
+    #[test]
+    fn caps_announce_the_headline_bar_and_logo_depth() {
+        for c in ["look.headline.v2", "look.bar.v2", "look.logo.v2"] {
+            assert!(CAPS.contains(&c), "{c}");
+        }
     }
 }

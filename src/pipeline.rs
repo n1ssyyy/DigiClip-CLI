@@ -126,10 +126,12 @@ pub fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
     };
     Ok(crate::render::Look {
         canvas: args.canvas(),
-        bar: args
-            .progress_bar
-            .as_deref()
-            .and_then(crate::compose::parse_hex),
+        bar: crate::compose::bar_color(
+            args.progress_bar
+                .as_deref()
+                .and_then(crate::compose::parse_hex),
+            parsed.as_ref().and_then(|l| l.bar.as_ref()),
+        ),
         logo,
         music,
         anim: crate::captions::ass::Anim::parse(&args.caption_anim),
@@ -2907,5 +2909,36 @@ mod tests {
             p.removed.iter().any(|r| r.reason.starts_with("exact cap")),
             "trim must be audited"
         );
+    }
+
+    #[test]
+    fn the_looks_bar_colour_wins_over_the_flat_one_and_never_turns_the_bar_on() {
+        use clap::Parser;
+        let bar = |flags: &[&str]| {
+            let mut a = vec!["digiclip", "in.mp4"];
+            a.extend_from_slice(flags);
+            look_for(&Args::try_parse_from(a).unwrap()).unwrap()
+        };
+        let look = r##"{"bar":{"color":"#FF3B30","inset":0.04,"radius":1}}"##;
+        // Flat colour alone, as ever.
+        assert_eq!(bar(&["--progress-bar", "#00FF00"]).bar, Some((0, 255, 0)));
+        assert_eq!(bar(&["--progress-bar"]).bar, Some((255, 212, 0)));
+        // The Look's colour replaces it; the flag still switches the bar on.
+        let l = bar(&["--progress-bar", "#00FF00", "--look", look]);
+        assert_eq!(l.bar, Some((255, 59, 48)));
+        let shape = l.bar_look.unwrap();
+        assert_eq!((shape.inset, shape.radius), (Some(0.04), Some(1.0)));
+        // No flag: no bar, whatever the Look says.
+        let l = bar(&["--look", look]);
+        assert_eq!(l.bar, None);
+        assert!(l.bar_look.is_some());
+        // A Look with other bar fields keeps the flat colour.
+        let l = bar(&[
+            "--progress-bar",
+            "#00FF00",
+            "--look",
+            r#"{"bar":{"pos":"top"}}"#,
+        ]);
+        assert_eq!(l.bar, Some((0, 255, 0)));
     }
 }

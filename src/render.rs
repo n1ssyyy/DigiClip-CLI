@@ -290,6 +290,11 @@ pub struct Logo {
     pub at: Option<(f64, f64)>,
     /// The Look's opacity (`None` = [`LOGO_ALPHA`]).
     pub opacity: Option<f64>,
+    /// The Look's turn about the logo's centre (degrees, clockwise).
+    pub rotate: Option<f64>,
+    /// The Look's shadow and glow, drawn from the logo's own shape.
+    pub shadow: Option<crate::look::ShadowLook>,
+    pub glow: Option<crate::look::GlowLook>,
 }
 
 /// How opaque a logo is drawn unless the Look says otherwise.
@@ -304,6 +309,9 @@ impl Default for Logo {
             scale: 1.0,
             at: None,
             opacity: None,
+            rotate: None,
+            shadow: None,
+            glow: None,
         }
     }
 }
@@ -329,7 +337,16 @@ impl Logo {
         self.at =
             (l.x.is_some() || l.y.is_some()).then(|| (l.x.unwrap_or(0.5), l.y.unwrap_or(0.5)));
         self.opacity = l.opacity;
+        self.rotate = l.rotate.filter(|d| d.abs() > 0.01);
+        self.shadow = l.shadow.clone();
+        self.glow = l.glow.clone();
         self
+    }
+
+    /// Does the Look turn the logo or give it a shadow or a glow (so that
+    /// `logo_chain` builds the longer chain)?
+    pub fn dressed(&self) -> bool {
+        self.rotate.is_some() || self.shadow.is_some() || self.glow.is_some()
     }
 
     /// Drawn size (even px): fits a box 14% of the short canvas side tall
@@ -1065,9 +1082,19 @@ fn run(
 /// Logo overlay (input `li`) on the video chain: sized by `Logo::size`,
 /// lightly translucent, inset from its corner (or put where the Look says).
 /// Captions burn on top.
+///
+/// A Look can also turn the logo, give it a shadow and a glow
+/// (`Logo::dressed`); the chain is then longer, and only then.
 pub fn logo_chain(li: usize, logo: &Logo, c: Canvas) -> String {
     let (lw, lh) = logo.size(c);
     let (mx, my) = Logo::inset(c);
+    let alpha = logo.opacity.map_or_else(
+        || LOGO_ALPHA.to_string(),
+        |o| format!("{}", (o.clamp(0.0, 1.0) * 100.0).round() / 100.0),
+    );
+    if logo.dressed() {
+        return dressed_logo_chain(li, logo, c, &alpha);
+    }
     let (x, y) = if let Some((x, y)) = logo.free_origin(c) {
         (format!("{x}"), format!("{y}"))
     } else {
@@ -1085,14 +1112,183 @@ pub fn logo_chain(li: usize, logo: &Logo, c: Canvas) -> String {
         };
         (x, y)
     };
-    let alpha = logo.opacity.map_or_else(
-        || LOGO_ALPHA.to_string(),
-        |o| format!("{}", (o.clamp(0.0, 1.0) * 100.0).round() / 100.0),
-    );
     format!(
         "[vpre];[{li}:v]format=rgba,scale={lw}:{lh}:flags=lanczos,colorchannelmixer=aa={alpha}[logo];\
          [vpre][logo]overlay=x={x}:y={y}:format=auto,format=yuv420p"
     )
+}
+
+/// The box (even px) a `w` x `h` logo turned by `deg` degrees fits in.
+pub fn turned_box(w: u32, h: u32, deg: f64) -> (u32, u32) {
+    let (s, c) = deg.to_radians().sin_cos();
+    let (w, h) = (w as f64, h as f64);
+    let up = |v: f64| (((v - 1e-6) / 2.0).ceil() as u32 * 2).max(2);
+    (up(w * c.abs() + h * s.abs()), up(w * s.abs() + h * c.abs()))
+}
+
+/// One coordinate of the overlay: from the start of the frame, or from its end.
+enum Along {
+    Start(i64),
+    End(i64),
+}
+
+impl Along {
+    /// Moved `by` px towards the start of the frame; `axis` names the frame's
+    /// extent in an expression (`W` or `H`).
+    fn back(self, by: i64, axis: char) -> String {
+        match self {
+            Along::Start(n) => format!("{}", n - by),
+            Along::End(n) => format!("{axis}-{}", n + by),
+        }
+    }
+}
+
+/// The logo chain when the Look turns the logo or gives it a shadow or a
+/// glow. The logo is scaled, turned about its centre on a transparent ground
+/// (its alpha kept), and padded by the room the effects need; the shadow and
+/// the glow are made from its alpha — the whole layer set to one colour, so a
+/// blur only moves alpha — then stacked shadow, glow, logo, and the stack takes
+/// the logo's opacity. The stack sits on the frame with the logo's own centre
+/// where the plain chain would have put it.
+///
+/// A glow is what a caption's glow is: the shape grown by 0.55 of `size` (a
+/// dilation, one pixel per pass) and blurred by 0.6 of `size`, at `strength`
+/// opacity; a shadow is a blurred copy offset by `x`, `y`.
+fn dressed_logo_chain(li: usize, logo: &Logo, c: Canvas, alpha: &str) -> String {
+    use crate::captions::motion;
+    let (lw, lh) = logo.size(c);
+    let (mx, my) = Logo::inset(c);
+    let k = crate::captions::ass::design_scale(c.w, c.h);
+    let (ow, oh) = logo.rotate.map_or((lw, lh), |d| turned_box(lw, lh, d));
+    let shadow = logo.shadow.as_ref().map(|s| motion::shadow_from(s, k));
+    let glow = logo
+        .glow
+        .as_ref()
+        .map(|g| motion::resolve_glow(&[Some(g)], [255.0; 3], k))
+        .filter(|g| g.size > 0.0 && g.strength > 0.0);
+    let shadow = shadow.filter(|s| s.opacity > 0.0);
+    let hex = |col: [f64; 3]| col.map(|v| v.round().clamp(0.0, 255.0) as u8);
+    // The room the effects need around the turned logo (even px).
+    let sh_sigma = shadow.map_or(0.0, |s| s.blur);
+    let (sx, sy) = shadow.map_or((0, 0), |s| (s.x.round() as i64, s.y.round() as i64));
+    let gl_grow = glow.map_or(0.0, |g| g.size * motion::GLOW_BORD);
+    let gl_sigma = glow.map_or(0.0, |g| g.size * motion::GLOW_BLUR);
+    let reach = [
+        shadow.map_or(0.0, |_| sx.abs().max(sy.abs()) as f64 + 3.0 * sh_sigma),
+        glow.map_or(0.0, |_| gl_grow + 3.0 * gl_sigma),
+    ]
+    .into_iter()
+    .fold(0.0, f64::max);
+    let m = if shadow.is_some() || glow.is_some() {
+        ((reach.ceil() as u32 + 2).div_ceil(2) * 2) as i64
+    } else {
+        0
+    };
+    let (gw, gh) = (ow as i64 + 2 * m, oh as i64 + 2 * m);
+    let mut f = format!("[vpre];[{li}:v]format=rgba,scale={lw}:{lh}:flags=lanczos");
+    if let Some(deg) = logo.rotate {
+        f.push_str(&format!(
+            ",rotate=a={:.6}:ow={ow}:oh={oh}:c=black@0",
+            deg.to_radians()
+        ));
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    if shadow.is_none() && glow.is_none() {
+        f.push_str(&format!(",colorchannelmixer=aa={alpha}[logo];"));
+    } else {
+        let n = 1 + shadow.is_some() as usize + glow.is_some() as usize;
+        let mut outs = vec!["[lt]"];
+        if shadow.is_some() {
+            outs.push("[ls]");
+        }
+        if glow.is_some() {
+            outs.push("[lq]");
+        }
+        f.push_str(&format!(",split={n}{};", outs.concat()));
+        let pad = |dx: i64, dy: i64| format!("pad={gw}:{gh}:{dx}:{dy}:color=black@0");
+        let blur = |sigma: f64| {
+            if sigma > 0.05 {
+                format!(",gblur=sigma={sigma:.2}:steps=2")
+            } else {
+                String::new()
+            }
+        };
+        let mix = |a: f64| {
+            if a < 0.999 {
+                format!(",colorchannelmixer=aa={:.3}", a.clamp(0.0, 1.0))
+            } else {
+                String::new()
+            }
+        };
+        if let Some(s) = shadow {
+            let [r, g, b] = hex(s.col);
+            f.push_str(&format!(
+                "[ls]{},lutrgb=r={r}:g={g}:b={b}{}{}[sh];",
+                pad(m + sx, m + sy),
+                blur(sh_sigma),
+                mix(s.opacity)
+            ));
+            stack.push("[sh]");
+        }
+        if let Some(g) = glow {
+            let [r, gg, b] = hex(g.col);
+            let grow: String = (0..gl_grow.round() as usize)
+                .map(|i| {
+                    format!(
+                        ",dilation=coordinates={}",
+                        if i % 2 == 0 { 255 } else { 90 }
+                    )
+                })
+                .collect();
+            f.push_str(&format!(
+                "[lq]{},lutrgb=r={r}:g={gg}:b={b}{grow}{}{}[gl];",
+                pad(m, m),
+                blur(gl_sigma),
+                mix(g.strength)
+            ));
+            stack.push("[gl]");
+        }
+        f.push_str(&format!("[lt]{}[lyr];", pad(m, m)));
+        stack.push("[lyr]");
+        // Bottom first, each overlaid on the one below.
+        let mut under = stack[0].to_string();
+        for (i, top) in stack.iter().enumerate().skip(1) {
+            let out = if i + 1 == stack.len() {
+                String::new()
+            } else {
+                format!("[st{i}]")
+            };
+            let tail = if out.is_empty() {
+                format!(",colorchannelmixer=aa={alpha}[logo];")
+            } else {
+                format!("{out};")
+            };
+            f.push_str(&format!("{under}{top}overlay=format=auto{tail}"));
+            under = out;
+        }
+    }
+    // Where the plain chain would put the unturned box; the stack is centred on it.
+    let (x, y) = if let Some((x, y)) = logo.free_origin(c) {
+        (Along::Start(x as i64), Along::Start(y as i64))
+    } else {
+        let x = if logo.corner.is_left() {
+            Along::Start(mx as i64)
+        } else {
+            Along::End((mx + lw) as i64)
+        };
+        let y = if logo.corner.is_top() {
+            Along::Start(my as i64)
+        } else {
+            Along::End((my * 2 + lh) as i64)
+        };
+        (x, y)
+    };
+    let (bx, by) = ((gw - lw as i64) / 2, (gh - lh as i64) / 2);
+    let (xs, ys) = (x.back(bx, 'W'), y.back(by, 'H'));
+    f.push_str(&format!(
+        "[vpre][logo]overlay=x={xs}:y={ys}:format=auto,format=yuv420p"
+    ));
+    f
 }
 
 /// Decoder stage: one ffmpeg per span, frames streamed in output order.
@@ -1465,5 +1661,213 @@ mod tests {
         assert_eq!(aa(r#"{"opacity":0}"#), "0");
         assert_eq!(aa(r#"{"opacity":1}"#), "1");
         assert_eq!(aa(r#"{"opacity":0.333}"#), "0.33");
+    }
+
+    // ---- Look: logo rotate, shadow and glow --------------------------------
+
+    fn br(json: &str) -> Logo {
+        logo_with(Corner::BottomRight, 1.0, json)
+    }
+
+    #[test]
+    fn fields_that_do_not_dress_the_logo_leave_the_chain_alone() {
+        let c = Canvas::TALL;
+        let plain = logo_chain(3, &br("{}"), c);
+        // A zero turn is no turn; the old fields keep the plain chain.
+        assert_eq!(logo_chain(3, &br(r#"{"rotate":0}"#), c), plain);
+        assert_eq!(logo_chain(3, &br(r#"{"rotate":0.005}"#), c), plain);
+        assert!(!br(r#"{"rotate":0}"#).dressed());
+        let sized = logo_chain(3, &br(r#"{"size":2,"opacity":0.5,"x":0.2,"y":0.3}"#), c);
+        assert!(!sized.contains("split") && !sized.contains("rotate="));
+        // A shadow with no opacity, or a glow with no strength, draws nothing.
+        assert!(!logo_chain(3, &br(r#"{"shadow":{"opacity":0}}"#), c).contains("split"));
+        assert!(!logo_chain(3, &br(r#"{"glow":{"strength":0}}"#), c).contains("split"));
+        assert!(!logo_chain(3, &br(r#"{"glow":{"size":0}}"#), c).contains("dilation"));
+    }
+
+    #[test]
+    fn a_turned_logo_is_scaled_then_rotated_into_a_box_that_holds_it() {
+        let c = Canvas::TALL;
+        let f = logo_chain(3, &br(r#"{"rotate":-12}"#), c);
+        // 152 px logo turned 12 degrees: 152 (cos + sin) = 180.3 -> 182.
+        assert_eq!(turned_box(152, 152, -12.0), (182, 182));
+        assert!(
+            f.contains(
+                "scale=152:152:flags=lanczos,rotate=a=-0.209440:ow=182:oh=182:c=black@0,colorchannelmixer=aa=0.9[logo]"
+            ),
+            "{f}"
+        );
+        // The box grows around the logo's own centre: 15 px each side.
+        assert!(f.contains("overlay=x=W-210:y=H-301:format=auto"), "{f}");
+        // Other turns and shapes: always even, never smaller than the logo.
+        for (w, h, d) in [
+            (152, 152, 30.0),
+            (280, 70, 12.0),
+            (70, 280, -30.0),
+            (2, 2, 5.0),
+        ] {
+            let (bw, bh) = turned_box(w, h, d);
+            let (sn, cs) = d.to_radians().sin_cos();
+            let (fw, fh) = (w as f64, h as f64);
+            assert!(bw % 2 == 0 && bh % 2 == 0, "{w}x{h} {d}");
+            // The box holds the turned rectangle, to within the rounding up to even.
+            assert!(
+                bw as f64 >= fw * cs.abs() + fh * sn.abs() - 1e-3,
+                "{w}x{h} {d}"
+            );
+            assert!(
+                bh as f64 >= fw * sn.abs() + fh * cs.abs() - 1e-3,
+                "{w}x{h} {d}"
+            );
+            assert!(
+                bw as f64 <= fw * cs.abs() + fh * sn.abs() + 2.0 + 1e-3,
+                "{w}x{h} {d}"
+            );
+        }
+        assert_eq!(turned_box(280, 70, 0.0), (280, 70));
+        // A wide logo turned 30 degrees gets much taller.
+        let (a, b) = turned_box(280, 70, 30.0);
+        assert!(a < 280 + 70 && b > 70 + 100, "{a} {b}");
+    }
+
+    #[test]
+    fn a_shadow_is_a_blurred_offset_copy_under_the_logo() {
+        let c = Canvas::TALL;
+        let f = logo_chain(
+            3,
+            &br(r##"{"shadow":{"color":"#102030","x":10,"y":12,"blur":12,"opacity":0.7}}"##),
+            c,
+        );
+        // Two branches: the logo and its shadow, each padded to the same box
+        // (50 px of room: 12 + 3 x 12 blur, rounded up to even) with the shadow
+        // moved by its offset.
+        assert!(f.contains("split=2[lt][ls]"), "{f}");
+        assert!(
+            f.contains("[ls]pad=252:252:60:62:color=black@0,lutrgb=r=16:g=32:b=48,gblur=sigma=12.00:steps=2,colorchannelmixer=aa=0.700[sh]"),
+            "{f}"
+        );
+        assert!(
+            f.contains("[lt]pad=252:252:50:50:color=black@0[lyr]"),
+            "{f}"
+        );
+        // Shadow under logo, the pair takes the logo's opacity.
+        assert!(
+            f.contains("[sh][lyr]overlay=format=auto,colorchannelmixer=aa=0.9[logo]"),
+            "{f}"
+        );
+        // The logo's own place does not move: the stack is centred on it.
+        assert!(
+            f.contains("overlay=x=W-245:y=H-336:format=auto,format=yuv420p"),
+            "{f}"
+        );
+        // A shadow with only an offset: black, today's soft default blur.
+        let f = logo_chain(3, &br(r#"{"shadow":{"y":8}}"#), c);
+        assert!(f.contains("lutrgb=r=0:g=0:b=0,gblur=sigma="), "{f}");
+        assert!(f.contains("[ls]pad="), "{f}");
+        // No blur: no gblur.
+        let f = logo_chain(3, &br(r#"{"shadow":{"x":4,"y":4,"blur":0}}"#), c);
+        assert!(!f.contains("gblur"), "{f}");
+        // Sizes follow the canvas, like the captions': half scale on a small one.
+        let big = logo_chain(
+            3,
+            &br(r#"{"shadow":{"x":20,"y":20,"blur":10}}"#),
+            Canvas::TALL,
+        );
+        let small = logo_chain(
+            3,
+            &br(r#"{"shadow":{"x":20,"y":20,"blur":10}}"#),
+            Canvas::SQUARE,
+        );
+        let sigma = |f: &str| -> f64 {
+            f.split("gblur=sigma=")
+                .nth(1)
+                .unwrap()
+                .split(':')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert!(sigma(&small) <= sigma(&big), "{small} {big}");
+    }
+
+    #[test]
+    fn a_glow_is_a_grown_blurred_halo_of_the_logos_shape() {
+        let c = Canvas::TALL;
+        let f = logo_chain(
+            3,
+            &br(r##"{"glow":{"color":"#00E5FF","size":20,"strength":0.8}}"##),
+            c,
+        );
+        assert!(f.contains("split=2[lt][lq]"), "{f}");
+        // Grown by 0.55 of the size (11 px = 11 one-pixel passes), blurred by 0.6 of it.
+        assert_eq!(f.matches("dilation=coordinates=").count(), 11, "{f}");
+        assert!(
+            f.contains("lutrgb=r=0:g=229:b=255,dilation=coordinates=255,dilation=coordinates=90"),
+            "{f}"
+        );
+        assert!(
+            f.contains("gblur=sigma=12.00:steps=2,colorchannelmixer=aa=0.800[gl]"),
+            "{f}"
+        );
+        // Glow under the logo, the pair takes the logo's opacity.
+        assert!(
+            f.contains("[gl][lyr]overlay=format=auto,colorchannelmixer=aa=0.9[logo]"),
+            "{f}"
+        );
+        // Without a colour it is white (a logo has no text colour to follow).
+        let f = logo_chain(3, &br(r#"{"glow":{"size":8}}"#), c);
+        assert!(f.contains("lutrgb=r=255:g=255:b=255,dilation"), "{f}");
+        assert_eq!(f.matches("dilation=coordinates=").count(), 4, "{f}");
+        // Full strength has no mixer on the halo.
+        let f = logo_chain(3, &br(r#"{"glow":{"size":8,"strength":1}}"#), c);
+        assert!(f.contains("gblur=sigma=4.80:steps=2[gl]"), "{f}");
+    }
+
+    #[test]
+    fn rotate_shadow_and_glow_stack_in_order_and_share_one_opacity() {
+        let c = Canvas::TALL;
+        let f = logo_chain(
+            3,
+            &br(
+                r#"{"rotate":-12,"opacity":0.5,"shadow":{"x":10,"y":12,"blur":12,"opacity":0.7},"glow":{"size":20,"strength":0.8}}"#,
+            ),
+            c,
+        );
+        assert!(
+            f.contains("rotate=a=-0.209440:ow=182:oh=182:c=black@0,split=3[lt][ls][lq]"),
+            "{f}"
+        );
+        // Bottom to top: shadow, glow, logo.
+        assert!(
+            f.contains("[sh][gl]overlay=format=auto[st1];[st1][lyr]overlay=format=auto,colorchannelmixer=aa=0.5[logo]"),
+            "{f}"
+        );
+        let at = |s: &str| f.find(s).unwrap_or_else(|| panic!("{s} in {f}"));
+        assert!(at("[sh];") < at("[gl];") && at("[gl];") < at("[lyr];"));
+        // Every branch is padded to the same box: the turned logo plus the room.
+        assert_eq!(f.matches("pad=282:282:").count(), 3, "{f}");
+        // The stack's centre is the logo's: 182 -> 282 is 50 px of room, 15 of turn.
+        assert!(f.contains("overlay=x=W-260:y=H-351:format=auto"), "{f}");
+        // Opacity applies once, to the stack.
+        assert_eq!(f.matches("colorchannelmixer=aa=0.5").count(), 1, "{f}");
+        // A free logo is centred where it is put, dressed or not.
+        let f = logo_chain(
+            3,
+            &br(r#"{"x":0.5,"y":0.5,"rotate":10,"glow":{"size":8}}"#),
+            c,
+        );
+        assert!(f.contains("overlay=x=429:y=849:format=auto"), "{f}");
+        // 152 px box at (464, 884); 222 px stack: 35 px each side -> (429, 849).
+        assert!(f.contains("pad=222:222:22:22"), "{f}");
+    }
+
+    #[test]
+    fn a_dressed_logo_counts_as_dressed_only_when_something_shows() {
+        assert!(br(r#"{"rotate":5}"#).dressed());
+        assert!(br(r#"{"shadow":{"y":1}}"#).dressed());
+        assert!(br(r#"{"glow":{"size":1}}"#).dressed());
+        assert!(!br(r#"{"size":2}"#).dressed());
+        assert!(!Logo::default().dressed());
     }
 }

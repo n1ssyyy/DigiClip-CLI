@@ -723,8 +723,22 @@ fn main() {
         |a: [i32; 3], b: [i32; 3], tol: i32| a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol);
     let thick =
         digiclip_rs::compose::bar_thickness(digiclip_rs::compose::Canvas::TALL, 2.0) as usize;
-    let top_filled = px(&mid, w, w / 4, thick / 2);
-    let top_track = px(&mid, w, w * 3 / 4, thick / 2);
+    // A dressed bar (inset, radius, track, glow) sits where `BarFx` puts it;
+    // the plain one runs edge to edge.
+    let bar_box = {
+        let l = pipeline::look_for(&args_with(&look_json)).unwrap();
+        match (&l.bar_look, l.bar) {
+            (Some(b), Some(rgb)) if b.shaped() => {
+                digiclip_rs::bar::BarFx::new(digiclip_rs::compose::Canvas::TALL, b, rgb).bounds()
+            }
+            _ => (0, 0, w, thick),
+        }
+    };
+    let (bx0, by0, bx1, by1) = bar_box;
+    let bar_mid = (by0 + by1) / 2;
+    let dressed = bar_box != (0, 0, w, thick);
+    let top_filled = px(&mid, w, bx0 + (bx1 - bx0) / 4, bar_mid);
+    let top_track = px(&mid, w, bx0 + (bx1 - bx0) * 3 / 4, bar_mid);
     println!("bar: filled {top_filled:?}, track {top_track:?}, want {want:?}, {thick} px thick");
     assert!(
         near(top_filled, want, 8),
@@ -740,7 +754,11 @@ fn main() {
         "the Look moved the bar off the bottom"
     );
     assert!(
-        !near(px(&mid, w, w / 4, thick + 6), want, 40),
+        !near(
+            px(&mid, w, w / 4, by1 + if dressed { 80 } else { 6 }),
+            want,
+            40
+        ),
         "the bar is {thick} px thick"
     );
 

@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod bar;
 pub mod binaries;
 pub mod cache;
 pub mod camera;

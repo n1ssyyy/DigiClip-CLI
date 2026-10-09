@@ -51,14 +51,14 @@ const DROP_V: f64 = 0.06;
 const FX_BLUR: f64 = 8.0;
 /// A glow's `size` is how far the light reaches: it is a border of this
 /// share of it, blurred by this share of it (px at 1080 wide).
-const GLOW_BORD: f64 = 0.55;
-const GLOW_BLUR: f64 = 0.6;
+pub const GLOW_BORD: f64 = 0.55;
+pub const GLOW_BLUR: f64 = 0.6;
 /// What a glow, shadow or box object leaves out (px at 1080 wide).
-const GLOW_SIZE: f64 = 12.0;
-const GLOW_STRENGTH: f64 = 0.8;
-const SHADOW_Y: f64 = 4.0;
-const SHADOW_BLUR: f64 = 4.0;
-const SHADOW_OPACITY: f64 = 0.6;
+pub const GLOW_SIZE: f64 = 12.0;
+pub const GLOW_STRENGTH: f64 = 0.8;
+pub const SHADOW_Y: f64 = 4.0;
+pub const SHADOW_BLUR: f64 = 4.0;
+pub const SHADOW_OPACITY: f64 = 0.6;
 const BOX_PAD_X: f64 = 16.0;
 const BOX_PAD_Y: f64 = 8.0;
 /// Drawing units per pixel (p4: one unit is an eighth of a pixel).
@@ -194,6 +194,9 @@ pub struct BoxSpec {
     pub pad_y: f64,
     pub radius: f64,
     pub per_word: bool,
+    /// One box around the whole block of rows (a headline's card) rather than
+    /// one per row.
+    pub block: bool,
 }
 
 /// The box behind the spoken word (its opacity is a word look).
@@ -274,6 +277,9 @@ pub struct Cfg {
     pub align: Option<Align>,
     pub rotate: f64,
     pub max_lines: Option<usize>,
+    /// Break the line into exactly this many rows, as evenly as it allows
+    /// (a headline has decided its rows already).
+    pub force_rows: Option<usize>,
     /// Does any word carry its own stroke (so every text event says its stroke)?
     pub stroke_tags: bool,
     /// The widest stroke any look has (px).
@@ -356,7 +362,19 @@ fn exit_ms(k: ExitKind) -> f64 {
 /// entrance or exit with no time is none.
 pub fn effective_motion(cap: &CaptionsLook, anim: Anim) -> (Enter, Exit) {
     let (_, en, ex) = from_anim(anim);
-    let enter = match &cap.enter {
+    merge_motion(cap.enter.as_ref(), cap.exit.as_ref(), en, ex)
+}
+
+/// An entrance and an exit given by the Look over the ones the element has by
+/// default (`en`, `ex`): a field left out keeps the default's, a different kind
+/// takes that kind's own time. An entrance or exit with no time is none.
+pub fn merge_motion(
+    look_enter: Option<&crate::look::EnterLook>,
+    look_exit: Option<&crate::look::ExitLook>,
+    en: Enter,
+    ex: Exit,
+) -> (Enter, Exit) {
+    let enter = match look_enter {
         None => en,
         Some(e) => {
             let kind = e.kind.unwrap_or(en.kind);
@@ -368,7 +386,7 @@ pub fn effective_motion(cap: &CaptionsLook, anim: Anim) -> (Enter, Exit) {
             }
         }
     };
-    let exit = match &cap.exit {
+    let exit = match look_exit {
         None => ex,
         Some(e) => {
             let kind = e.kind.unwrap_or(ex.kind);
@@ -397,6 +415,19 @@ pub fn effective_motion(cap: &CaptionsLook, anim: Anim) -> (Enter, Exit) {
             ..exit
         },
     )
+}
+
+/// A shadow object with its defaults (black, x 0, y 4, blur 4, opacity 0.6)
+/// filled in; lengths scaled from the 1080-wide design by `k`. The headline and
+/// the logo read their shadow through this too.
+pub fn shadow_from(s: &crate::look::ShadowLook, k: f64) -> Shadow {
+    Shadow {
+        col: s.color.map_or([0.0; 3], col_of),
+        x: s.x.unwrap_or(0.0) * k,
+        y: s.y.unwrap_or(SHADOW_Y) * k,
+        blur: s.blur.unwrap_or(SHADOW_BLUR) * k,
+        opacity: s.opacity.unwrap_or(SHADOW_OPACITY),
+    }
 }
 
 impl Cfg {
@@ -447,6 +478,7 @@ impl Cfg {
             pad_y: b.pad_y.unwrap_or(BOX_PAD_Y) * k,
             radius: b.radius.unwrap_or(0.0),
             per_word: b.per == Some(crate::look::BoxPer::Word),
+            block: false,
         });
         let abox = w.active.box_.as_ref().map(|b| ABox {
             col: b.color.map(col_of).or(base.box_col).unwrap_or(accent),
@@ -459,13 +491,7 @@ impl Cfg {
         if let Some(b) = &w.active.box_ {
             act.abox = b.opacity.unwrap_or(1.0);
         }
-        let shadow = cap.shadow_fx.as_ref().map(|s| Shadow {
-            col: s.color.map_or([0.0; 3], col_of),
-            x: s.x.unwrap_or(0.0) * k,
-            y: s.y.unwrap_or(SHADOW_Y) * k,
-            blur: s.blur.unwrap_or(SHADOW_BLUR) * k,
-            opacity: s.opacity.unwrap_or(SHADOW_OPACITY),
-        });
+        let shadow = cap.shadow_fx.as_ref().map(|s| shadow_from(s, k));
         let stroke_max = [up, act, spk]
             .iter()
             .map(|l| l.stroke.w)
@@ -482,6 +508,7 @@ impl Cfg {
             align: cap.align,
             rotate: cap.rotate.unwrap_or(0.0),
             max_lines: cap.lines,
+            force_rows: None,
             stroke_tags: cap.stroke.is_some() || w.active.stroke.is_some(),
             stroke_max,
             shadow,
@@ -1603,9 +1630,6 @@ pub struct Draw<'a> {
 /// least number of rows allows.
 fn break_rows(w: &[f64], sp: f64, avail: f64) -> Vec<Range<usize>> {
     let n = w.len();
-    let width = |r: Range<usize>| -> f64 {
-        r.clone().map(|i| w[i]).sum::<f64>() + sp * (r.len().saturating_sub(1)) as f64
-    };
     // Greedy for the row count.
     let mut rows = 1;
     let mut cur = 0.0;
@@ -1621,9 +1645,25 @@ fn break_rows(w: &[f64], sp: f64, avail: f64) -> Vec<Range<usize>> {
     if rows == 1 || n < 2 {
         return std::iter::once(0..n).collect();
     }
-    let rows = rows.min(n);
-    // Try every set of breaks with that many rows; narrowest widest row wins,
-    // then the wider top row.
+    balanced_rows(w, sp, rows.min(n), avail)
+}
+
+/// Break a line's words into exactly `rows` rows: the narrowest widest row
+/// wins (rows wider than `avail` only when nothing fits), then the wider top row.
+fn balanced_rows(w: &[f64], sp: f64, rows: usize, avail: f64) -> Vec<Range<usize>> {
+    let n = w.len();
+    let width = |r: Range<usize>| -> f64 {
+        r.clone().map(|i| w[i]).sum::<f64>() + sp * (r.len().saturating_sub(1)) as f64
+    };
+    let rows = rows.clamp(1, n.max(1));
+    if rows == 1 || n < 2 {
+        return std::iter::once(0..n).collect();
+    }
+    if n > 22 {
+        // Far more words than any caption or headline has: an even split.
+        let cuts: Vec<usize> = (0..=rows).map(|i| i * n / rows).collect();
+        return cuts.windows(2).map(|c| c[0]..c[1]).collect();
+    }
     let mut best: Option<(f64, Vec<usize>)> = None;
     for mask in 0u32..(1 << (n - 1)) {
         if mask.count_ones() as usize != rows - 1 {
@@ -1708,7 +1748,7 @@ fn glow_default(fill: Col) -> Col {
 /// One state's glow: the layers of the Look over each other (a layer's unset
 /// fields keep the one below), the defaults under all of them. No layer, no
 /// glow.
-fn resolve_glow(layers: &[Option<&GlowLook>], fill: Col, k: f64) -> Glow {
+pub fn resolve_glow(layers: &[Option<&GlowLook>], fill: Col, k: f64) -> Glow {
     if layers.iter().all(|l| l.is_none()) {
         return Glow {
             col: fill,
@@ -1842,7 +1882,6 @@ struct Row {
 }
 
 /// The ASS events (box, shadow, glow and word, all lines) for the word-level model.
-#[allow(clippy::too_many_arguments)]
 pub fn events(
     cfg: &Cfg,
     geo: &Geo,
@@ -1850,6 +1889,21 @@ pub fn events(
     lines: &[Vec<Word>],
     spans: &[(f64, f64)],
     offset: f64,
+) -> String {
+    events_with(cfg, geo, draw, lines, spans, offset, None)
+}
+
+/// [`events`], with the keyword words of the first line given (the headline
+/// picks its accent word itself) instead of found by the caption rules.
+#[allow(clippy::too_many_arguments)]
+fn events_with(
+    cfg: &Cfg,
+    geo: &Geo,
+    draw: &Draw,
+    lines: &[Vec<Word>],
+    spans: &[(f64, f64)],
+    offset: f64,
+    first_line_keywords: Option<&[bool]>,
 ) -> String {
     let Some(face) = metrics::face(geo.font) else {
         return String::new();
@@ -1871,13 +1925,18 @@ pub fn events(
     let tilt = cfg.rotate;
     let mut out = String::new();
     let mut fresh = true;
-    for (line, &(t0, t1)) in lines.iter().zip(spans) {
+    for (li, (line, &(t0, t1))) in lines.iter().zip(spans).enumerate() {
         let (l0, l1) = ((t0 - offset) * 1000.0, (t1 - offset) * 1000.0);
         let mut ws: Vec<W> = Vec::new();
         let mut kw_flags = Vec::new();
         for w in line {
             kw_flags.push(is_keyword(&w.w, fresh));
             fresh = ends_sentence(&w.w);
+        }
+        if let (0, Some(kw)) = (li, first_line_keywords) {
+            if kw.len() == kw_flags.len() {
+                kw_flags = kw.to_vec();
+            }
         }
         for (w, kw) in line.iter().zip(&kw_flags) {
             let text = if draw.caps {
@@ -1905,6 +1964,8 @@ pub fn events(
         let one_row = single || cfg.max_lines == Some(1);
         let rows: Vec<Range<usize>> = if one_row {
             std::iter::once(0..ws.len()).collect()
+        } else if let Some(n) = cfg.force_rows {
+            balanced_rows(&slot, sp, n, avail)
         } else {
             break_rows(&slot, sp, avail)
         };
@@ -2173,6 +2234,52 @@ pub fn events(
                         .render(),
                     );
                 }
+            } else if bx.block {
+                // One card around every row: from the left-most ink to the
+                // right-most, from the top of the first row's ink to the bottom
+                // of the last row's.
+                let joined = |r: &Range<usize>| {
+                    r.clone()
+                        .map(|i| ws[i].text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let (mut l, mut rr) = (f64::INFINITY, f64::NEG_INFINITY);
+                for row in &row_info {
+                    let (first, last) = (row.words.start, row.words.end - 1);
+                    let (lsb, _) = face.ink_x(&ws[first].text, size);
+                    let (_, rsb) = face.ink_x(&ws[last].text, size);
+                    l = l.min(pos[first].0 - (ws[first].width - spc) / 2.0 + lsb);
+                    rr = rr.max(pos[last].0 + (ws[last].width - spc) / 2.0 - rsb);
+                }
+                if let (Some(first), Some(last)) = (row_info.first(), row_info.last()) {
+                    let top_ink = first.cy + (asc - desc) / 2.0 - band(&joined(&first.words)).0;
+                    let bottom_ink = last.cy + (asc - desc) / 2.0 - band(&joined(&last.words)).1;
+                    let w = (rr - l) + 2.0 * (bx.pad_x + cfg.stroke_max);
+                    let h = (bottom_ink - top_ink) + 2.0 * (bx.pad_y + cfg.stroke_max);
+                    out.push_str(
+                        &Item {
+                            role: Role::Box {
+                                col: bx.col,
+                                opacity: bx.opacity,
+                                src: BoxSrc::Line,
+                            },
+                            layer: LAYER_BOX,
+                            tilt,
+                            ..Item::plain(
+                                draw.text_style,
+                                drawn_box(w, h, bx.radius),
+                                (l0, l1),
+                                rotp(((l + rr) / 2.0, (top_ink + bottom_ink) / 2.0)),
+                                centre,
+                                line_win(l0, l1),
+                                None,
+                                size,
+                            )
+                        }
+                        .render(),
+                    );
+                }
             } else {
                 for row in &row_info {
                     let r = &row.words;
@@ -2395,6 +2502,206 @@ pub fn events(
     out
 }
 
+// ---- the headline ----------------------------------------------------------------
+
+/// The headline's layers sit above the captions': box, shadow, glow, text.
+pub const HEADLINE_LAYER: u8 = 10;
+
+/// How many rows a headline of these words takes, and how wide the block may
+/// be: `avail` px first, then up to `safe` px when that is what it takes to stay
+/// in `max_rows`. A text that needs more rows even at `safe` is `None`. Text
+/// that is `min_rows` long or short is spread over at least that many rows
+/// (never more words than rows). Widths are the font's advances (with
+/// `spacing` px after every character).
+pub fn headline_rows(
+    font: &str,
+    size: f64,
+    spacing: f64,
+    words: &[String],
+    (avail, safe): (f64, f64),
+    (min_rows, max_rows): (usize, usize),
+) -> Option<(usize, f64)> {
+    let face = metrics::face(font)?;
+    let sp = face.width(" ", size) + spacing;
+    let w: Vec<f64> = words
+        .iter()
+        .map(|t| face.width(t, size) + t.chars().count() as f64 * spacing)
+        .collect();
+    for room in [avail, safe.max(avail)] {
+        let r = break_rows(&w, sp, room).len();
+        if r <= max_rows {
+            let rows = r.max(min_rows).min(max_rows).min(words.len().max(1));
+            return Some((rows, room));
+        }
+    }
+    None
+}
+
+/// Where the headline's block goes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HeadlineY {
+    /// The card's top edge, in px.
+    Top(f64),
+    /// The middle of the card, in px.
+    Centre(f64),
+}
+
+/// A headline to draw with the word-level machinery.
+pub struct HeadlineDraw<'a> {
+    /// Entrance, exit, stroke, shadow, glow, card, spacing, alignment: as
+    /// resolved from the Look (`Cfg::resolve`).
+    pub cfg: Cfg,
+    pub pw: u32,
+    pub ph: u32,
+    pub font: &'static str,
+    pub font_px: u32,
+    /// The ASS style the events use.
+    pub text_style: &'a str,
+    /// The words as drawn (the case is already applied).
+    pub words: Vec<String>,
+    /// The word in the accent colour.
+    pub accent: Option<usize>,
+    /// Rows of text (from [`headline_rows`]) and the room for the block (px).
+    pub rows: usize,
+    pub avail: f64,
+    /// Where the block is centred horizontally (px), and vertically.
+    pub cx: f64,
+    pub y: HeadlineY,
+    /// On screen from `start` to `end`, seconds on the clip clock.
+    pub start: f64,
+    pub end: f64,
+    /// The card keeps this far from the frame's edges (px).
+    pub margin: f64,
+}
+
+/// The ASS events of a headline: card, shadow, glow and text, on the layers
+/// [`HEADLINE_LAYER`] and up. The headline is one line of words that are all
+/// on screen from `start` to `end`, laid out in `rows` rows, with the line's
+/// entrance and exit; the accent word is the line's one keyword.
+pub fn headline_events(h: &HeadlineDraw) -> String {
+    let Some(face) = metrics::face(h.font) else {
+        return String::new();
+    };
+    if h.words.is_empty() || h.end - h.start < 0.02 {
+        return String::new();
+    }
+    let size = h.font_px as f64;
+    let mut cfg = h.cfg.clone();
+    let spc = cfg.spacing;
+    let sp = face.width(" ", size) + spc;
+    let (asc, desc) = face.line_box(size);
+    let pitch = size * cfg.line_gap;
+    let widths: Vec<f64> = h
+        .words
+        .iter()
+        .map(|t| face.width(t, size) + t.chars().count() as f64 * spc)
+        .collect();
+    // The room the block gets, as the events will see it.
+    let margin_x = ((h.pw as f64 - h.avail) / 2.0).round().max(0.0);
+    let avail = (h.pw as f64 - 2.0 * margin_x).max(40.0);
+    let rows = if h.rows <= 1 {
+        std::iter::once(0..widths.len()).collect::<Vec<_>>()
+    } else {
+        balanced_rows(&widths, sp, h.rows, avail)
+    };
+    cfg.max_lines = (rows.len() == 1).then_some(1);
+    cfg.force_rows = (rows.len() > 1).then_some(rows.len());
+    if let Some(b) = cfg.boxfx.as_mut() {
+        b.block = true;
+    }
+    // The block and its card.
+    let text_of = |r: &Range<usize>| {
+        r.clone()
+            .map(|i| h.words[i].as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let ink = |t: &str| face.ink_y(t, size).unwrap_or((0.72 * size, 0.0));
+    let block_w = rows
+        .iter()
+        .map(|r| r.clone().map(|i| widths[i]).sum::<f64>() + sp * r.len().saturating_sub(1) as f64)
+        .fold(0.0, f64::max);
+    let nrows = rows.len();
+    let top_ink =
+        size / 2.0 + (asc - desc) / 2.0 - rows.first().map_or(0.0, |r| ink(&text_of(r)).0);
+    let bottom_ink = size / 2.0 + (nrows - 1) as f64 * pitch + (asc - desc) / 2.0
+        - rows.last().map_or(0.0, |r| ink(&text_of(r)).1);
+    let (pad_x, pad_y) = cfg
+        .boxfx
+        .as_ref()
+        .map_or((0.0, 0.0), |b| (b.pad_x, b.pad_y));
+    let (ex, ey) = (pad_x + cfg.stroke_max, pad_y + cfg.stroke_max);
+    let card_h = (bottom_ink - top_ink) + 2.0 * ey;
+    let block_h = (nrows - 1) as f64 * pitch + size;
+    // `top` is the top of the block's first line box; the card's top edge is
+    // `top_ink - ey` below it.
+    let mut top = match h.y {
+        HeadlineY::Top(t) => t - (top_ink - ey),
+        HeadlineY::Centre(c) => c - (top_ink + bottom_ink) / 2.0,
+    };
+    // The whole card inside the frame (the top wins when it cannot be).
+    let over = top + top_ink - ey + card_h - (h.ph as f64 - h.margin);
+    if over > 0.0 {
+        top -= over;
+    }
+    let under = h.margin - (top + top_ink - ey);
+    if under > 0.0 {
+        top += under;
+    }
+    let half = (block_w / 2.0 + ex)
+        .min(h.pw as f64 / 2.0 - h.margin)
+        .max(0.0);
+    let px = h.cx.clamp(half + h.margin, h.pw as f64 - half - h.margin);
+    let geo = Geo {
+        pw: h.pw,
+        ph: h.ph,
+        k: cfg.k,
+        alignment: 5,
+        margin_v: 0,
+        cap_l: margin_x as u32,
+        cap_r: margin_x as u32,
+        place: Some((px.round() as i64, (top + block_h / 2.0).round() as i64)),
+        font: h.font,
+        font_px: h.font_px,
+    };
+    let draw = Draw {
+        text_style: h.text_style,
+        box_style: None,
+        caps: false,
+    };
+    let line: Vec<Word> = h
+        .words
+        .iter()
+        .map(|t| Word {
+            w: t.clone(),
+            s: h.start,
+            e: h.end,
+            conf: None,
+        })
+        .collect();
+    let kw: Vec<bool> = (0..line.len()).map(|i| Some(i) == h.accent).collect();
+    let text = events_with(
+        &cfg,
+        &geo,
+        &draw,
+        &[line],
+        &[(h.start, h.end)],
+        0.0,
+        Some(&kw),
+    );
+    // Above the captions: every event's layer moves up.
+    text.lines()
+        .map(|l| match l.strip_prefix("Dialogue: ") {
+            Some(rest) => {
+                let (n, tail) = rest.split_once(',').unwrap_or((rest, ""));
+                let n: u8 = n.parse().unwrap_or(0);
+                format!("Dialogue: {},{tail}\n", n + HEADLINE_LAYER)
+            }
+            None => format!("{l}\n"),
+        })
+        .collect()
+}
+
 /// Can a row's shadow and glow be written once for the whole row? Only when
 /// the words are all on show together.
 fn single_free(cfg: &Cfg, single: bool) -> bool {
@@ -2510,5 +2817,98 @@ mod tests {
         assert_eq!(break_rows(&[100.0, 100.0], 20.0, 700.0), vec![0..2]);
         // A word wider than the room still gets a row of its own.
         assert_eq!(break_rows(&[900.0, 100.0], 20.0, 700.0), vec![0..1, 1..2]);
+    }
+
+    // ---- the headline's rows --------------------------------------------------
+
+    #[test]
+    fn balanced_rows_cover_the_words_and_keep_the_widest_row_narrow() {
+        let w = [100.0, 80.0, 120.0, 60.0, 90.0, 70.0];
+        // One row is everything.
+        assert_eq!(balanced_rows(&w, 10.0, 1, 1000.0), vec![0..6]);
+        for rows in 2..=4 {
+            let r = balanced_rows(&w, 10.0, rows, 1000.0);
+            assert_eq!(r.len(), rows);
+            assert_eq!(r[0].start, 0);
+            assert_eq!(r.last().unwrap().end, 6);
+            assert!(r.windows(2).all(|p| p[0].end == p[1].start));
+            // No row is empty.
+            assert!(r.iter().all(|x| !x.is_empty()));
+        }
+        // Two rows: the split that makes the widest row narrowest.
+        let width =
+            |r: &Range<usize>| r.clone().map(|i| w[i]).sum::<f64>() + 10.0 * (r.len() - 1) as f64;
+        let two = balanced_rows(&w, 10.0, 2, 1000.0);
+        let widest = two.iter().map(width).fold(0.0, f64::max);
+        for cut in 1..6 {
+            let alt = [0..cut, cut..6];
+            assert!(widest <= alt.iter().map(width).fold(0.0, f64::max) + 0.5);
+        }
+        // More rows than words: one word per row.
+        let many = balanced_rows(&w[..3], 10.0, 5, 1000.0);
+        assert_eq!(many, vec![0..1, 1..2, 2..3]);
+        // A long line is split evenly instead of searched.
+        let long = vec![10.0; 30];
+        let r = balanced_rows(&long, 5.0, 3, 1000.0);
+        assert_eq!(r, vec![0..10, 10..20, 20..30]);
+        // No words: nothing to break.
+        assert_eq!(balanced_rows(&[], 5.0, 2, 100.0), vec![0..0]);
+    }
+
+    #[test]
+    fn headline_rows_widen_the_block_before_giving_up() {
+        let words = |t: &str| -> Vec<String> { t.split(' ').map(String::from).collect() };
+        let long = words("Why most founders quit too early and what to do");
+        let arch = "Archivo Black";
+        // Plenty of room: as many rows as the width needs, at least the minimum.
+        assert_eq!(
+            headline_rows(arch, 64.0, 0.0, &long, (1008.0, 1008.0), (1, 3)),
+            Some((2, 1008.0))
+        );
+        assert_eq!(
+            headline_rows(arch, 64.0, 0.0, &long, (540.0, 1008.0), (1, 3)),
+            Some((3, 540.0))
+        );
+        // Too narrow for three rows: the block widens to what is safe.
+        assert_eq!(
+            headline_rows(arch, 64.0, 0.0, &long, (300.0, 1008.0), (1, 3)),
+            Some((2, 1008.0))
+        );
+        // Not even then: it does not fit.
+        assert_eq!(
+            headline_rows(arch, 64.0, 0.0, &long, (300.0, 1008.0), (1, 1)),
+            None
+        );
+        assert_eq!(
+            headline_rows(arch, 64.0, 0.0, &long, (1008.0, 1008.0), (1, 1)),
+            None
+        );
+        // A short text can be spread over two rows, but never over more rows than words.
+        let short = words("Big news");
+        assert_eq!(
+            headline_rows(arch, 64.0, 0.0, &short, (1008.0, 1008.0), (1, 3)),
+            Some((1, 1008.0))
+        );
+        assert_eq!(
+            headline_rows(arch, 64.0, 0.0, &short, (1008.0, 1008.0), (2, 3)),
+            Some((2, 1008.0))
+        );
+        assert_eq!(
+            headline_rows(arch, 64.0, 0.0, &words("Big"), (1008.0, 1008.0), (2, 3)),
+            Some((1, 1008.0))
+        );
+        // Letter spacing makes words wider.
+        let tight = headline_rows(arch, 64.0, 0.0, &long, (1008.0, 1008.0), (1, 3))
+            .unwrap()
+            .0;
+        let loose = headline_rows(arch, 64.0, 12.0, &long, (1008.0, 1008.0), (1, 3))
+            .unwrap()
+            .0;
+        assert!(loose >= tight);
+        // A font with no metrics cannot be laid out.
+        assert_eq!(
+            headline_rows("Comic Sans", 64.0, 0.0, &long, (1008.0, 1008.0), (1, 3)),
+            None
+        );
     }
 }
