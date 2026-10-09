@@ -27,7 +27,7 @@ use std::ops::Range;
 use super::ass::{ends_sentence, is_keyword, Anim};
 use super::metrics;
 use crate::look::{
-    Align, CaptionsLook, Ease, EnterKind, ExitKind, Fill, GlowLook, Rgb, WordMode, WordState,
+    Align, CaptionsLook, Ease, EnterKind, ExitKind, Fill, GlowLook, Rgba, WordMode, WordState,
 };
 use crate::whisper::Word;
 
@@ -125,27 +125,42 @@ fn nacc(v: f64) -> String {
     }
 }
 
-type Col = [f64; 3];
+/// A colour as red, green, blue (0..255) and opacity (0..255, 255 opaque).
+/// Only the text's own fill and stroke keep their opacity here; shadows, glows
+/// and boxes fold it into their strength / opacity when they are resolved.
+type Col = [f64; 4];
 
 const NO_GLOW: Glow = Glow {
-    col: [255.0; 3],
+    col: [255.0; 4],
     size: 0.0,
     strength: 0.0,
 };
 
-fn col_of(c: Rgb) -> Col {
-    [c.0 as f64, c.1 as f64, c.2 as f64]
+fn col_of(c: Rgba) -> Col {
+    [c.0 as f64, c.1 as f64, c.2 as f64, c.3 as f64]
 }
 
-/// `&HAABBGGRR` as a colour (alpha dropped).
+/// The same colour, opaque.
+fn solid(c: Col) -> Col {
+    [c[0], c[1], c[2], 255.0]
+}
+
+/// `&HAABBGGRR` as a colour; the ASS alpha byte (00 opaque) becomes the
+/// colour's opacity.
 pub fn col_of_ass(s: &str) -> Col {
     let h = s.trim_start_matches("&H").trim_end_matches('&');
-    let h = if h.len() > 6 { &h[h.len() - 6..] } else { h };
+    let (a, h) = if h.len() > 6 {
+        let (a, rest) = h.split_at(h.len() - 6);
+        (u32::from_str_radix(a, 16).unwrap_or(0).min(255), rest)
+    } else {
+        (0, h)
+    };
     let v = u32::from_str_radix(h, 16).unwrap_or(0xFFFFFF);
     [
         (v & 0xFF) as f64,
         ((v >> 8) & 0xFF) as f64,
         ((v >> 16) & 0xFF) as f64,
+        (255 - a) as f64,
     ]
 }
 
@@ -296,6 +311,14 @@ pub struct Cfg {
     pub k: f64,
     /// Does anything draw under the text (so the text moves up to its layer)?
     pub decor: bool,
+    /// Opacity of the whole element (0..1): it multiplies into the line's alpha,
+    /// so into every part of every word.
+    pub opacity: f64,
+    /// Is any alpha other than the word's own in play (an element opacity below
+    /// 1, or a fill or stroke colour that is not opaque)? Then each text event
+    /// says its fill, stroke and shadow alpha apart (`\1a`, `\3a`, `\4a`)
+    /// instead of one `\alpha`.
+    pub parts: bool,
 }
 
 /// What a v1 `anim` stands for: reveal mode, entrance and exit.
@@ -420,13 +443,15 @@ pub fn merge_motion(
 /// A shadow object with its defaults (black, x 0, y 4, blur 4, opacity 0.6)
 /// filled in; lengths scaled from the 1080-wide design by `k`. The headline and
 /// the logo read their shadow through this too.
+/// The colour's own alpha multiplies into `opacity`.
 pub fn shadow_from(s: &crate::look::ShadowLook, k: f64) -> Shadow {
+    let col = s.color.map_or([0.0, 0.0, 0.0, 255.0], col_of);
     Shadow {
-        col: s.color.map_or([0.0; 3], col_of),
+        col: solid(col),
         x: s.x.unwrap_or(0.0) * k,
         y: s.y.unwrap_or(SHADOW_Y) * k,
         blur: s.blur.unwrap_or(SHADOW_BLUR) * k,
-        opacity: s.opacity.unwrap_or(SHADOW_OPACITY),
+        opacity: s.opacity.unwrap_or(SHADOW_OPACITY) * col[3] / 255.0,
     }
 }
 
@@ -471,17 +496,27 @@ impl Cfg {
             };
         }
         // Boxes: the caption's (one per line or per word), and the spoken word's.
-        let boxfx = cap.box_fx.as_ref().map(|b| BoxSpec {
-            col: b.color.map(col_of).or(base.box_col).unwrap_or([0.0; 3]),
-            opacity: b.opacity.unwrap_or(base.box_opacity),
-            pad_x: b.pad_x.unwrap_or(BOX_PAD_X) * k,
-            pad_y: b.pad_y.unwrap_or(BOX_PAD_Y) * k,
-            radius: b.radius.unwrap_or(0.0),
-            per_word: b.per == Some(crate::look::BoxPer::Word),
-            block: false,
+        // A box colour's own alpha multiplies into the box's opacity.
+        let boxfx = cap.box_fx.as_ref().map(|b| {
+            let col = b
+                .color
+                .map(col_of)
+                .or(base.box_col)
+                .unwrap_or([0.0, 0.0, 0.0, 255.0]);
+            BoxSpec {
+                col: solid(col),
+                opacity: b.opacity.unwrap_or(base.box_opacity) * col[3] / 255.0,
+                pad_x: b.pad_x.unwrap_or(BOX_PAD_X) * k,
+                pad_y: b.pad_y.unwrap_or(BOX_PAD_Y) * k,
+                radius: b.radius.unwrap_or(0.0),
+                per_word: b.per == Some(crate::look::BoxPer::Word),
+                block: false,
+            }
         });
+        let abox_col =
+            |b: &crate::look::ActiveBoxLook| b.color.map(col_of).or(base.box_col).unwrap_or(accent);
         let abox = w.active.box_.as_ref().map(|b| ABox {
-            col: b.color.map(col_of).or(base.box_col).unwrap_or(accent),
+            col: solid(abox_col(b)),
             radius: b
                 .radius
                 .unwrap_or_else(|| boxfx.as_ref().map_or(0.0, |x| x.radius)),
@@ -489,7 +524,7 @@ impl Cfg {
             pad_y: boxfx.as_ref().map_or(BOX_PAD_Y * k, |x| x.pad_y),
         });
         if let Some(b) = &w.active.box_ {
-            act.abox = b.opacity.unwrap_or(1.0);
+            act.abox = b.opacity.unwrap_or(1.0) * abox_col(b)[3] / 255.0;
         }
         let shadow = cap.shadow_fx.as_ref().map(|s| shadow_from(s, k));
         let stroke_max = [up, act, spk]
@@ -502,6 +537,15 @@ impl Cfg {
             || cap.glow.is_some()
             || w.active.glow.is_some()
             || w.keyword.glow.is_some();
+        let opacity = cap.opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        let kw_color = w.keyword.color.map_or(accent, col_of);
+        let see_through = |c: &Col| c[3] < 255.0;
+        let parts = opacity < 1.0
+            || [up, act, spk]
+                .iter()
+                .any(|l| see_through(&l.color) || see_through(&l.stroke.col))
+            || see_through(&kw_color)
+            || see_through(&base.stroke.col);
         Cfg {
             spacing: cap.spacing.unwrap_or(0.0) * base.font_px,
             line_gap: cap.line_gap.unwrap_or(1.0),
@@ -525,7 +569,9 @@ impl Cfg {
             act,
             spk,
             spk_color_set: w.spoken.color.is_some(),
-            kw_color: w.keyword.color.map_or(accent, col_of),
+            kw_color,
+            opacity,
+            parts,
             kw_scale: w.keyword.scale,
             attack: w
                 .attack_ms
@@ -644,6 +690,9 @@ struct LineWin {
     enter: Enter,
     exit: Exit,
     reach: Reach,
+    /// The element's opacity: a factor of the line's alpha for as long as the
+    /// line is up (it multiplies the entrance and exit fades).
+    opacity: f64,
 }
 
 const POP_KEYS: &[(f64, f64)] = &[(0.0, 0.84), (0.55, 1.05), (1.0, 1.0)];
@@ -751,7 +800,7 @@ impl LineWin {
             sc: a.sc * b.sc,
             dx: a.dx + b.dx,
             dy: a.dy + b.dy,
-            alpha: a.alpha * b.alpha,
+            alpha: a.alpha * b.alpha * self.opacity,
             blur: a.blur + b.blur,
         }
     }
@@ -785,7 +834,7 @@ impl LineWin {
 struct WordFx {
     s: f64,
     e: f64,
-    col: Track<3>,
+    col: Track<4>,
     op: Track<1>,
     sc: Track<1>,
     blur: Track<1>,
@@ -794,10 +843,10 @@ struct WordFx {
     /// Stroke width and colour, glow size / strength / colour, opacity of the
     /// box behind the word.
     sw: Track<1>,
-    scol: Track<3>,
+    scol: Track<4>,
     gs: Track<1>,
     gk: Track<1>,
-    gcol: Track<3>,
+    gcol: Track<4>,
     bo: Track<1>,
     bump: bool,
     /// The unswept colour, when the word is filled by a sweep.
@@ -827,7 +876,7 @@ impl WordFx {
         ]
     }
 
-    fn colours(&self) -> [&Track<3>; 3] {
+    fn colours(&self) -> [&Track<4>; 3] {
         [&self.col, &self.scol, &self.gcol]
     }
 
@@ -909,6 +958,11 @@ struct Item {
     tilt: f64,
     /// Say the stroke on every event (the Look sets one).
     stroke_tags: bool,
+    /// Say the fill, stroke and shadow alpha apart (`Cfg::parts`).
+    parts: bool,
+    /// The alpha byte of the style's shadow (BackColour), when the text's style
+    /// row casts one: it takes the word's alpha like the fill does.
+    back: Option<u8>,
 }
 
 impl Item {
@@ -941,6 +995,8 @@ impl Item {
             shift: (0.0, 0.0),
             tilt: 0.0,
             stroke_tags: false,
+            parts: false,
+            back: None,
         }
     }
 }
@@ -985,7 +1041,7 @@ impl Item {
                 w.bo.eval(t)[0],
             ),
             None => (
-                [0.0; 3], 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, [0.0; 3], 0.0, 0.0, [0.0; 3], 0.0,
+                [0.0; 4], 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, [0.0; 4], 0.0, 0.0, [0.0; 4], 0.0,
             ),
         };
         let (cx, cy) = self.centre;
@@ -1037,6 +1093,25 @@ impl Item {
                         if let Some(sh) = b.shadow {
                             let a = 255.0 - ((255.0 - sh as f64) * f.alpha).round();
                             s.push_str(&format!("\\4a&H{:02X}&", a.clamp(0.0, 255.0) as u8));
+                        }
+                        s
+                    }
+                    None if self.parts => {
+                        // Each part its own: fill, (sweep) unswept fill, stroke
+                        // and the style's shadow, every one the part's colour
+                        // alpha times the word's alpha (which holds the line's
+                        // fades and the element's opacity).
+                        let part = |tag: &str, own: f64| {
+                            format!("\\{tag}&H{:02X}&", alpha_byte(own / 255.0 * f.alpha))
+                        };
+                        let fill_a = colour.map_or(f.col[3], |c| c[3]);
+                        let mut s = part("1a", fill_a);
+                        if let Some(u) = self.word.as_ref().and_then(|w| w.sweep) {
+                            s.push_str(&part("2a", u[3]));
+                        }
+                        s.push_str(&part("3a", f.scol[3]));
+                        if let Some(b) = self.back {
+                            s.push_str(&part("4a", 255.0 - b as f64));
                         }
                         s
                     }
@@ -1201,6 +1276,16 @@ impl Item {
         if !self.line_steady(a, b) {
             return None;
         }
+        if self.parts {
+            // A part's alpha is its colour's alpha times the word's: two ramps
+            // over the same stretch multiply into a curve, not a straight tag.
+            let over = |s: &Seg<4>| s.t0 < b && s.t1 > a && (s.from[3] - s.to[3]).abs() > 1e-9;
+            let colour_alpha = [&w.col, &w.scol].iter().any(|t| t.segs.iter().any(over));
+            let word_alpha = w.op.segs.iter().any(|s| s.t0 < b && s.t1 > a);
+            if colour_alpha && word_alpha {
+                return None;
+            }
+        }
         let mut found = None;
         let mut hit = |s: &Seg<1>| {
             if near(s.t0, a, 5.0) && near(s.t1, b, 5.0) {
@@ -1240,8 +1325,8 @@ impl Item {
                 && near(f.gs, lerp(f0.gs, f1.gs), 0.3)
                 && near(f.gk, lerp(f0.gk, f1.gk), 0.01)
                 && near(f.bo, lerp(f0.bo, f1.bo), 0.01)
-                && (0..3).all(|i| near(f.col[i], lerp(f0.col[i], f1.col[i]), 1.5))
-                && (0..3).all(|i| near(f.scol[i], lerp(f0.scol[i], f1.scol[i]), 1.5))
+                && (0..4).all(|i| near(f.col[i], lerp(f0.col[i], f1.col[i]), 1.5))
+                && (0..4).all(|i| near(f.scol[i], lerp(f0.scol[i], f1.scol[i]), 1.5))
                 && (0..3).all(|i| near(f.gcol[i], lerp(f0.gcol[i], f1.gcol[i]), 1.5))
         })
     }
@@ -1547,6 +1632,7 @@ impl Item {
                 f.col[0],
                 f.col[1],
                 f.col[2],
+                f.col[3],
                 f.sw,
                 f.gs,
                 f.gk,
@@ -1554,6 +1640,7 @@ impl Item {
                 f.scol[0],
                 f.scol[1],
                 f.scol[2],
+                f.scol[3],
                 f.gcol[0],
                 f.gcol[1],
                 f.gcol[2],
@@ -1623,6 +1710,8 @@ pub struct Draw<'a> {
     /// Set when the style has a box: its style name, the box's alpha byte in
     /// the outline slot and the shadow's alpha when it casts one.
     pub box_style: Option<(&'a str, u8, Option<u8>)>,
+    /// Set when the text's own style row casts a shadow: that shadow's alpha byte.
+    pub text_back: Option<u8>,
     pub caps: bool,
 }
 
@@ -1739,9 +1828,9 @@ fn rounded_box(w: f64, h: f64, r: f64) -> String {
 fn glow_default(fill: Col) -> Col {
     let luma = 0.2126 * fill[0] + 0.7152 * fill[1] + 0.0722 * fill[2];
     if luma < 70.0 {
-        [255.0; 3]
+        [255.0; 4]
     } else {
-        fill
+        solid(fill)
     }
 }
 
@@ -1751,21 +1840,25 @@ fn glow_default(fill: Col) -> Col {
 pub fn resolve_glow(layers: &[Option<&GlowLook>], fill: Col, k: f64) -> Glow {
     if layers.iter().all(|l| l.is_none()) {
         return Glow {
-            col: fill,
+            col: solid(fill),
             ..NO_GLOW
         };
     }
     let pick =
         |f: &dyn Fn(&GlowLook) -> Option<f64>| layers.iter().flatten().rev().find_map(|g| f(g));
+    // The glow's colour: the top-most layer's own, else the letters' (their
+    // RGB; the letters' alpha is theirs). The colour's own alpha multiplies
+    // into the strength.
+    let col = layers
+        .iter()
+        .flatten()
+        .rev()
+        .find_map(|g| g.color)
+        .map_or_else(|| glow_default(fill), col_of);
     Glow {
-        col: layers
-            .iter()
-            .flatten()
-            .rev()
-            .find_map(|g| g.color)
-            .map_or_else(|| glow_default(fill), col_of),
+        col: solid(col),
         size: pick(&|g| g.size).unwrap_or(GLOW_SIZE) * k,
-        strength: pick(&|g| g.strength).unwrap_or(GLOW_STRENGTH),
+        strength: pick(&|g| g.strength).unwrap_or(GLOW_STRENGTH) * col[3] / 255.0,
     }
 }
 
@@ -1908,6 +2001,9 @@ fn events_with(
     let Some(face) = metrics::face(geo.font) else {
         return String::new();
     };
+    if cfg.opacity <= 0.0 {
+        return String::new();
+    }
     let size = geo.font_px as f64;
     let spc = cfg.spacing;
     let sp = face.width(" ", size) + spc;
@@ -2088,6 +2184,7 @@ fn events_with(
             enter: cfg.enter,
             exit: cfg.exit,
             reach,
+            opacity: cfg.opacity,
         };
         // The window the word's own line motion runs on.
         let lwin = |i: usize| {
@@ -2484,6 +2581,8 @@ fn events_with(
                     anchor: (spc / 2.0, 0.0),
                     tilt,
                     stroke_tags: cfg.stroke_tags,
+                    parts: cfg.parts,
+                    back: draw.text_back,
                     ..Item::plain(
                         draw.text_style,
                         w.text.clone(),
@@ -2667,6 +2766,7 @@ pub fn headline_events(h: &HeadlineDraw) -> String {
     let draw = Draw {
         text_style: h.text_style,
         box_style: None,
+        text_back: None,
         caps: false,
     };
     let line: Vec<Word> = h
@@ -2910,5 +3010,196 @@ mod tests {
             headline_rows("Comic Sans", 64.0, 0.0, &long, (1008.0, 1008.0), (1, 3)),
             None
         );
+    }
+
+    // ---- alpha: the evaluated tracks -------------------------------------------
+
+    fn cfg_of(json: &str) -> Cfg {
+        let cap = crate::look::Look::parse(&format!(r##"{{"captions":{json}}}"##))
+            .captions
+            .unwrap();
+        Cfg::resolve(
+            &cap,
+            Anim::Static,
+            col_of_ass("&H00FFFFFF"),
+            col_of_ass("&H00FFFFFF"),
+            col_of_ass("&H0000D4FF"),
+            1.0,
+            &Base {
+                stroke: Stroke {
+                    col: [0.0, 0.0, 0.0, 255.0],
+                    w: 0.0,
+                },
+                box_col: None,
+                box_opacity: 1.0,
+                font_px: 60.0,
+            },
+        )
+    }
+
+    /// One word on screen from 0 to 2000 ms, spoken from 500 to 900 ms.
+    fn item_of(cfg: &Cfg) -> Item {
+        let w = W {
+            text: "hi".into(),
+            s: 500.0,
+            e: 900.0,
+            kw: false,
+            width: 100.0,
+        };
+        let (r0, r1) = timeline(cfg, &w);
+        let fx = word_fx(cfg, &w, word_looks(cfg, false), r0, r1, false);
+        let line = LineWin {
+            e0: 0.0,
+            x1: 2000.0,
+            enter: cfg.enter,
+            exit: cfg.exit,
+            reach: Reach {
+                v: 0.0,
+                h: 0.0,
+                drop: 0.0,
+                blur: 0.0,
+            },
+            opacity: cfg.opacity,
+        };
+        Item {
+            parts: cfg.parts,
+            ..Item::plain(
+                "S",
+                "hi".into(),
+                (0.0, 2000.0),
+                (0.0, 0.0),
+                (0.0, 0.0),
+                line,
+                Some(fx),
+                60.0,
+            )
+        }
+    }
+
+    fn close(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-6, "{a} != {b}");
+    }
+
+    #[test]
+    fn element_opacity_multiplies_the_entrance_and_exit_fades() {
+        let item = item_of(&cfg_of(
+            r#"{"opacity":0.5,"enter":{"kind":"fade","ms":200,"ease":"linear"},"exit":{"kind":"fade","ms":200}}"#,
+        ));
+        // Half way through the entrance: 0.5 of the fade, 0.5 of the element.
+        close(item.frame(100.0).alpha, 0.25);
+        close(item.frame(100.0).lalpha, 0.25);
+        // Settled: the element alone.
+        close(item.frame(1000.0).alpha, 0.5);
+        // Half way through the exit (1800..2000): 0.5 * 0.5.
+        close(item.frame(1900.0).alpha, 0.25);
+        // No element opacity: the fades are what they were.
+        let plain = item_of(&cfg_of(
+            r#"{"enter":{"kind":"fade","ms":200,"ease":"linear"},"exit":{"kind":"fade","ms":200}}"#,
+        ));
+        close(plain.frame(100.0).alpha, 0.5);
+        close(plain.frame(1000.0).alpha, 1.0);
+        // Opacity 1 is the very same number, not close to it.
+        let one = item_of(&cfg_of(
+            r#"{"opacity":1,"enter":{"kind":"fade","ms":200,"ease":"linear"}}"#,
+        ));
+        assert_eq!(one.frame(100.0).alpha, plain.frame(100.0).alpha);
+    }
+
+    #[test]
+    fn element_opacity_multiplies_the_word_state_transitions() {
+        let cfg = cfg_of(
+            r#"{"opacity":0.5,"words":{"upcoming":{"opacity":0.4},"active":{"opacity":1},
+                "attack_ms":100,"attack_ease":"linear"}}"#,
+        );
+        let item = item_of(&cfg);
+        // Upcoming: 0.4 * 0.5. Half way through the attack: 0.7 * 0.5. Active: 0.5.
+        close(item.frame(100.0).alpha, 0.2);
+        close(item.frame(550.0).alpha, 0.35);
+        close(item.frame(700.0).alpha, 0.5);
+        // The line's own alpha (what boxes follow) is the element's alone.
+        close(item.frame(550.0).lalpha, 0.5);
+    }
+
+    #[test]
+    fn colour_alpha_travels_with_the_colour_between_word_states() {
+        let cfg = cfg_of(
+            r##"{"words":{"upcoming":{"color":"#FFFFFF40"},"active":{"color":"#FFFFFFFF"},
+                "attack_ms":100,"attack_ease":"linear"}}"##,
+        );
+        assert!(cfg.parts);
+        let item = item_of(&cfg);
+        close(item.frame(100.0).col[3], 64.0);
+        close(item.frame(550.0).col[3], 64.0 + (255.0 - 64.0) / 2.0);
+        close(item.frame(700.0).col[3], 255.0);
+        // The tags: fill and stroke each their own (round((1 - a) * 255)).
+        let tag = |t: f64| {
+            let f = item.frame(t);
+            item.props(&f, Some(f.col))[3].clone()
+        };
+        assert_eq!(tag(100.0), "\\1a&HBF&\\3a&H00&");
+        assert_eq!(tag(700.0), "\\1a&H00&\\3a&H00&");
+        // The word's opacity multiplies the colour's: 0.5 * 64/255 -> 0.125.
+        let both = item_of(&cfg_of(
+            r##"{"words":{"upcoming":{"color":"#FFFFFF40","opacity":0.5}}}"##,
+        ));
+        let f = both.frame(100.0);
+        assert_eq!(both.props(&f, Some(f.col))[3], "\\1a&HDF&\\3a&H80&");
+        // Nothing see-through, no element opacity: the one \alpha of today.
+        let plain = item_of(&cfg_of(r#"{"words":{"upcoming":{"opacity":0.5}}}"#));
+        assert!(!plain.parts);
+        let f = plain.frame(100.0);
+        assert_eq!(plain.props(&f, Some(f.col))[3], "\\alpha&H80&");
+    }
+
+    #[test]
+    fn a_colours_alpha_folds_into_the_strength_of_what_it_dresses() {
+        let sh = shadow_from(
+            &crate::look::ShadowLook {
+                color: Some(Rgba(0, 0, 0, 128)),
+                opacity: Some(0.5),
+                ..Default::default()
+            },
+            1.0,
+        );
+        close(sh.opacity, 0.5 * 128.0 / 255.0);
+        assert_eq!(sh.col, [0.0, 0.0, 0.0, 255.0]);
+        let gl = resolve_glow(
+            &[Some(&GlowLook {
+                color: Some(Rgba(255, 0, 0, 51)),
+                strength: Some(1.0),
+                ..Default::default()
+            })],
+            [255.0; 4],
+            1.0,
+        );
+        close(gl.strength, 0.2);
+        // A glow that takes the letters' colour takes their RGB, opaque.
+        let gl = resolve_glow(
+            &[Some(&GlowLook {
+                strength: Some(1.0),
+                ..Default::default()
+            })],
+            [200.0, 180.0, 20.0, 64.0],
+            1.0,
+        );
+        assert_eq!(gl.col, [200.0, 180.0, 20.0, 255.0]);
+        close(gl.strength, 1.0);
+        // The box: colour alpha times the box's opacity, then the same for the
+        // spoken word's box (its track starts from there).
+        let cfg = cfg_of(
+            r##"{"box":{"color":"#10101080","opacity":0.5},
+                "words":{"active":{"box":{"color":"#FFD40040","opacity":0.5}}}}"##,
+        );
+        close(cfg.boxfx.unwrap().opacity, 0.5 * 128.0 / 255.0);
+        close(cfg.act.abox, 0.5 * 64.0 / 255.0);
+        assert_eq!(cfg.boxfx.unwrap().col[3], 255.0);
+    }
+
+    #[test]
+    fn ass_colours_keep_their_alpha_byte_as_an_opacity() {
+        assert_eq!(col_of_ass("&H00302010"), [16.0, 32.0, 48.0, 255.0]);
+        assert_eq!(col_of_ass("&H7F302010"), [16.0, 32.0, 48.0, 128.0]);
+        assert_eq!(col_of_ass("&HFF302010&"), [16.0, 32.0, 48.0, 0.0]);
+        assert_eq!(col_of_ass("&H302010&"), [16.0, 32.0, 48.0, 255.0]);
     }
 }

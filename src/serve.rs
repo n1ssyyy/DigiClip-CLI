@@ -3342,6 +3342,11 @@ mod tests {
         let a = args_for(&src, &out, &o, &s).unwrap();
         assert_eq!(a.headline.as_deref(), Some("Big news"));
         assert_eq!(a.progress_bar.as_deref(), Some("#00E5FF"));
+        // An alpha rides along: `#RRGGBBAA`.
+        o.progress_bar = Some("00e5ff80".into());
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        assert_eq!(a.progress_bar.as_deref(), Some("#00E5FF80"));
+        o.progress_bar = Some("00e5ff".into());
         // Empty = default; a bad value is a clear error, not a silent default.
         o.aspect = Some(String::new());
         o.logo_pos = Some(" ".into());
@@ -3668,6 +3673,7 @@ mod tests {
             assert!(caps.contains(&format!("look.{s}").as_str()), "{caps:?}");
         }
         assert_eq!(caps, crate::look::CAPS);
+        assert!(caps.contains(&"look.alpha"), "{caps:?}");
         assert!(caps.contains(&"preview_frame"), "{caps:?}");
     }
 

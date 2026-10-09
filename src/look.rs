@@ -12,9 +12,10 @@
 //! ```text
 //! look: { v: 1,
 //!   captions: { show, x, y, size, font, case, color, active, accent,
-//!               outline, outline_w, shadow, box, box_opacity, max_words, anim },
-//!   headline: { x, y, size, ink, card, accent, anim, seconds },
-//!   bar:      { pos, height },
+//!               outline, outline_w, shadow, box, box_opacity, max_words, anim,
+//!               opacity },
+//!   headline: { x, y, size, ink, card, accent, anim, seconds, opacity },
+//!   bar:      { pos, height, opacity },
 //!   logo:     { x, y, size, opacity },
 //!   camera:   { feel, zoom, punch },
 //!   effects:  { vignette, grade, fill_dim },
@@ -68,8 +69,79 @@
 //! ```
 //!
 //! `x`/`y` are the centre of an element as a fraction of the output frame
-//! (0..1, right and down). Sizes multiply today's size. Colours are
-//! `#RRGGBB` strings.
+//! (0..1, right and down). Sizes multiply today's size.
+//!
+//! # Alpha (capability `look.alpha`)
+//!
+//! A colour is `#RRGGBB` or `#RRGGBBAA` (`AA` = opacity, `FF` opaque, `00`
+//! clear; hex, upper or lower case; the short `#RGB` forms are not colours).
+//! A six-digit colour is opaque and renders exactly as before. Every element
+//! also takes `opacity` (0..1, default 1, clamped): `captions.opacity`,
+//! `headline.opacity`, `bar.opacity` and `logo.opacity` (the logo's own
+//! default is 0.9). Opacity 0 draws nothing; 1 changes nothing.
+//!
+//! Alpha is applied part by part and multiplied, never grouped: the opacity of
+//! a part is the product of its colour's alpha, the part's own opacity number
+//! (`box.opacity`, `card.opacity`, `bar.track_opacity`, `shadow.opacity`,
+//! `glow.strength`, `words.<state>.opacity`), whatever fades it over time
+//! (entrance, exit, word-state attack / release) and the element's `opacity`.
+//! ASS has no group opacity, so a half-transparent fill shows its own stroke,
+//! and overlapping glyph parts add up, as they do in libass.
+//!
+//! ```text
+//! ASS alpha byte of a part = round((1 - opacity) * 255)   (00 opaque, FF clear)
+//!
+//! caption / headline (word-level writer, `\1a \3a \4a` per event):
+//!   fill           color.alpha * word-state opacity * line fade * element   \1a (\2a unswept sweep fill)
+//!   stroke         stroke.color.alpha * word-state opacity * line fade * element   \3a
+//!   style shadow   the preset's own alpha * word-state opacity * fade * element    \4a
+//!   shadow object  shadow.color.alpha * shadow.opacity * word * fade * element
+//!   glow           glow.color.alpha * glow.strength * word * fade * element
+//!   box / card     color.alpha * box.opacity * fade * element (a per-word box
+//!                  also * the word's opacity; the active word's box takes
+//!                  active.box.opacity, its colour alpha and the state ramp)
+//! caption / headline (line writer: no positioned field):
+//!   the style's colours (fill, unsung fill, outline / box, shadow) carry
+//!   colour alpha * element; libass multiplies `\fad` on top of every channel
+//!   as (1 - a)(1 - fade); `words` and keywords name `\1a..\4a` themselves.
+//! progress bar (compositor, straight alpha, each layer rounded to 8 bits),
+//!   bottom to top: picture, track over the whole bar, glow, fill:
+//!   fill  = color.alpha * bar.opacity
+//!   track = track.alpha * track_opacity * bar.opacity (a bar without a track
+//!           colour: the dimmed picture, blended at bar.opacity)
+//!   glow  = glow.color.alpha * glow.strength * bar.opacity
+//! logo (ffmpeg overlay, straight alpha over the frame): the logo image keeps
+//!   its own alpha; shadow = shadow.color.alpha * shadow.opacity, glow =
+//!   glow.color.alpha * glow.strength; shadow, glow and logo are stacked with
+//!   `overlay`, and the stack as a whole is then multiplied by `logo.opacity`
+//!   (a true group, since it is a raster).
+//! ```
+//!
+//! libass combines `\fad`, `\alpha`, `\1a..\4a` and `\t` by multiplying
+//! opacities per channel (checked against the renderer: a 0.5 fill under half
+//! a fade shows 0.25); `\t` moves an alpha byte linearly. A glow whose colour
+//! is not given takes the letters' RGB, opaque (its strength is its opacity).
+//!
+//! Colours and elements, with alpha ("yes") or why not:
+//!
+//! ```text
+//! captions.color, active, accent, outline            yes (#RRGGBBAA)
+//! captions.box (string), box.color                   yes (x box.opacity, box_opacity)
+//! captions.stroke.color, shadow.color, glow.color    yes (shadow x shadow.opacity, glow x strength)
+//! captions.words.{upcoming,active,spoken,keyword}.color   yes (x words.<state>.opacity)
+//! captions.words.active.{stroke,glow,box}.color, words.keyword.glow.color   yes
+//! captions.opacity                                   the element: yes
+//! headline.ink, accent, stroke.color, shadow.color, glow.color   yes
+//! headline.card (string), card.color                 yes (x card.opacity)
+//! headline.opacity                                   the element: yes
+//! bar.color, track, glow.color, flat progress_bar    yes (track x track_opacity)
+//! bar.opacity                                        the element: yes
+//! logo.shadow.color, logo.glow.color                 yes
+//! logo.opacity                                       the element: yes (default 0.9)
+//! effects.vignette, fill_dim                         are strengths (0..1): their own opacity
+//! effects.grade                                      no: a colour treatment of the picture, no strength
+//! camera.*, layout.split, positions, sizes           no: not colours or drawn elements
+//! ```
 
 use std::path::Path;
 
@@ -97,27 +169,48 @@ pub const CAPS: &[&str] = &[
     "look.effects",
     "look.layout",
     "look.fonts",
+    "look.alpha",
     "preview_frame",
 ];
 
-/// An sRGB colour.
+/// An sRGB colour with an alpha: `#RRGGBB` (opaque) or `#RRGGBBAA` (`AA` is
+/// the opacity, `FF` opaque, `00` clear). The fourth byte is that opacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rgb(pub u8, pub u8, pub u8);
+pub struct Rgba(pub u8, pub u8, pub u8, pub u8);
 
-impl Rgb {
-    /// `#RRGGBB` (the `#` is optional); anything else is `None`.
-    pub fn parse(s: &str) -> Option<Rgb> {
+impl Rgba {
+    /// An opaque colour.
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Rgba {
+        Rgba(r, g, b, 255)
+    }
+
+    /// `#RRGGBB` or `#RRGGBBAA` (the `#` is optional); anything else
+    /// (including the short `#RGB` forms) is `None`.
+    pub fn parse(s: &str) -> Option<Rgba> {
         let h = s.trim().trim_start_matches('#');
-        if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !(h.len() == 6 || h.len() == 8) || !h.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
         let p = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
-        Some(Rgb(p(0)?, p(2)?, p(4)?))
+        let a = if h.len() == 8 { p(6)? } else { 255 };
+        Some(Rgba(p(0)?, p(2)?, p(4)?, a))
     }
 
-    /// ASS colour `&HAABBGGRR` (alpha 00 = opaque, FF = clear).
+    /// The colour's own opacity, 0..1.
+    pub fn opacity(self) -> f64 {
+        self.3 as f64 / 255.0
+    }
+
+    /// ASS colour `&HAABBGGRR` with an explicit ASS alpha byte (00 = opaque,
+    /// FF = clear); the colour's own alpha is ignored.
     pub fn ass(self, alpha: u8) -> String {
         format!("&H{alpha:02X}{:02X}{:02X}{:02X}", self.2, self.1, self.0)
+    }
+
+    /// ASS colour carrying the colour's own alpha (`#RRGGBBAA` -> alpha byte
+    /// `255 - AA`; a six-digit colour has alpha byte 00).
+    pub fn ass_own(self) -> String {
+        self.ass(255 - self.3)
     }
 }
 
@@ -136,7 +229,7 @@ pub enum BoxLook {
     /// No box (removes the one a style has).
     None,
     /// An opaque box in this colour.
-    Color(Rgb),
+    Color(Rgba),
 }
 
 /// How a value travels between two looks.
@@ -204,7 +297,7 @@ pub enum BoxPer {
 /// `outline` / `outline_w`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StrokeLook {
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// 0..12 px at a 1080-wide frame.
     pub width: Option<f64>,
 }
@@ -212,7 +305,7 @@ pub struct StrokeLook {
 /// A soft drop shadow.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ShadowLook {
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// Offset, -30..30 px at a 1080-wide frame (right / down positive).
     pub x: Option<f64>,
     pub y: Option<f64>,
@@ -225,7 +318,7 @@ pub struct ShadowLook {
 /// A soft light around the letters.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GlowLook {
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// How far the light reaches, 0..40 px at a 1080-wide frame.
     pub size: Option<f64>,
     /// 0..1.
@@ -235,7 +328,7 @@ pub struct GlowLook {
 /// A box drawn as a shape behind the line (or each word).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BoxFxLook {
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// 0..1.
     pub opacity: Option<f64>,
     /// Room between the letters and the box, 0..60 px at a 1080-wide frame.
@@ -249,7 +342,7 @@ pub struct BoxFxLook {
 /// The box behind just the spoken word.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ActiveBoxLook {
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// 0..1.
     pub opacity: Option<f64>,
     /// 0..1.
@@ -260,7 +353,7 @@ pub struct ActiveBoxLook {
 /// only reads the fields it has in the contract; the others stay `None`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WordState {
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// 0..1.
     pub opacity: Option<f64>,
     /// 0.5..1.5.
@@ -282,7 +375,7 @@ pub struct WordState {
 /// The emphasis words (the ones the engine already accents).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeywordLook {
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// 0.5..1.5.
     pub scale: Option<f64>,
     /// The emphasis words' own glow.
@@ -366,14 +459,14 @@ pub struct CaptionsLook {
     pub case: Option<Case>,
     /// Text colour (not-yet-spoken; also the spoken colour unless `active`
     /// is set).
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// Colour of the word being spoken / already spoken.
-    pub active: Option<Rgb>,
+    pub active: Option<Rgba>,
     /// Keyword colour.
-    pub accent: Option<Rgb>,
+    pub accent: Option<Rgba>,
     /// Text outline colour (ignored while a box is drawn: the box takes
     /// the outline slot).
-    pub outline: Option<Rgb>,
+    pub outline: Option<Rgba>,
     /// Outline width in px at a 1080-wide frame, 0..8 (box padding when a
     /// box is drawn).
     pub outline_w: Option<f64>,
@@ -410,9 +503,24 @@ pub struct CaptionsLook {
     pub glow: Option<GlowLook>,
     /// Box as an object (a colour or `none` is `box_`).
     pub box_fx: Option<BoxFxLook>,
+    /// Opacity of the whole caption element, 0..1 (1 unless set): fill,
+    /// stroke, shadow, glow and boxes of every word, on top of every other
+    /// alpha (colour alpha, word-state opacities, entrance and exit fades).
+    pub opacity: Option<f64>,
 }
 
 impl CaptionsLook {
+    /// Does any colour of the one-event-per-line writer (`color`, `active`,
+    /// `accent`, `outline`, a `box` colour) have an alpha below opaque?
+    pub fn has_alpha(&self) -> bool {
+        let see = |c: &Option<Rgba>| c.is_some_and(|c| c.3 < 255);
+        see(&self.color)
+            || see(&self.active)
+            || see(&self.accent)
+            || see(&self.outline)
+            || matches!(self.box_, Some(BoxLook::Color(c)) if c.3 < 255)
+    }
+
     /// Does this caption need the positioned writer (every word its own
     /// event)? It does when it has word looks, an entrance or exit, or any
     /// of the text-dressing fields. A caption without any of them goes through
@@ -457,7 +565,7 @@ pub enum AccentWord {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CardLook {
     /// White unless set.
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// 0..1 (1 unless set).
     pub opacity: Option<f64>,
     /// Room between the letters and the card, 0..80 px at a 1080-wide frame
@@ -478,10 +586,10 @@ pub struct HeadlineLook {
     pub y: Option<f64>,
     /// Type and card padding multiplier, 0.5..2.
     pub size: Option<f64>,
-    pub ink: Option<Rgb>,
+    pub ink: Option<Rgba>,
     /// Card colour, or `None` for no card (the text gets an outline).
     pub card: Option<BoxLook>,
-    pub accent: Option<Rgb>,
+    pub accent: Option<Rgba>,
     pub anim: Option<HeadlineAnim>,
     /// Seconds on screen, >= 0 (0 = the whole clip).
     pub seconds: Option<f64>,
@@ -507,6 +615,9 @@ pub struct HeadlineLook {
     pub exit: Option<ExitLook>,
     /// Seconds after the clip starts before the headline enters, 0..5.
     pub delay_s: Option<f64>,
+    /// Opacity of the whole headline, 0..1 (1 unless set): type, stroke,
+    /// shadow, glow and card, on top of every other alpha.
+    pub opacity: Option<f64>,
 }
 
 impl HeadlineLook {
@@ -549,9 +660,9 @@ pub struct BarLook {
     pub height: Option<f64>,
     /// Colour of the filled part; wins over the flat `progress_bar` colour
     /// (which still switches the bar on).
-    pub color: Option<Rgb>,
+    pub color: Option<Rgba>,
     /// Colour of the unfilled part (a dark translucent track unless set).
-    pub track: Option<Rgb>,
+    pub track: Option<Rgba>,
     /// Opacity of the track, 0..1.
     pub track_opacity: Option<f64>,
     /// Margin from the frame's left and right edges and from the edge the bar
@@ -561,6 +672,9 @@ pub struct BarLook {
     pub radius: Option<f64>,
     /// A soft halo of the fill colour around the filled part.
     pub glow: Option<GlowLook>,
+    /// Opacity of the whole bar, 0..1 (1 unless set): fill, track and glow,
+    /// on top of every other alpha.
+    pub opacity: Option<f64>,
 }
 
 impl BarLook {
@@ -755,8 +869,8 @@ fn num(o: &Obj, k: &str, lo: f64, hi: f64) -> Option<f64> {
         .map(|n| n.clamp(lo, hi))
 }
 
-fn color(o: &Obj, k: &str) -> Option<Rgb> {
-    o.get(k).and_then(Value::as_str).and_then(Rgb::parse)
+fn color(o: &Obj, k: &str) -> Option<Rgba> {
+    o.get(k).and_then(Value::as_str).and_then(Rgba::parse)
 }
 
 fn word(o: &Obj, k: &str) -> Option<String> {
@@ -786,7 +900,7 @@ fn captions(o: &Obj) -> CaptionsLook {
         box_: match o.get("box") {
             Some(Value::Null) => Some(BoxLook::None),
             Some(Value::String(s)) if s.trim().eq_ignore_ascii_case("none") => Some(BoxLook::None),
-            Some(Value::String(s)) => Rgb::parse(s).map(BoxLook::Color),
+            Some(Value::String(s)) => Rgba::parse(s).map(BoxLook::Color),
             _ => None,
         },
         shadow_fx: sect(o, "shadow")
@@ -813,6 +927,7 @@ fn captions(o: &Obj) -> CaptionsLook {
             .map(glow)
             .filter(|g| *g != GlowLook::default()),
         box_opacity: num(o, "box_opacity", 0.0, 1.0),
+        opacity: num(o, "opacity", 0.0, 1.0),
         max_words: num(o, "max_words", 1.0, 8.0).map(|n| n.round() as usize),
         anim: word(o, "anim").and_then(|a| Anim::from_name(&a)),
         words: sect(o, "words")
@@ -1032,7 +1147,7 @@ fn headline(o: &Obj) -> HeadlineLook {
         card: match o.get("card") {
             Some(Value::Null) => Some(BoxLook::None),
             Some(Value::String(s)) if s.trim().eq_ignore_ascii_case("none") => Some(BoxLook::None),
-            Some(Value::String(s)) => Rgb::parse(s).map(BoxLook::Color),
+            Some(Value::String(s)) => Rgba::parse(s).map(BoxLook::Color),
             _ => None,
         },
         accent: color(o, "accent"),
@@ -1063,6 +1178,7 @@ fn headline(o: &Obj) -> HeadlineLook {
         enter: sect(o, "enter").map(enter).and_then(nonempty),
         exit: sect(o, "exit").map(exit).and_then(nonempty),
         delay_s: num(o, "delay_s", 0.0, 5.0),
+        opacity: num(o, "opacity", 0.0, 1.0),
     }
 }
 
@@ -1080,6 +1196,7 @@ fn bar(o: &Obj) -> BarLook {
         inset: num(o, "inset", 0.0, 0.1),
         radius: num(o, "radius", 0.0, 1.0),
         glow: sect(o, "glow").map(glow).and_then(nonempty),
+        opacity: num(o, "opacity", 0.0, 1.0),
     }
 }
 
@@ -1136,13 +1253,13 @@ mod tests {
 
     #[test]
     fn colours_convert_to_ass_order() {
-        assert_eq!(Rgb::parse("#FF3B30"), Some(Rgb(255, 59, 48)));
-        assert_eq!(Rgb(255, 59, 48).ass(0), "&H00303BFF");
-        assert_eq!(Rgb(0x11, 0x22, 0x33).ass(0x80), "&H80332211");
-        assert_eq!(Rgb::parse("00e5ff"), Some(Rgb(0, 229, 255)));
-        assert_eq!(Rgb::parse("#FFF"), None);
-        assert_eq!(Rgb::parse("#GG0000"), None);
-        assert_eq!(Rgb::parse(""), None);
+        assert_eq!(Rgba::parse("#FF3B30"), Some(Rgba::rgb(255, 59, 48)));
+        assert_eq!(Rgba::rgb(255, 59, 48).ass(0), "&H00303BFF");
+        assert_eq!(Rgba::rgb(0x11, 0x22, 0x33).ass(0x80), "&H80332211");
+        assert_eq!(Rgba::parse("00e5ff"), Some(Rgba::rgb(0, 229, 255)));
+        assert_eq!(Rgba::parse("#FFF"), None);
+        assert_eq!(Rgba::parse("#GG0000"), None);
+        assert_eq!(Rgba::parse(""), None);
     }
 
     #[test]
@@ -1172,11 +1289,11 @@ mod tests {
         assert_eq!((c.x, c.y, c.size), (Some(0.0), Some(1.0), Some(2.0)));
         assert_eq!(c.font, Some("Anton"));
         assert_eq!(c.case, Some(Case::Upper));
-        assert_eq!(c.color, Some(Rgb(255, 255, 255)));
+        assert_eq!(c.color, Some(Rgba::rgb(255, 255, 255)));
         assert_eq!(c.active, None); // malformed colour = absent
-        assert_eq!(c.accent, Some(Rgb(0, 255, 0)));
+        assert_eq!(c.accent, Some(Rgba::rgb(0, 255, 0)));
         assert_eq!((c.outline_w, c.shadow), (Some(8.0), Some(0.0)));
-        assert_eq!(c.box_, Some(BoxLook::Color(Rgb(0, 0, 0))));
+        assert_eq!(c.box_, Some(BoxLook::Color(Rgba::rgb(0, 0, 0))));
         assert_eq!((c.box_opacity, c.max_words), (Some(1.0), Some(8)));
         assert_eq!(c.anim, Some(Anim::Bounce));
     }
@@ -1201,7 +1318,7 @@ mod tests {
         assert_eq!(
             w.upcoming,
             WordState {
-                color: Some(Rgb(0x10, 0x20, 0x30)),
+                color: Some(Rgba::rgb(0x10, 0x20, 0x30)),
                 opacity: Some(0.0),
                 scale: Some(1.5),
                 blur: Some(10.0),
@@ -1228,7 +1345,7 @@ mod tests {
         );
         assert_eq!(
             (w.keyword.color, w.keyword.scale),
-            (Some(Rgb(255, 0, 255)), Some(1.5))
+            (Some(Rgba::rgb(255, 0, 255)), Some(1.5))
         );
         assert_eq!(
             (
@@ -1320,7 +1437,7 @@ mod tests {
         let card = |j: &str| Look::parse(j).headline.unwrap().card;
         assert_eq!(
             card(r##"{"headline":{"card":"#111111"}}"##),
-            Some(BoxLook::Color(Rgb(0x11, 0x11, 0x11)))
+            Some(BoxLook::Color(Rgba::rgb(0x11, 0x11, 0x11)))
         );
         assert_eq!(card(r#"{"headline":{"card":null}}"#), Some(BoxLook::None));
         assert_eq!(card(r#"{"headline":{"card":"None"}}"#), Some(BoxLook::None));
@@ -1371,7 +1488,7 @@ mod tests {
         assert_eq!(
             c.stroke,
             Some(StrokeLook {
-                color: Some(Rgb(0x10, 0x20, 0x30)),
+                color: Some(Rgba::rgb(0x10, 0x20, 0x30)),
                 width: Some(12.0)
             })
         );
@@ -1436,9 +1553,12 @@ mod tests {
         )
         .captions
         .unwrap();
-        assert_eq!(c.box_, Some(BoxLook::Color(Rgb(0x10, 0x10, 0x10))));
+        assert_eq!(c.box_, Some(BoxLook::Color(Rgba::rgb(0x10, 0x10, 0x10))));
         assert_eq!((c.box_opacity, c.shadow), (Some(0.5), Some(4.0)));
-        assert_eq!((c.outline, c.outline_w), (Some(Rgb(255, 0, 0)), Some(5.0)));
+        assert_eq!(
+            (c.outline, c.outline_w),
+            (Some(Rgba::rgb(255, 0, 0)), Some(5.0))
+        );
         assert!(c.box_fx.is_none() && c.shadow_fx.is_none() && c.stroke.is_none());
         assert!(!c.positioned());
         // Objects land in their own fields and make the caption positioned.
@@ -1478,7 +1598,7 @@ mod tests {
         let b = a.box_.unwrap();
         assert_eq!(
             (b.color, b.opacity, b.radius),
-            (Some(Rgb(255, 212, 0)), Some(1.0), Some(0.0))
+            (Some(Rgba::rgb(255, 212, 0)), Some(1.0), Some(0.0))
         );
         // Only the spoken word has these.
         for s in [&w.spoken, &w.upcoming] {
@@ -1487,7 +1607,7 @@ mod tests {
         let k = w.keyword.glow.unwrap();
         assert_eq!(
             (k.color, k.size, k.strength),
-            (Some(Rgb(255, 0, 255)), Some(40.0), Some(1.0))
+            (Some(Rgba::rgb(255, 0, 255)), Some(40.0), Some(1.0))
         );
     }
 
@@ -1527,7 +1647,7 @@ mod tests {
         assert_eq!(
             h.stroke,
             Some(StrokeLook {
-                color: Some(Rgb(0x10, 0x20, 0x30)),
+                color: Some(Rgba::rgb(0x10, 0x20, 0x30)),
                 width: Some(12.0)
             })
         );
@@ -1539,7 +1659,7 @@ mod tests {
         let g = h.glow.unwrap();
         assert_eq!(
             (g.color, g.size, g.strength),
-            (Some(Rgb(255, 212, 0)), Some(40.0), Some(0.0))
+            (Some(Rgba::rgb(255, 212, 0)), Some(40.0), Some(0.0))
         );
         assert_eq!(h.accent_word, Some(AccentWord::Last));
         let e = h.enter.unwrap();
@@ -1605,7 +1725,7 @@ mod tests {
         assert_eq!(
             h.card_fx,
             Some(CardLook {
-                color: Some(Rgb(0x10, 0x20, 0x30)),
+                color: Some(Rgba::rgb(0x10, 0x20, 0x30)),
                 opacity: Some(1.0),
                 pad: Some(80.0),
                 radius: Some(0.0)
@@ -1644,7 +1764,7 @@ mod tests {
         assert_eq!((b.pos, b.height), (Some(BarPos::Top), Some(2.0)));
         assert_eq!(
             (b.color, b.track),
-            (Some(Rgb(255, 59, 48)), Some(Rgb(255, 255, 255)))
+            (Some(Rgba::rgb(255, 59, 48)), Some(Rgba::rgb(255, 255, 255)))
         );
         assert_eq!(
             (b.track_opacity, b.inset, b.radius),
@@ -1653,7 +1773,7 @@ mod tests {
         let g = b.glow.unwrap();
         assert_eq!(
             (g.color, g.size, g.strength),
-            (Some(Rgb(0, 229, 255)), Some(40.0), Some(0.5))
+            (Some(Rgba::rgb(0, 229, 255)), Some(40.0), Some(0.5))
         );
         let b = Look::parse(r#"{"bar":{"inset":-1,"track_opacity":-1,"radius":9}}"#)
             .bar
@@ -1798,5 +1918,271 @@ mod tests {
         ] {
             assert!(Look::font_notes(ok).is_empty(), "{ok}");
         }
+    }
+
+    // ---- alpha -------------------------------------------------------------
+
+    #[test]
+    fn colours_take_an_alpha() {
+        assert_eq!(Rgba::parse("#FF3B30"), Some(Rgba(255, 59, 48, 255)));
+        assert_eq!(Rgba::parse("#FF3B3080"), Some(Rgba(255, 59, 48, 128)));
+        assert_eq!(Rgba::parse("ff3b30cc"), Some(Rgba(255, 59, 48, 204)));
+        assert_eq!(Rgba::parse("#00000000"), Some(Rgba(0, 0, 0, 0)));
+        // No short forms, no odd lengths, no junk.
+        for bad in [
+            "#FFF",
+            "#FFFF",
+            "#FF3B3",
+            "#FF3B308",
+            "#FF3B30801",
+            "#GG3B3080",
+            "",
+        ] {
+            assert_eq!(Rgba::parse(bad), None, "{bad}");
+        }
+        // ASS: the alpha byte is transparency (00 opaque).
+        assert_eq!(Rgba(255, 59, 48, 255).ass_own(), "&H00303BFF");
+        assert_eq!(Rgba(255, 59, 48, 128).ass_own(), "&H7F303BFF");
+        assert_eq!(Rgba(255, 59, 48, 0).ass_own(), "&HFF303BFF");
+        assert!((Rgba(0, 0, 0, 51).opacity() - 0.2).abs() < 1e-9);
+    }
+
+    /// Every colour field of the Look: where it sits in the JSON (`%` is the
+    /// colour) and how to read it back (`None` when it is not there).
+    #[allow(clippy::type_complexity)]
+    fn colour_fields() -> Vec<(&'static str, fn(&Look) -> Option<Rgba>)> {
+        fn box_colour(b: Option<BoxLook>) -> Option<Rgba> {
+            match b? {
+                BoxLook::Color(c) => Some(c),
+                BoxLook::None => None,
+            }
+        }
+        vec![
+            (r#"{"captions":{"color":"%"}}"#, |l| {
+                l.captions.as_ref()?.color
+            }),
+            (r#"{"captions":{"active":"%"}}"#, |l| {
+                l.captions.as_ref()?.active
+            }),
+            (r#"{"captions":{"accent":"%"}}"#, |l| {
+                l.captions.as_ref()?.accent
+            }),
+            (r#"{"captions":{"outline":"%"}}"#, |l| {
+                l.captions.as_ref()?.outline
+            }),
+            (r#"{"captions":{"box":"%"}}"#, |l| {
+                box_colour(l.captions.as_ref()?.box_)
+            }),
+            (r#"{"captions":{"box":{"color":"%"}}}"#, |l| {
+                l.captions.as_ref()?.box_fx.as_ref()?.color
+            }),
+            (r#"{"captions":{"stroke":{"color":"%"}}}"#, |l| {
+                l.captions.as_ref()?.stroke.as_ref()?.color
+            }),
+            (r#"{"captions":{"shadow":{"color":"%"}}}"#, |l| {
+                l.captions.as_ref()?.shadow_fx.as_ref()?.color
+            }),
+            (r#"{"captions":{"glow":{"color":"%"}}}"#, |l| {
+                l.captions.as_ref()?.glow.as_ref()?.color
+            }),
+            (
+                r#"{"captions":{"words":{"upcoming":{"color":"%"}}}}"#,
+                |l| l.captions.as_ref()?.words.as_ref()?.upcoming.color,
+            ),
+            (r#"{"captions":{"words":{"active":{"color":"%"}}}}"#, |l| {
+                l.captions.as_ref()?.words.as_ref()?.active.color
+            }),
+            (r#"{"captions":{"words":{"spoken":{"color":"%"}}}}"#, |l| {
+                l.captions.as_ref()?.words.as_ref()?.spoken.color
+            }),
+            (r#"{"captions":{"words":{"keyword":{"color":"%"}}}}"#, |l| {
+                l.captions.as_ref()?.words.as_ref()?.keyword.color
+            }),
+            (
+                r#"{"captions":{"words":{"active":{"stroke":{"color":"%"}}}}}"#,
+                |l| {
+                    l.captions
+                        .as_ref()?
+                        .words
+                        .as_ref()?
+                        .active
+                        .stroke
+                        .as_ref()?
+                        .color
+                },
+            ),
+            (
+                r#"{"captions":{"words":{"active":{"glow":{"color":"%"}}}}}"#,
+                |l| {
+                    l.captions
+                        .as_ref()?
+                        .words
+                        .as_ref()?
+                        .active
+                        .glow
+                        .as_ref()?
+                        .color
+                },
+            ),
+            (
+                r#"{"captions":{"words":{"active":{"box":{"color":"%"}}}}}"#,
+                |l| {
+                    l.captions
+                        .as_ref()?
+                        .words
+                        .as_ref()?
+                        .active
+                        .box_
+                        .as_ref()?
+                        .color
+                },
+            ),
+            (
+                r#"{"captions":{"words":{"keyword":{"glow":{"color":"%"}}}}}"#,
+                |l| {
+                    l.captions
+                        .as_ref()?
+                        .words
+                        .as_ref()?
+                        .keyword
+                        .glow
+                        .as_ref()?
+                        .color
+                },
+            ),
+            (r#"{"headline":{"ink":"%"}}"#, |l| l.headline.as_ref()?.ink),
+            (r#"{"headline":{"accent":"%"}}"#, |l| {
+                l.headline.as_ref()?.accent
+            }),
+            (r#"{"headline":{"card":"%"}}"#, |l| {
+                box_colour(l.headline.as_ref()?.card)
+            }),
+            (r#"{"headline":{"card":{"color":"%"}}}"#, |l| {
+                l.headline.as_ref()?.card_fx.as_ref()?.color
+            }),
+            (r#"{"headline":{"stroke":{"color":"%"}}}"#, |l| {
+                l.headline.as_ref()?.stroke.as_ref()?.color
+            }),
+            (r#"{"headline":{"shadow":{"color":"%"}}}"#, |l| {
+                l.headline.as_ref()?.shadow.as_ref()?.color
+            }),
+            (r#"{"headline":{"glow":{"color":"%"}}}"#, |l| {
+                l.headline.as_ref()?.glow.as_ref()?.color
+            }),
+            (r#"{"bar":{"color":"%"}}"#, |l| l.bar.as_ref()?.color),
+            (r#"{"bar":{"track":"%"}}"#, |l| l.bar.as_ref()?.track),
+            (r#"{"bar":{"glow":{"color":"%"}}}"#, |l| {
+                l.bar.as_ref()?.glow.as_ref()?.color
+            }),
+            (r#"{"logo":{"shadow":{"color":"%"}}}"#, |l| {
+                l.logo.as_ref()?.shadow.as_ref()?.color
+            }),
+            (r#"{"logo":{"glow":{"color":"%"}}}"#, |l| {
+                l.logo.as_ref()?.glow.as_ref()?.color
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_colour_field_takes_six_or_eight_digits_and_falls_back_on_junk() {
+        let fields = colour_fields();
+        assert_eq!(fields.len(), 29);
+        for (json, read) in &fields {
+            let with = |c: &str| Look::parse(&json.replace('%', c));
+            assert_eq!(
+                read(&with("#112233")),
+                Some(Rgba(0x11, 0x22, 0x33, 255)),
+                "{json}"
+            );
+            assert_eq!(
+                read(&with("#11223344")),
+                Some(Rgba(0x11, 0x22, 0x33, 0x44)),
+                "{json}"
+            );
+            assert_eq!(
+                read(&with("#112233FF")),
+                Some(Rgba(0x11, 0x22, 0x33, 255)),
+                "{json}"
+            );
+            // A bad string is a colour that is not there: the field keeps its default.
+            for bad in ["#1122334", "#GG223344", "#123", "red", "#1122334455"] {
+                assert_eq!(read(&with(bad)), None, "{json} {bad}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_colours_alpha_sits_beside_the_fields_own_opacity() {
+        let l = Look::parse(
+            r##"{"captions":{"box":{"color":"#00000080","opacity":0.5},
+                  "shadow":{"color":"#00000080","opacity":0.5},
+                  "glow":{"color":"#FFD40080","strength":0.5},
+                  "words":{"upcoming":{"color":"#FFFFFF80","opacity":0.4}}},
+                "headline":{"card":{"color":"#FFFFFF80","opacity":0.5}},
+                "bar":{"track":"#00000080","track_opacity":0.5}}"##,
+        );
+        // Both numbers are kept as written; the renderers multiply them.
+        let c = l.captions.unwrap();
+        let b = c.box_fx.unwrap();
+        assert_eq!((b.color, b.opacity), (Some(Rgba(0, 0, 0, 128)), Some(0.5)));
+        let s = c.shadow_fx.unwrap();
+        assert_eq!((s.color, s.opacity), (Some(Rgba(0, 0, 0, 128)), Some(0.5)));
+        let g = c.glow.unwrap();
+        assert_eq!(
+            (g.color, g.strength),
+            (Some(Rgba(255, 212, 0, 128)), Some(0.5))
+        );
+        let u = c.words.unwrap().upcoming;
+        assert_eq!(
+            (u.color, u.opacity),
+            (Some(Rgba(255, 255, 255, 128)), Some(0.4))
+        );
+        let k = l.headline.unwrap().card_fx.unwrap();
+        assert_eq!(
+            (k.color, k.opacity),
+            (Some(Rgba(255, 255, 255, 128)), Some(0.5))
+        );
+        let r = l.bar.unwrap();
+        assert_eq!(
+            (r.track, r.track_opacity),
+            (Some(Rgba(0, 0, 0, 128)), Some(0.5))
+        );
+    }
+
+    #[test]
+    fn element_opacity_is_clamped_and_absent_means_one() {
+        let o = |j: &str| {
+            let l = Look::parse(j);
+            (
+                l.captions.and_then(|c| c.opacity),
+                l.headline.and_then(|c| c.opacity),
+                l.bar.and_then(|c| c.opacity),
+                l.logo.and_then(|c| c.opacity),
+            )
+        };
+        assert_eq!(
+            o(r#"{"captions":{"opacity":0.5},"headline":{"opacity":0.25},
+                  "bar":{"opacity":0.75},"logo":{"opacity":0.1}}"#),
+            (Some(0.5), Some(0.25), Some(0.75), Some(0.1))
+        );
+        assert_eq!(
+            o(r#"{"captions":{"opacity":7},"headline":{"opacity":-3},
+                  "bar":{"opacity":1.5},"logo":{"opacity":9}}"#),
+            (Some(1.0), Some(0.0), Some(1.0), Some(1.0))
+        );
+        // Not a number, or not there: absent.
+        assert_eq!(
+            o(
+                r#"{"captions":{"opacity":"half"},"headline":{"opacity":null},"bar":{"opacity":[1]},"logo":{}}"#
+            ),
+            (None, None, None, None)
+        );
+        assert!(Look::parse(r#"{"captions":{"opacity":"half"}}"#).is_empty());
+        assert!(!Look::parse(r#"{"bar":{"opacity":0.5}}"#).is_empty());
+    }
+
+    #[test]
+    fn the_caps_announce_alpha() {
+        assert!(CAPS.contains(&"look.alpha"));
     }
 }

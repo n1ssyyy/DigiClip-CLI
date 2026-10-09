@@ -374,7 +374,7 @@ pub fn render(req: &Request) -> anyhow::Result<Output> {
         };
         let progress = (req.t / req.len_s) as f32;
         let mut comp = Compositor::new(dg.w, dg.h, canvas)
-            .with_bar(look.bar)
+            .with_bar_rgba(look.bar)
             .with_bar_look(look.bar_look.as_ref())
             .with_effects(look.effects.as_ref())
             .with_split(look.layout.as_ref());

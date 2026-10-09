@@ -418,7 +418,7 @@ pub fn image_size(p: &Path) -> Option<(u32, u32)> {
 pub struct Look {
     pub canvas: Canvas,
     /// Progress bar color (sRGB); `None` = off.
-    pub bar: Option<(u8, u8, u8)>,
+    pub bar: Option<crate::look::Rgba>,
     /// Corner logo.
     pub logo: Option<Logo>,
     /// Background music and its bed level (dB relative to the speech).
@@ -955,7 +955,7 @@ fn run(
 
     // --- compose loop (this thread) ----------------------------------------
     let mut comp = Compositor::new(dg.w, dg.h, canvas)
-        .with_bar(job.look.bar)
+        .with_bar_rgba(job.look.bar)
         .with_bar_look(job.look.bar_look.as_ref())
         .with_effects(job.look.effects.as_ref())
         .with_split(job.look.layout.as_ref());
@@ -1164,10 +1164,10 @@ fn dressed_logo_chain(li: usize, logo: &Logo, c: Canvas, alpha: &str) -> String 
     let glow = logo
         .glow
         .as_ref()
-        .map(|g| motion::resolve_glow(&[Some(g)], [255.0; 3], k))
+        .map(|g| motion::resolve_glow(&[Some(g)], [255.0; 4], k))
         .filter(|g| g.size > 0.0 && g.strength > 0.0);
     let shadow = shadow.filter(|s| s.opacity > 0.0);
-    let hex = |col: [f64; 3]| col.map(|v| v.round().clamp(0.0, 255.0) as u8);
+    let hex = |col: [f64; 4]| col.map(|v| v.round().clamp(0.0, 255.0) as u8);
     // The room the effects need around the turned logo (even px).
     let sh_sigma = shadow.map_or(0.0, |s| s.blur);
     let (sx, sy) = shadow.map_or((0, 0), |s| (s.x.round() as i64, s.y.round() as i64));
@@ -1221,7 +1221,7 @@ fn dressed_logo_chain(li: usize, logo: &Logo, c: Canvas, alpha: &str) -> String 
             }
         };
         if let Some(s) = shadow {
-            let [r, g, b] = hex(s.col);
+            let [r, g, b, _] = hex(s.col);
             f.push_str(&format!(
                 "[ls]{},lutrgb=r={r}:g={g}:b={b}{}{}[sh];",
                 pad(m + sx, m + sy),
@@ -1231,7 +1231,7 @@ fn dressed_logo_chain(li: usize, logo: &Logo, c: Canvas, alpha: &str) -> String 
             stack.push("[sh]");
         }
         if let Some(g) = glow {
-            let [r, gg, b] = hex(g.col);
+            let [r, gg, b, _] = hex(g.col);
             let grow: String = (0..gl_grow.round() as usize)
                 .map(|i| {
                     format!(
@@ -1869,5 +1869,37 @@ mod tests {
         assert!(br(r#"{"glow":{"size":1}}"#).dressed());
         assert!(!br(r#"{"size":2}"#).dressed());
         assert!(!Logo::default().dressed());
+    }
+
+    // ---- Look: alpha on the logo's shadow and glow --------------------------
+
+    #[test]
+    fn a_shadow_or_glow_colours_alpha_multiplies_into_its_layer_and_the_logo_keeps_its_own() {
+        let c = Canvas::TALL;
+        let chain = |json: &str| logo_chain(3, &br(json), c);
+        let f = chain(
+            r##"{"opacity":0.7,"shadow":{"color":"#00000080","opacity":0.5},
+                "glow":{"color":"#FFD40080","size":10,"strength":0.8}}"##,
+        );
+        // Shadow 0.5 * 128/255 = 0.251; glow 0.8 * 128/255 = 0.402; the stack
+        // as a whole then takes the logo's opacity (a true group of rasters).
+        assert!(
+            f.contains(
+                "lutrgb=r=0:g=0:b=0,gblur=sigma=4.00:steps=2,colorchannelmixer=aa=0.251[sh]"
+            ),
+            "{f}"
+        );
+        assert!(f.contains("colorchannelmixer=aa=0.402[gl]"), "{f}");
+        assert!(f.contains("colorchannelmixer=aa=0.7[logo]"), "{f}");
+        // `FF` and six digits are the same chain.
+        let a =
+            chain(r##"{"shadow":{"color":"#000000FF"},"glow":{"color":"#FFD400FF","size":10}}"##);
+        let b = chain(r##"{"shadow":{"color":"#000000"},"glow":{"color":"#FFD400","size":10}}"##);
+        assert_eq!(a, b);
+        // A fully clear colour draws no layer.
+        let z =
+            chain(r##"{"shadow":{"color":"#00000000"},"glow":{"color":"#FFD40000","size":10}}"##);
+        assert!(!z.contains("split") && !z.contains("dilation"), "{z}");
+        assert!(z.contains("colorchannelmixer=aa=0.9[logo]"), "{z}");
     }
 }
