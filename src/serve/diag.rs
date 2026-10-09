@@ -2,7 +2,7 @@
 //! the key), recent jobs and the tail of `logs/serve.log`, with anything
 //! key-shaped redacted.
 
-use super::{health, AppState, JobRecord};
+use super::{AppState, JobRecord};
 
 /// Log lines kept from the end of `serve.log`.
 const LOG_TAIL: usize = 1500;
@@ -106,7 +106,11 @@ pub(super) async fn diagnostics(st: &AppState) -> String {
     );
     s += &format!(
         "== health\n{}\n\n",
-        pretty(serde_json::json!(health().await))
+        pretty(serde_json::json!(match st.health.last() {
+            Some(h) => Some(h),
+            // Nothing probed yet: a bug report wants the facts, so wait.
+            None => st.health.fresh(&st.bus).await,
+        }))
     );
     s += &format!(
         "== settings\n{}\n\n",
