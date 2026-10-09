@@ -139,7 +139,11 @@ impl HealthCache {
                 let Ok(h) = probed else {
                     tracing::warn!("health probe failed");
                     s.running = false;
-                    s.pending = false;
+                    // Callers waiting for a follow-up probe are released too
+                    // (they answer with what is stored), not left hanging.
+                    if std::mem::take(&mut s.pending) {
+                        s.started += 1;
+                    }
                     let seq = s.started;
                     drop(s);
                     me.shared.done.send_replace(seq);
