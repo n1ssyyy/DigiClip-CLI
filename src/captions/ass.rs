@@ -1356,6 +1356,16 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
         );
         let markup = headline_markup(h, &ink, &accent, (ink_a != acc_a).then_some((acc_a, ink_a)));
         let (ink, edge) = (faded(&ink, hop), faded(&edge, hop));
+        // Border style 4 draws the card in the back colour and also an outline
+        // of that width in the outline colour. Opaque, the outline lies on the
+        // card and cannot be seen; with any alpha the two would add up to a
+        // halo, so the outline slot is then fully transparent (the card is
+        // still sized by the outline's width).
+        let outline = if border == 4 && ass_alpha(&edge) != 0 {
+            with_alpha(&edge, 0xFF)
+        } else {
+            edge.clone()
+        };
         // Where: today's top-centre, or anchored on a point by its middle.
         let place = (hl.x.is_some() || hl.y.is_some()).then(|| {
             let (w, s) = (pw as f64, side_h as f64);
@@ -1382,7 +1392,7 @@ pub fn build_for(words: &[Word], preset_name: &str, offset: f64, o: &AssOpts) ->
             }
         };
         out.push_str(&format!(
-            "Style: Headline,Archivo Black,{font_px},{ink},{ink},{edge},{edge},0,0,0,0,100,100,0,0,{border},{edge_w},0,{align},{ml},{mr},{margin_v},1\n",
+            "Style: Headline,Archivo Black,{font_px},{ink},{ink},{outline},{edge},0,0,0,0,100,100,0,0,{border},{edge_w},0,{align},{ml},{mr},{margin_v},1\n",
         ));
         // Time on screen: the whole clip, or `seconds` of it with a short
         // fade out, never past the clip.
@@ -5505,14 +5515,15 @@ mod tests {
     fn the_v1_headline_carries_the_element_opacity_and_its_colours_alpha() {
         let ass = tall(r#"{"opacity":0.4}"#);
         let h = style_line(&ass, "Headline");
+        // The card is the back colour; the outline slot is clear (see the next test).
         assert_eq!(
             (h[3], h[4], h[5], h[6]),
-            ("&H99111111", "&H99111111", "&H99FFFFFF", "&H99FFFFFF")
+            ("&H99111111", "&H99111111", "&HFFFFFFFF", "&H99FFFFFF")
         );
         assert!(head_event(&ass).contains("\\fad(160,0)"));
         // A card colour with an alpha.
         let h = style_line(&tall(r##"{"card":"#FFFFFF80"}"##), "Headline").join(",");
-        assert!(h.contains(",&H7FFFFFFF,&H7FFFFFFF,"), "{h}");
+        assert!(h.contains(",&HFFFFFFFF,&H7FFFFFFF,"), "{h}");
         // The accent word names its own fill alpha, and the rest puts it back.
         let e = head_event(&tall(r##"{"accent":"#FFD40080"}"##)).to_string();
         // (libass takes the colour from `\1c` and ignores the alpha byte there.)
@@ -5522,6 +5533,55 @@ mod tests {
         assert_eq!(tall(r#"{"opacity":1}"#), tall("{}"));
         // Opacity 0 draws nothing.
         assert!(hl_events(&tall(r#"{"opacity":0}"#)).is_empty());
+    }
+
+    #[test]
+    fn a_translucent_card_has_a_clear_outline_so_no_halo_shows() {
+        // Border style 4: the card is the back colour, and libass also draws an
+        // outline of the same width in the outline colour. Opaque it lies on the
+        // card; with any alpha the two would add up to a halo around the letters.
+        let slot = |json: &str| -> (String, String, String, String) {
+            let ass = tall(json);
+            let h = style_line(&ass, "Headline");
+            (
+                h[5].to_string(),
+                h[6].to_string(),
+                h[15].to_string(),
+                h[16].to_string(),
+            )
+        };
+        let own = |o: &str, b: &str| {
+            (
+                o.to_string(),
+                b.to_string(),
+                "4".to_string(),
+                "24".to_string(),
+            )
+        };
+        // Opacity 0.5: the back colour carries it, the outline slot is clear, the
+        // card keeps its size (the outline's width).
+        assert_eq!(slot(r#"{"opacity":0.5}"#), own("&HFFFFFFFF", "&H80FFFFFF"));
+        // A card colour with an alpha, alone and with an element opacity.
+        assert_eq!(
+            slot(r##"{"card":"#FFFFFF80"}"##),
+            own("&HFFFFFFFF", "&H7FFFFFFF")
+        );
+        let both = faded("&H7F0000FF", 0.5);
+        assert_eq!(
+            slot(r##"{"card":"#FF000080","opacity":0.5}"##),
+            own(&with_alpha(&both, 0xFF), &both)
+        );
+        // Opaque colours and opacity 1: the outline is the card, exactly as it was.
+        assert_eq!(slot("{}"), own("&H00FFFFFF", "&H00FFFFFF"));
+        assert_eq!(slot(r#"{"opacity":1}"#), slot("{}"));
+        assert_eq!(
+            slot(r##"{"card":"#FFD400"}"##),
+            own("&H0000D4FF", "&H0000D4FF")
+        );
+        // No card: the dark edge is a real outline and keeps its alpha.
+        let ass = tall(r#"{"card":"none","opacity":0.5}"#);
+        let h = style_line(&ass, "Headline");
+        assert_eq!((h[5], h[15]), ("&H80000000", "1"));
     }
 
     #[test]

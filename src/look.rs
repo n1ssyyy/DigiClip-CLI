@@ -85,8 +85,12 @@
 //! (`box.opacity`, `card.opacity`, `bar.track_opacity`, `shadow.opacity`,
 //! `glow.strength`, `words.<state>.opacity`), whatever fades it over time
 //! (entrance, exit, word-state attack / release) and the element's `opacity`.
-//! ASS has no group opacity, so a half-transparent fill shows its own stroke,
-//! and overlapping glyph parts add up, as they do in libass.
+//! ASS has no group opacity, so a part is faded on its own and whatever lies
+//! beneath it shows through it. "What shows through what" below says exactly
+//! what that is, part by part and writer by writer; the engine makes sure that
+//! no part which is invisible at full opacity becomes visible only because of
+//! alpha (the classic headline's outline inside its card, the bar's track and
+//! glow under its fill: both are handled there).
 //!
 //! ```text
 //! ASS alpha byte of a part = round((1 - opacity) * 255)   (00 opaque, FF clear)
@@ -104,18 +108,87 @@
 //!   the style's colours (fill, unsung fill, outline / box, shadow) carry
 //!   colour alpha * element; libass multiplies `\fad` on top of every channel
 //!   as (1 - a)(1 - fade); `words` and keywords name `\1a..\4a` themselves.
-//! progress bar (compositor, straight alpha, each layer rounded to 8 bits),
-//!   bottom to top: picture, track over the whole bar, glow, fill:
-//!   fill  = color.alpha * bar.opacity
-//!   track = track.alpha * track_opacity * bar.opacity (a bar without a track
-//!           colour: the dimmed picture, blended at bar.opacity)
-//!   glow  = glow.color.alpha * glow.strength * bar.opacity
+//!   The classic headline's card (border style 4) is its back colour; its
+//!   outline slot (same colour, same width, lies on the card at full opacity)
+//!   is fully transparent as soon as the card has any alpha.
+//! progress bar (compositor, straight alpha, each layer rounded to 8 bits):
+//!   the bar is drawn as it is at full opacity, bottom to top: picture, track
+//!   (only where the fill is not, when the fill colour has an alpha), glow (the
+//!   same), fill; `bar.opacity` then blends that result with the picture:
+//!   fill  = color.alpha, then * bar.opacity
+//!   track = track.alpha * track_opacity (a bar without a track colour: the
+//!           dimmed picture), then * bar.opacity
+//!   glow  = glow.color.alpha * glow.strength, then * bar.opacity
 //! logo (ffmpeg overlay, straight alpha over the frame): the logo image keeps
 //!   its own alpha; shadow = shadow.color.alpha * shadow.opacity, glow =
 //!   glow.color.alpha * glow.strength; shadow, glow and logo are stacked with
 //!   `overlay`, and the stack as a whole is then multiplied by `logo.opacity`
 //!   (a true group, since it is a raster).
 //! ```
+//!
+//! # What shows through what
+//!
+//! A translucent part lets the picture show through, and, depending on the
+//! part, whatever the renderer has drawn beneath it. Checked on rendered
+//! frames (a `#FFFFFF40` fill, an opaque black stroke 10 wide and an opaque
+//! red shadow 18 px off, no blur, over grey):
+//!
+//! ```text
+//! fill      shows the picture and everything beneath the glyph: the shadow
+//!           (libass's or the engine's copy), the glow copy, the box or card.
+//!           It does NOT show its own outline: libass cuts the outline away
+//!           under the fill, so the stroke colour never shows through a
+//!           translucent fill (seen at a fill alpha of 25 %).
+//! outline   (stroke) is drawn only outside the glyph, a ring around it, at
+//!           its own alpha; the picture and a shadow beneath it show through
+//!           that ring.
+//! shadow    a copy of the whole glyph shape (fill and outline) behind it. Not
+//!           cut under the glyph: through a translucent fill (and a
+//!           translucent outline) the shadow's body shows, not only the part
+//!           that sticks out. At full opacity that body is hidden; this is the
+//!           one thing a translucent fill reveals.
+//! glow      a blurred, grown copy in one colour behind the glyph. Same as the
+//!           shadow: not cut, its body tints a translucent fill.
+//! box, card the rectangle (or rounded shape) behind the text. Not cut under
+//!           the glyph either: a translucent fill shows the box colour, not
+//!           the picture, where it lies on the box. A translucent box shows
+//!           the picture (plus a shadow cast by the box, if there is one).
+//! ```
+//!
+//! The two writers differ in how these parts are made:
+//!
+//! ```text
+//! line writer (no positioned field in the Look):
+//!   fill, outline and shadow are the style row's own colours: PrimaryColour,
+//!   OutlineColour, BackColour, drawn by libass in one pass. The only shadow
+//!   is the style's (the preset's, or the v1 `shadow` number): libass's own
+//!   copy of the glyph, behaving as "shadow" above. There are no glow or
+//!   shadow copies of the engine's. A box is libass border style 3 (the box is
+//!   the OutlineColour, the padding is the Outline width): in its own style
+//!   (`...Box`, invisible text) on its own event under the line whenever it is
+//!   see-through, the line fades or the element's opacity is below 1, else in
+//!   the text's own event. The classic headline's card is border style 4: the
+//!   card is the BackColour and libass also draws an outline of the card's
+//!   colour in OutlineColour; the engine makes that outline fully transparent
+//!   whenever the card or the element has an alpha, so no halo shows up.
+//! word-level writer (a positioned field in the Look):
+//!   the fill, the stroke (`\bord`, `\3c`) and the style shadow are libass's
+//!   as above; a `shadow` object, a `glow` object and a `box` object are the
+//!   engine's own events on lower layers (shadow, glow: a copy of the text,
+//!   fill and border in the one colour and one alpha, so that copy's border
+//!   never shows over its own fill; box: a drawn shape, not libass's box), all
+//!   behaving as above. A style's own libass box (hormozi, highlight) gets its
+//!   own event under the text, as in the line writer. The positioned headline
+//!   is drawn like this too, its card a drawn shape under the text.
+//! ```
+//!
+//! Still not undone, because ASS has no group opacity: shadow, glow and box
+//! bodies under a translucent fill (above); boxes of neighbouring words
+//! (`per: word`) that overlap each other and the active word's box over the
+//! line's box show their overlap darker once translucent. Everything the
+//! compositor and the logo graph draw is an exception: the bar is a true group
+//! (see above) and so is the logo (shadow, glow and image stacked, then
+//! `logo.opacity`).
 //!
 //! libass combines `\fad`, `\alpha`, `\1a..\4a` and `\t` by multiplying
 //! opacities per channel (checked against the renderer: a 0.5 fill under half

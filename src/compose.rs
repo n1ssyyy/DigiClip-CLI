@@ -884,8 +884,10 @@ pub fn draw_bar(out: &mut [u8], c: Canvas, color: (u8, u8, u8), progress: f32) {
 }
 
 /// [`draw_bar_at`] with alpha: the dimmed track is laid over the picture at
-/// `track_a`, then the fill over that at `fill_a` (straight alpha, each layer
-/// rounded to 8 bits; a `fill_a` and `track_a` of 1 give [`draw_bar_at`]'s pixels).
+/// `track_a` where the fill is not, the fill over the picture at `fill_a`
+/// (straight alpha, rounded to 8 bits; a `fill_a` and `track_a` of 1 give
+/// [`draw_bar_at`]'s pixels). The track is not laid under the fill: it is
+/// hidden there at full opacity, and a see-through fill must not show it.
 pub fn draw_bar_over(
     out: &mut [u8],
     c: Canvas,
@@ -908,11 +910,10 @@ pub fn draw_bar_over(
         let row = &mut oy[y * w..(y + 1) * w];
         for (x, p) in row.iter_mut().enumerate() {
             let dim = 16 + (p.saturating_sub(16) as u32 * 45 / 100) as u8;
-            let under = mix(*p, dim, track_a);
             *p = if (x as u32) < fill {
-                mix(under, color.0, fill_a)
+                mix(*p, color.0, fill_a)
             } else {
-                under
+                mix(*p, dim, track_a)
             };
         }
     }
@@ -923,11 +924,10 @@ pub fn draw_bar_over(
             let row = &mut plane[y * cw..(y + 1) * cw];
             for (x, p) in row.iter_mut().enumerate() {
                 let dim = (128 + (*p as i32 - 128) / 2) as u8;
-                let under = mix(*p, dim, track_a);
                 *p = if ((x * 2) as u32) < fill {
-                    mix(under, val, fill_a)
+                    mix(*p, val, fill_a)
                 } else {
-                    under
+                    mix(*p, dim, track_a)
                 };
             }
         }
@@ -1951,21 +1951,20 @@ mod tests {
         let (yy, yu, yv) = yuv709(255, 212, 0);
         let bh = bar_thickness(c, 1.0) as usize;
         let dim = |p: u8| 16 + (p.saturating_sub(16) as u32 * 45 / 100) as u8;
-        let dim_c = |p: u8| (128 + (p as i32 - 128) / 2) as u8;
         let fill_to = w / 2; // progress 0.5
         let g = Geom { w: c.w, h: c.h };
         let cw = g.cw() as usize;
 
-        // opacity 0.5: the dimmed track at 0.5 over the picture, then the fill at 0.5.
+        // opacity 0.5: the dimmed track at 0.5 over the picture where the fill is
+        // not, the fill at 0.5 over the picture (no track under it).
         let half = build(Some(yellow), Some(&bar_of(r#"{"opacity":0.5}"#)));
         for y in h - bh..h {
             for x in [0, 17, fill_to - 1, fill_to, fill_to + 5, w - 1] {
                 let p = pic[y * w + x];
-                let under = mixf(p, dim(p), 0.5);
                 let want = if x < fill_to {
-                    mixf(under, yy, 0.5)
+                    mixf(p, yy, 0.5)
                 } else {
-                    under
+                    mixf(p, dim(p), 0.5)
                 };
                 assert_eq!(half[y * w + x], want, "luma {x},{y}");
             }
@@ -1974,17 +1973,18 @@ mod tests {
             let base = g.luma_len() + (plane - 1) * g.chroma_len();
             let (cy, x) = ((h - bh) / 2 + 1, 5usize);
             let p = pic[base + cy * cw + x];
-            let want = mixf(mixf(p, dim_c(p), 0.5), val, 0.5);
+            let want = mixf(p, val, 0.5);
             assert_eq!(half[base + cy * cw + x], want, "chroma {plane}");
         }
         // Above the bar: untouched.
         assert!(half[..(h - bh) * w] == pic[..(h - bh) * w]);
 
-        // A flat colour with an alpha: the fill at that alpha over the opaque dim track.
+        // A flat colour with an alpha: the fill at that alpha over the picture (the
+        // dim track is not under it), the opaque dim track beside it.
         let flat = build(Some(crate::look::Rgba(255, 212, 0, 128)), None);
         let (x, y) = (17, h - 2);
         let p = pic[y * w + x];
-        assert_eq!(flat[y * w + x], mixf(dim(p), yy, 128.0 / 255.0));
+        assert_eq!(flat[y * w + x], mixf(p, yy, 128.0 / 255.0));
         let p = pic[y * w + w - 3];
         assert_eq!(flat[y * w + w - 3], dim(p));
 
