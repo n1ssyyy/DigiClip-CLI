@@ -3057,10 +3057,6 @@ pub async fn run_serve(
     // libass reads `<data dir>/fonts`: the bundled fonts go there, beside the
     // creator's, and Looks and layout learn the creator's families.
     crate::provision::set_data_dir(data_dir.clone());
-    if let Err(e) = crate::provision::ensure_fonts() {
-        tracing::warn!("fonts: could not write the bundled fonts: {e}");
-    }
-    crate::fonts::Library::active().publish();
     let token = token.filter(|t| !t.is_empty()).unwrap_or_else(|| {
         // Per-boot token: local-only auth without stored secrets.
         format!("{:x}{:x}", now_ms(), std::process::id())
@@ -3078,12 +3074,43 @@ pub async fn run_serve(
         mcp: mcp::Mcp::default(),
         preview: Default::default(),
     };
+    // What a first `hello` reports: the saved settings and the saved jobs.
     st.settings = Mutex::new(st.load_settings());
     st.jobs = Mutex::new(reload_jobs());
     let st = Arc::new(st);
-    tokio::spawn(watch::run(st.clone()));
-    mcp::restart(&st).await;
 
+    // Nothing else comes before the socket. The desktop app waits a bounded
+    // time for the banner, and everything below it can be slow on a machine
+    // that is busy scanning a fresh install.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let boot = boot_after_banner(
+        st.clone(),
+        || {
+            if let Err(e) = crate::provision::ensure_fonts() {
+                tracing::warn!("fonts: could not write the bundled fonts: {e}");
+            }
+            crate::fonts::Library::active().publish();
+        },
+        |st| async move { mcp::restart(&st).await },
+    );
+    serve_ready(
+        listener,
+        st,
+        move || println!("DIGICLIP_SERVE port={port} token={token}"),
+        boot,
+    )
+    .await
+}
+
+/// Print the banner (`announce`) the moment the socket is bound, start `boot`
+/// in the background, and serve. The order is the contract: the banner comes
+/// before anything in `boot` can finish, and `boot` never delays a request.
+async fn serve_ready(
+    listener: tokio::net::TcpListener,
+    st: Arc<AppState>,
+    announce: impl FnOnce(),
+    boot: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/ws", get(ws_handler))
         .route("/art/{job}/{file}", get(art_handler))
@@ -3093,11 +3120,35 @@ pub async fn run_serve(
         // desktop webview fetch blobs (downloads) without a proxy.
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(st);
-
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    println!("DIGICLIP_SERVE port={port} token={token}");
+    announce();
+    tokio::spawn(boot);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// What the engine does once it is answering, in the background:
+///
+/// - the bundled fonts are written to `<data dir>/fonts` and the creator's
+///   are published to Looks and layout. A hello, `fonts_list` and the font
+///   route need neither (they list the bundled fonts from memory and scan the
+///   folder themselves); every render calls `ensure_fonts` itself before
+///   libass runs, and that waits for this write if it is still going; and a
+///   creator's family not published yet is found by Looks on first use;
+/// - the watch folder task;
+/// - the MCP server: the bridge copy of this executable, its port,
+///   `server.json` and the probe of the AI apps' config files (`mcp_start`).
+///   Until it is done a hello says `mcp.running = false, mcp.starting = true`,
+///   and the app gets an `mcp` event when it is up.
+async fn boot_after_banner<W, F, Fut>(st: Arc<AppState>, fonts: W, mcp_start: F)
+where
+    W: FnOnce() + Send + 'static,
+    F: FnOnce(Arc<AppState>) -> Fut + Send,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    tokio::spawn(watch::run(st.clone()));
+    let fonts = tokio::task::spawn_blocking(fonts);
+    mcp_start(st).await;
+    let _ = fonts.await;
 }
 
 #[cfg(test)]
@@ -4072,5 +4123,146 @@ mod tests {
         let (code, _, _) = get_font(&st, "/font/a/b.ttf?token=t", &[]).await;
         assert_eq!(code, StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    // ---- boot order ------------------------------------------------------
+
+    /// A server state in its own temp folder, with MCP on at `mcp_port`.
+    fn boot_state(dir: &Path, mcp_port: u16) -> Arc<AppState> {
+        let (bus, _) = broadcast::channel::<ServerMsg>(16);
+        let settings = Settings {
+            mcp_port,
+            mcp_token: Some("boot-test-token-0000".into()),
+            ..Settings::default()
+        };
+        // A few bytes stand in for the executable the bridge copy is made of.
+        let exe = dir.join("fake-engine.exe");
+        std::fs::write(&exe, b"not really an engine").unwrap();
+        Arc::new(AppState {
+            token: "t".into(),
+            data_dir: dir.to_path_buf(),
+            jobs: Mutex::new(HashMap::new()),
+            settings: Mutex::new(settings),
+            model_runs: Mutex::new(HashMap::new()),
+            worker: Semaphore::new(1),
+            bus,
+            id_counter: AtomicU64::new(1),
+            mcp: mcp::Mcp::with_bridge_source(exe),
+            preview: Default::default(),
+        })
+    }
+
+    async fn free_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// The banner comes, and the socket answers, while the MCP start has not
+    /// finished (here it is held back by hand); the app then gets its `mcp`
+    /// event, and a hello in between says it is not up yet.
+    #[tokio::test]
+    async fn the_socket_answers_before_the_mcp_start_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp_port = free_port().await;
+        let st = boot_state(dir.path(), mcp_port);
+        let mut bus = st.bus.subscribe();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let note = {
+            let events = events.clone();
+            move |what: &'static str| events.lock().unwrap().push(what)
+        };
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let boot = boot_after_banner(
+            st.clone(),
+            {
+                let note = note.clone();
+                move || note("fonts")
+            },
+            {
+                let note = note.clone();
+                move |st| async move {
+                    note("mcp-asked");
+                    let _ = held.await;
+                    mcp::restart(&st).await;
+                    note("mcp-done");
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let banner = {
+            let note = note.clone();
+            move || note("banner")
+        };
+        let server = tokio::spawn(serve_ready(listener, st.clone(), banner, boot));
+        let wait_for = |what: &'static str| {
+            let events = events.clone();
+            async move {
+                for _ in 0..500 {
+                    if events.lock().unwrap().contains(&what) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("never saw {what}: {:?}", events.lock().unwrap());
+            }
+        };
+        wait_for("banner").await;
+        wait_for("mcp-asked").await;
+
+        // The route answers over a real socket with the MCP start held back.
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let res = http
+            .get(format!(
+                "http://127.0.0.1:{port}/font/Anton-Regular.ttf?token=t"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        note("answered");
+        assert!(!events.lock().unwrap().contains(&"mcp-done"));
+
+        // A hello now: the MCP server is not up, and it says it is starting.
+        let (ok, _, data) = ask(&st, r#"{"id":1,"cmd":"hello"}"#).await;
+        assert!(ok);
+        let data = data.unwrap();
+        let m = &data["mcp"];
+        assert_eq!(m["running"], false);
+        assert_eq!(m["starting"], true);
+        assert!(m["installed"].is_object(), "{m}");
+        assert_eq!(m["port"], mcp_port);
+        assert!(bus.try_recv().is_err(), "no mcp event before the start");
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", mcp_port))
+            .await
+            .is_err());
+
+        // Let the start finish: up, announced, and the file is written.
+        release.send(()).unwrap();
+        wait_for("mcp-done").await;
+        let ServerMsg::Ev {
+            ev: Event::Mcp { mcp },
+        } = bus.recv().await.unwrap()
+        else {
+            panic!("expected the mcp event");
+        };
+        assert_eq!(mcp["running"], true);
+        assert_eq!(mcp["starting"], false);
+        tokio::net::TcpStream::connect(("127.0.0.1", mcp_port))
+            .await
+            .expect("the MCP port is listening");
+        let file = std::fs::read_to_string(dir.path().join("mcp").join("server.json")).unwrap();
+        assert!(file.contains(&format!("\"port\": {mcp_port}")), "{file}");
+        let (_, _, data) = ask(&st, r#"{"id":2,"cmd":"hello"}"#).await;
+        assert_eq!(data.unwrap()["mcp"]["running"], true);
+
+        let order = events.lock().unwrap().clone();
+        let at = |w: &str| order.iter().position(|e| *e == w).unwrap();
+        assert!(
+            at("banner") < at("answered") && at("answered") < at("mcp-done"),
+            "{order:?}"
+        );
+        assert!(at("banner") < at("mcp-asked"), "{order:?}");
+        server.abort();
     }
 }

@@ -62,7 +62,13 @@ pub fn ensure_fonts() -> anyhow::Result<PathBuf> {
 }
 
 /// [`ensure_fonts`] for a given folder.
+///
+/// One caller at a time: the server writes the fonts in the background after
+/// it is up, and a render that starts meanwhile calls this too. It waits for
+/// the writer (never reads a half-written file) and then finds them whole.
 pub fn ensure_fonts_in(dir: &Path) -> anyhow::Result<PathBuf> {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     std::fs::create_dir_all(dir)?;
     for f in crate::fonts::BUNDLED {
         let p = dir.join(f.file);
