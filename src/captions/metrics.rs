@@ -129,8 +129,10 @@ fn read_family(b: &[u8], (off, len): (usize, usize)) -> Option<String> {
         let (rank, text): (u8, String) = match (plat, enc) {
             (3, 0 | 1 | 10) | (0, _) => {
                 let units: Vec<u16> = raw
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_be_bytes(*c))
                     .collect();
                 let t = char::decode_utf16(units)
                     .map(|c| c.unwrap_or('\u{fffd}'))

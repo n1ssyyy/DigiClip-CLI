@@ -3919,7 +3919,7 @@ mod tests {
     #[tokio::test]
     async fn fonts_list_add_and_remove_over_the_socket() {
         use crate::captions::metrics::testfont;
-        let st = fonts_state("fonts-cmds");
+        let st = fonts_state("serve-font-cmds");
         let (ok, e, data) = ask(&st, r#"{"id":1,"cmd":"fonts_list"}"#).await;
         assert!(ok, "{e:?}");
         let d = data.unwrap();
@@ -4005,7 +4005,7 @@ mod tests {
     #[tokio::test]
     async fn the_font_route_serves_listed_fonts_and_nothing_else() {
         use crate::captions::metrics::testfont;
-        let st = fonts_state("fonts-route");
+        let st = fonts_state("serve-font-route");
         let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
         let src = st.data_dir.join("src.otf");
         std::fs::create_dir_all(&st.data_dir).unwrap();
