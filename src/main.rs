@@ -28,7 +28,21 @@ fn main() -> Result<()> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
+    // `digiclip fonts …` is its own little command (the main one takes a video
+    // path first, so a subcommand cannot share its parser).
+    {
+        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if argv.get(1).is_some_and(|a| a == "fonts") && !std::path::Path::new("fonts").is_file() {
+            let mut rest = vec![std::ffi::OsString::from("digiclip fonts")];
+            rest.extend(argv.into_iter().skip(2));
+            return digiclip_rs::fonts::run_cli(digiclip_rs::cli::FontsArgs::parse_from(rest));
+        }
+    }
     let args = Args::parse();
+    // `--data-dir` moves the fonts folder (what libass reads) with it.
+    if let Some(d) = &args.data_dir {
+        digiclip_rs::provision::set_data_dir(d.clone());
+    }
     if args.mcp {
         // stdout carries the protocol: logs go to stderr only.
         tracing_subscriber::fmt()

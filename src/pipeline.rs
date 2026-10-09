@@ -102,13 +102,21 @@ struct Timeline {
 
 /// Canvas and overlays from the CLI flags. Missing logo/music files fail
 /// fast (they were asked for by name).
-fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
+pub fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
+    let parsed = args.look.as_deref().map(crate::look::Look::from_arg);
     let logo = match &args.logo {
         Some(p) if !p.is_file() => anyhow::bail!("--logo not found: {}", p.display()),
-        Some(p) => Some(crate::render::Logo::new(
-            p.clone(),
-            crate::render::Corner::parse(&args.logo_pos).unwrap_or(crate::render::Corner::TopRight),
-        )),
+        Some(p) => {
+            let logo = crate::render::Logo::new(
+                p.clone(),
+                crate::render::Corner::parse(&args.logo_pos)
+                    .unwrap_or(crate::render::Corner::TopRight),
+            );
+            Some(match parsed.as_ref().and_then(|l| l.logo.as_ref()) {
+                Some(l) => logo.with_look(l),
+                None => logo,
+            })
+        }
         None => None,
     };
     let music = match &args.music {
@@ -118,37 +126,68 @@ fn look_for(args: &Args) -> anyhow::Result<crate::render::Look> {
     };
     Ok(crate::render::Look {
         canvas: args.canvas(),
-        bar: args
-            .progress_bar
-            .as_deref()
-            .and_then(crate::compose::parse_hex),
+        bar: crate::compose::bar_color(
+            args.progress_bar
+                .as_deref()
+                .and_then(crate::compose::parse_hex),
+            parsed.as_ref().and_then(|l| l.bar.as_ref()),
+        ),
         logo,
         music,
         anim: crate::captions::ass::Anim::parse(&args.caption_anim),
+        captions: parsed.as_ref().and_then(|l| l.captions.clone()),
+        headline: parsed.as_ref().and_then(|l| l.headline.clone()),
+        bar_look: parsed.as_ref().and_then(|l| l.bar.clone()),
+        camera: parsed.as_ref().and_then(|l| l.camera.clone()),
+        effects: parsed.as_ref().and_then(|l| l.effects.clone()),
+        layout: parsed.and_then(|l| l.layout),
     })
 }
 
 /// Caption options for one render on this look.
-fn ass_opts(
+pub fn ass_opts(
     look: &crate::render::Look,
     headline: Option<String>,
     dur: f64,
     seam: bool,
 ) -> crate::captions::ass::AssOpts {
     let c = look.canvas;
+    // Split screen: the captions sit on the seam, wherever the Look put it
+    // (a position the Look gave the captions still wins).
+    let mut captions = look.captions.clone();
+    let seam_at = look
+        .layout
+        .as_ref()
+        .and_then(|l| l.split)
+        .filter(|s| seam && (s - 0.5).abs() > 1e-9);
+    if let Some(s) = seam_at {
+        let cap = captions.get_or_insert_with(Default::default);
+        if cap.x.is_none() && cap.y.is_none() {
+            cap.y = Some(crate::compose::split_rows(c.h, Some(s)) as f64 / c.h as f64);
+        }
+    }
     crate::captions::ass::AssOpts {
         w: c.w,
         h: c.h,
         headline,
         dur,
         anim: look.anim,
+        captions,
+        headline_look: look.headline.clone(),
         seam,
-        // Logo width + its inset + a gap.
-        clear: look.logo.as_ref().map(|l| crate::captions::ass::Clear {
-            top: l.corner.is_top(),
-            left: l.corner.is_left(),
-            px: l.size(c).0 + crate::render::Logo::inset(c).0 + (c.w as f64 * 0.025).round() as u32,
-        }),
+        // Logo width + its inset + a gap. A logo the Look placed by hand is
+        // the user's call: text does not make room for it.
+        clear: look
+            .logo
+            .as_ref()
+            .filter(|l| l.at.is_none())
+            .map(|l| crate::captions::ass::Clear {
+                top: l.corner.is_top(),
+                left: l.corner.is_left(),
+                px: l.size(c).0
+                    + crate::render::Logo::inset(c).0
+                    + (c.w as f64 * 0.025).round() as u32,
+            }),
     }
 }
 
@@ -343,6 +382,7 @@ async fn resolve_timeline(
     b: f64,
     words: &[crate::whisper::Word],
     canvas: crate::compose::Canvas,
+    zoom: f64,
     progress: Option<crate::progress::SharedPct>,
     cancel: &CancelFlag,
 ) -> Option<Timeline> {
@@ -460,8 +500,25 @@ async fn resolve_timeline(
                     if !tracked.shots.is_empty() {
                         tracing::info!("{} shot cut(s) pinned to the frame", tracked.shots.len());
                     }
+                    // The Look's camera zoom: single-face windows only (a
+                    // group's window is already as tight as it can be).
+                    let mut raw = tracked.raw;
+                    if zoom != 1.0 {
+                        for r in raw.iter_mut().filter(|r| r.n_faces < 2) {
+                            let win = (r.x, r.y, r.w, r.h);
+                            (r.x, r.y, r.w, r.h) = crate::track::zoom_window(
+                                win,
+                                r.ax,
+                                r.ay,
+                                zoom,
+                                src_w as f64,
+                                src_h as f64,
+                                base,
+                            );
+                        }
+                    }
                     Some(Timeline {
-                        raw: tracked.raw,
+                        raw,
                         segments: tracked.segments,
                         shots: tracked.shots,
                         duo: tracked.duo,
@@ -846,6 +903,11 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     );
 
     let look = look_for(args)?;
+    if let Some(raw) = args.look.as_deref() {
+        for note in crate::look::Look::font_notes(raw) {
+            tracing::warn!("look: {note}");
+        }
+    }
     let tag = look.canvas.tag();
     if look.canvas != crate::compose::Canvas::TALL {
         tracing::info!(
@@ -2086,6 +2148,7 @@ async fn plan_render(
             gb,
             pc.words,
             pc.look.canvas,
+            pc.look.camera.as_ref().and_then(|c| c.zoom).unwrap_or(1.0),
             track_hook,
             cancel,
         )
@@ -2116,8 +2179,16 @@ async fn plan_render(
         if let Some(tl) = &tl {
             duo_n += tl.duo.len();
             samples += tl.samples;
-            split_plans[pi] =
-                crate::split::plan(&tl.duo, &tl.shots, ga, gb, sw, sh, pc.look.canvas);
+            split_plans[pi] = crate::split::plan(
+                &tl.duo,
+                &tl.shots,
+                ga,
+                gb,
+                sw,
+                sh,
+                pc.look.canvas,
+                pc.look.layout.as_ref().and_then(|l| l.split).unwrap_or(0.5),
+            );
             for &s in &tl.shots {
                 if let Some(o) = crate::timeline::tight(s, &part.keeps) {
                     hards.push(out0 + o);
@@ -2159,14 +2230,14 @@ async fn plan_render(
             onsets: &ons,
             canvas: pc.look.canvas,
         },
-        &camera::CamCfg::default(),
+        &camera::CamCfg::for_feel(pc.look.camera.as_ref().and_then(|c| c.feel)),
     );
     // Punch depth respects the resolution floor (no mush on low-res input).
-    let mut pcfg = camera::PunchCfg::default();
     let base_h = pc.look.canvas.base_rect(sw, sh).h;
-    pcfg.zoom = pcfg
-        .zoom
-        .min((base_h / pc.look.canvas.min_crop_h()).max(1.08));
+    let pcfg = camera::punch_cfg(
+        pc.look.camera.as_ref().and_then(|c| c.punch),
+        (base_h / pc.look.canvas.min_crop_h()).max(1.08),
+    );
     let landed = camera::apply_punches(&mut poses, &punches, r, sw, sh, &pcfg);
     if !punches.is_empty() {
         tracing::info!(
@@ -2562,6 +2633,106 @@ fn exact_fit(
 mod tests {
     use super::*;
 
+    fn logo_look(corner: crate::render::Corner, json: &str) -> crate::render::Look {
+        let l = crate::look::Look::parse(json);
+        let logo = crate::render::Logo {
+            corner,
+            ..Default::default()
+        };
+        crate::render::Look {
+            canvas: crate::compose::Canvas::SQUARE,
+            logo: Some(match &l.logo {
+                Some(g) => logo.with_look(g),
+                None => logo,
+            }),
+            headline: l.headline,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn text_clears_a_corner_logo_by_its_scaled_size_and_ignores_a_free_one() {
+        use crate::render::Corner::TopRight;
+        let clear = |json: &str| ass_opts(&logo_look(TopRight, json), None, 5.0, false).clear;
+        // Today: logo box 152 + inset 43 + gap 27.
+        let today = clear("{}").unwrap();
+        assert_eq!((today.top, today.left, today.px), (true, false, 222));
+        assert_eq!(clear(r#"{"logo":{"opacity":0.5}}"#), Some(today));
+        // Scaled: the wider box is what text keeps clear of.
+        let big = clear(r#"{"logo":{"size":2}}"#).unwrap();
+        assert_eq!(big.px, 302 + 43 + 27);
+        // Placed by hand: nobody makes room.
+        assert_eq!(clear(r#"{"logo":{"x":0.8,"y":0.1}}"#), None);
+        assert_eq!(clear(r#"{"logo":{"y":0.9}}"#), None);
+    }
+
+    #[test]
+    fn the_headline_look_reaches_the_caption_options() {
+        let l = logo_look(
+            crate::render::Corner::TopLeft,
+            r#"{"headline":{"x":0.3,"seconds":2}}"#,
+        );
+        let o = ass_opts(&l, Some("Big news".into()), 6.0, false);
+        let h = o.headline_look.unwrap();
+        assert_eq!((h.x, h.seconds), (Some(0.3), Some(2.0)));
+    }
+
+    #[test]
+    fn the_split_seam_drags_the_captions_with_it() {
+        let look = |json: &str| {
+            let l = crate::look::Look::parse(json);
+            crate::render::Look {
+                canvas: crate::compose::Canvas::TALL,
+                captions: l.captions,
+                layout: l.layout,
+                ..Default::default()
+            }
+        };
+        let cap_y = |l: &crate::render::Look, seam: bool| {
+            ass_opts(l, None, 5.0, seam).captions.and_then(|c| c.y)
+        };
+        // Absent or 0.5: the captions are untouched (the style's seam rule).
+        for json in ["{}", r#"{"layout":{"split":0.5}}"#, r#"{"layout":{}}"#] {
+            assert_eq!(cap_y(&look(json), true), None, "{json}");
+        }
+        // Moved seam: captions follow it, only while the layout splits.
+        let moved = look(r#"{"layout":{"split":0.6}}"#);
+        assert_eq!(cap_y(&moved, true), Some(0.6));
+        assert_eq!(cap_y(&moved, false), None);
+        let up = look(r#"{"layout":{"split":0.3}}"#);
+        assert_eq!(cap_y(&up, true), Some(0.3));
+        // A position the Look gave the captions wins.
+        let placed = look(r#"{"captions":{"y":0.8},"layout":{"split":0.6}}"#);
+        assert_eq!(cap_y(&placed, true), Some(0.8));
+    }
+
+    #[test]
+    fn camera_effects_and_layout_ride_the_look_to_the_renderer() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "digiclip",
+            "in.mp4",
+            "--look",
+            r#"{"camera":{"feel":"locked","zoom":1.2,"punch":1.3},"effects":{"vignette":0.5,"grade":"warm","fill_dim":0.2},"layout":{"split":0.6}}"#,
+        ])
+        .unwrap();
+        let l = look_for(&args).unwrap();
+        let c = l.camera.unwrap();
+        assert_eq!(
+            (c.feel, c.zoom, c.punch),
+            (Some(crate::look::CameraFeel::Locked), Some(1.2), Some(1.3))
+        );
+        let e = l.effects.unwrap();
+        assert_eq!(
+            (e.vignette, e.grade, e.fill_dim),
+            (Some(0.5), Some(crate::look::Grade::Warm), Some(0.2))
+        );
+        assert_eq!(l.layout.unwrap().split, Some(0.6));
+        // No look: none of the three.
+        let l = look_for(&Args::try_parse_from(["digiclip", "in.mp4"]).unwrap()).unwrap();
+        assert!(l.camera.is_none() && l.effects.is_none() && l.layout.is_none());
+    }
+
     #[test]
     fn batch_expands_folders_and_names_outputs() {
         use clap::Parser;
@@ -2743,5 +2914,36 @@ mod tests {
             p.removed.iter().any(|r| r.reason.starts_with("exact cap")),
             "trim must be audited"
         );
+    }
+
+    #[test]
+    fn the_looks_bar_colour_wins_over_the_flat_one_and_never_turns_the_bar_on() {
+        use clap::Parser;
+        let bar = |flags: &[&str]| {
+            let mut a = vec!["digiclip", "in.mp4"];
+            a.extend_from_slice(flags);
+            look_for(&Args::try_parse_from(a).unwrap()).unwrap()
+        };
+        let look = r##"{"bar":{"color":"#FF3B30","inset":0.04,"radius":1}}"##;
+        // Flat colour alone, as ever.
+        assert_eq!(bar(&["--progress-bar", "#00FF00"]).bar, Some((0, 255, 0)));
+        assert_eq!(bar(&["--progress-bar"]).bar, Some((255, 212, 0)));
+        // The Look's colour replaces it; the flag still switches the bar on.
+        let l = bar(&["--progress-bar", "#00FF00", "--look", look]);
+        assert_eq!(l.bar, Some((255, 59, 48)));
+        let shape = l.bar_look.unwrap();
+        assert_eq!((shape.inset, shape.radius), (Some(0.04), Some(1.0)));
+        // No flag: no bar, whatever the Look says.
+        let l = bar(&["--look", look]);
+        assert_eq!(l.bar, None);
+        assert!(l.bar_look.is_some());
+        // A Look with other bar fields keeps the flat colour.
+        let l = bar(&[
+            "--progress-bar",
+            "#00FF00",
+            "--look",
+            r#"{"bar":{"pos":"top"}}"#,
+        ]);
+        assert_eq!(l.bar, Some((0, 255, 0)));
     }
 }

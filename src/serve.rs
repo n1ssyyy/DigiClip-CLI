@@ -9,6 +9,46 @@
 //! - `GET /art/<job>/<file>?token=…` — job artifacts (mp4 with Range
 //!   seeks for `<video>`, posters, ass/srt/kit) via [`ServeFile`].
 //!
+//! `preview_frame` (the Studio's "Exact frame") answers one still of what
+//! the real render would draw:
+//!
+//! ```text
+//! → { id, cmd: "preview_frame", job, start_s, len_s, t, options }
+//! ← { type: "res", id, ok: true, data: { job, file, rev, width, height,
+//!       ms, t, src_t, start_s, len_s, words, layout, warnings } }
+//! ← { type: "res", id, ok: false, error }
+//! ```
+//!
+//! `options` is the same object `job_start` takes (flat options plus
+//! `look`) and goes through the same `args_for` as a job. The still is the
+//! job's source at second `start_s + t`, as if a clip ran from `start_s`
+//! for `len_s` seconds, centre-framed on the canvas of the first aspect. It
+//! is written to the job folder as `preview-0.jpg` … `preview-3.jpg` (four
+//! names in rotation) and fetched through `/art/<job>/<file>?token=…&v=<rev>`.
+//! See [`crate::preview`] for what it draws and what it leaves out.
+//!
+//! Fonts: `fonts_list`, `fonts_add` and `fonts_remove` manage the creator's own
+//! fonts, and `GET /font/<file>?token=…` serves a listed font file for the
+//! app's preview. Capability `look.fonts`.
+//!
+//! ```text
+//! → { id, cmd: "fonts_list" }
+//! ← { type: "res", id, ok: true, data: { fonts: [Font], dir, max_bytes } }
+//!     Font = { family, file, bundled, category, weight, bytes, licence?,
+//!              rev, url }
+//!     bundled fonts first (in the picker's order), then the creator's by
+//!     family; `family` is what a Look puts in captions.font /
+//!     headline.font; `category` is display | sans | rounded | comic | serif
+//!     | hand | mono for bundled fonts and `custom` for the creator's;
+//!     `url` is `/font/<file>` (add `?token=…&v=<rev>`).
+//!
+//! → { id, cmd: "fonts_add", path }          (a local .ttf or .otf file)
+//! ← { ok: true, data: { font: Font } } | { ok: false, error }
+//!
+//! → { id, cmd: "fonts_remove", font }       (a family or a file name)
+//! ← { ok: true, data: { font: Font } } | { ok: false, error }
+//! ```
+//!
 //! Single-user desktop assumptions: bind 127.0.0.1 only, one per-boot
 //! token (Tauri spawns the sidecar with `--token`), one GPU worker
 //! (jobs queue behind a semaphore). Pause/resume is intentionally
@@ -121,6 +161,11 @@ pub struct JobOptions {
     /// Caption motion: `pop` (default), `words`, `none`.
     #[serde(default)]
     pub caption_anim: Option<String>,
+    /// The Look (see [`crate::look`]): kept as raw JSON so a field this
+    /// build does not know never fails the frame, and so a saved preset
+    /// round-trips it untouched.
+    #[serde(default)]
+    pub look: Option<serde_json::Value>,
     /// Absent = off, `""` = each clip's title, text = that text.
     #[serde(default)]
     pub headline: Option<String>,
@@ -755,6 +800,31 @@ enum Cmd {
     TranscriptGet {
         job: String,
     },
+    /// One still of the real render at second `t` of a window of the job's
+    /// source (`start_s`, `len_s`), dressed by `options` (see
+    /// [`crate::preview`]). Replies with the JPEG's name in the job folder.
+    PreviewFrame {
+        job: String,
+        #[serde(default)]
+        start_s: f64,
+        #[serde(default = "default_preview_len")]
+        len_s: f64,
+        #[serde(default)]
+        t: f64,
+        #[serde(default)]
+        options: JobOptions,
+    },
+    /// Every usable font family: the bundled ones, then the creator's.
+    FontsList,
+    /// Add a `.ttf` / `.otf` file from disk to the creator's fonts.
+    FontsAdd {
+        path: String,
+    },
+    /// Remove one of the creator's fonts (a family or a file name). `font`,
+    /// not `id`: a param named `id` would overwrite the frame id.
+    FontsRemove {
+        font: String,
+    },
     /// Write a redacted diagnostics bundle; replies with its path.
     Diagnostics,
     /// MCP server state (port, token, clients, activity, tools).
@@ -768,6 +838,10 @@ enum Cmd {
         #[serde(default)]
         remove: bool,
     },
+}
+
+fn default_preview_len() -> f64 {
+    crate::preview::DEFAULT_LEN_S
 }
 
 /// One server frame: a correlated `res` or an async `ev`.
@@ -872,6 +946,8 @@ struct AppState {
     bus: broadcast::Sender<ServerMsg>,
     id_counter: AtomicU64,
     mcp: mcp::Mcp,
+    /// `preview_frame`: one still at a time, and their numbering.
+    preview: crate::preview::Gate,
 }
 
 struct ModelRun {
@@ -1163,6 +1239,14 @@ fn args_for(
         .filter(|v| matches!(v.as_str(), "pop" | "words" | "none"))
     {
         flag(&mut argv, "--caption-anim", v.clone());
+    }
+    // Only a non-empty object travels: no look is the default argv.
+    if let Some(v) = o
+        .look
+        .as_ref()
+        .filter(|v| v.as_object().is_some_and(|m| !m.is_empty()))
+    {
+        flag(&mut argv, "--look", v.to_string());
     }
     // `""` = on with the default (clip title / brand yellow).
     if let Some(v) = &o.headline {
@@ -1609,6 +1693,8 @@ async fn snapshot(st: &AppState) -> serde_json::Value {
         "models": models,
         "health": health().await,
         "mcp": mcp::public(st).await,
+        // What this engine can do, so the app only enables live controls.
+        "caps": crate::look::CAPS,
     })
 }
 
@@ -2122,6 +2208,45 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 Err(e) => vec![err(id, e)],
             }
         }
+        Cmd::PreviewFrame {
+            job,
+            start_s,
+            len_s,
+            t,
+            options,
+        } => preview_frame(&st, id, job, (start_s, len_s, t), options).await,
+        Cmd::FontsList => {
+            let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+            match tokio::task::spawn_blocking(move || (lib.list(), lib.dir().to_path_buf())).await {
+                Ok((fonts, dir)) => vec![ok(
+                    id,
+                    Some(serde_json::json!({
+                        "fonts": fonts,
+                        "dir": dir.display().to_string(),
+                        "max_bytes": crate::fonts::MAX_BYTES,
+                    })),
+                )],
+                Err(e) => vec![err(id, format!("fonts: {e}"))],
+            }
+        }
+        Cmd::FontsAdd { path } => {
+            let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+            let added = tokio::task::spawn_blocking(move || lib.add(Path::new(path.trim()))).await;
+            match added {
+                Ok(Ok(font)) => vec![ok(id, Some(serde_json::json!({ "font": font })))],
+                Ok(Err(e)) => vec![err(id, e)],
+                Err(e) => vec![err(id, format!("fonts: {e}"))],
+            }
+        }
+        Cmd::FontsRemove { font } => {
+            let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+            let gone = tokio::task::spawn_blocking(move || lib.remove(&font)).await;
+            match gone {
+                Ok(Ok(font)) => vec![ok(id, Some(serde_json::json!({ "font": font })))],
+                Ok(Err(e)) => vec![err(id, e)],
+                Err(e) => vec![err(id, format!("fonts: {e}"))],
+            }
+        }
         Cmd::TranscriptGet { job } => {
             let out_dir = {
                 let jobs = st.jobs.lock().await;
@@ -2148,6 +2273,82 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 None => vec![err(id, "no transcript yet")],
             }
         }
+    }
+}
+
+/// `preview_frame`: one still, behind the previews' turnstile so a burst is
+/// served one at a time in arrival order. Every failure is a reply.
+async fn preview_frame(
+    st: &Arc<AppState>,
+    id: u64,
+    job: String,
+    (start_s, len_s, t): (f64, f64, f64),
+    options: JobOptions,
+) -> Vec<ServerMsg> {
+    let began = std::time::Instant::now();
+    let (start_s, len_s, t) = match crate::preview::window(start_s, len_s, t) {
+        Ok(w) => w,
+        Err(e) => return vec![err(id, e)],
+    };
+    let (source, dir, title, first_title) = {
+        let jobs = st.jobs.lock().await;
+        match jobs.get(&job) {
+            Some(live) => (
+                PathBuf::from(&live.record.source),
+                PathBuf::from(&live.record.out_dir),
+                live.record.name.clone(),
+                live.record.clips.first().map(|c| c.title.clone()),
+            ),
+            None => return vec![err(id, "unknown job")],
+        }
+    };
+    if !source.is_file() {
+        return vec![err(
+            id,
+            format!(
+                "the job's source video is not reachable: {}",
+                source.display()
+            ),
+        )];
+    }
+    let settings = st.settings.lock().await.clone();
+    let args = match args_for(&source, &dir, &options, &settings) {
+        Ok(a) => a,
+        Err(e) => return vec![err(id, e)],
+    };
+    let _turn = st.preview.lock.lock().await;
+    let seq = st.preview.seq.fetch_add(1, Ordering::SeqCst);
+    let req = crate::preview::Request {
+        transcript: dir.join("transcript.json"),
+        headline: crate::preview::headline_text(
+            options.headline.as_deref(),
+            first_title.as_deref(),
+            &title,
+        ),
+        fill: crate::preview::wants_fill(options.layout.as_deref()),
+        source,
+        dir,
+        args,
+        start_s,
+        len_s,
+        t,
+        seq,
+    };
+    let done = tokio::task::spawn_blocking(move || crate::preview::render(&req)).await;
+    match done {
+        Ok(Ok(out)) => {
+            let mut data = serde_json::to_value(&out).unwrap_or_default();
+            data["job"] = job.into();
+            data["start_s"] = start_s.into();
+            data["len_s"] = len_s.into();
+            // A new number per picture: the app adds it to the URL so a
+            // reused file name never shows a cached picture.
+            data["rev"] = now_ms().into();
+            data["ms"] = (began.elapsed().as_millis() as u64).into();
+            vec![ok(id, Some(data))]
+        }
+        Ok(Err(e)) => vec![err(id, format!("{e:#}"))],
+        Err(_) => vec![err(id, "the preview stopped unexpectedly")],
     }
 }
 
@@ -2670,6 +2871,18 @@ async fn socket_loop(st: Arc<AppState>, socket: WebSocket) {
                 continue;
             }
         };
+        // A preview takes a moment: it runs beside the socket's other
+        // commands instead of holding them up (previews queue among
+        // themselves, see `preview_frame`).
+        if matches!(req.cmd, Cmd::PreviewFrame { .. }) {
+            let (st, out_tx) = (st.clone(), out_tx.clone());
+            tokio::spawn(async move {
+                for reply in handle_cmd(st, req).await {
+                    let _ = out_tx.send(reply);
+                }
+            });
+            continue;
+        }
         for reply in handle_cmd(st.clone(), req).await {
             if out_tx.send(reply).is_err() {
                 break;
@@ -2678,6 +2891,59 @@ async fn socket_loop(st: Arc<AppState>, socket: WebSocket) {
     }
     pump.abort();
     write.abort();
+}
+
+/// `GET /font/<file>?token=…`: a listed font file (bundled, or one the
+/// creator added) with its content type and a year of caching. Only a name
+/// the fonts listing holds is served, so no other file can be read through
+/// it; the cache key is the file name plus `?v=<rev>` from the listing.
+async fn font_handler(
+    AxPath(file): AxPath<String>,
+    Query(q): Query<TokenQ>,
+    headers: axum::http::HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    use axum::http::header;
+    if q.token != st.token {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+    let found = tokio::task::spawn_blocking(move || lib.locate(&file))
+        .await
+        .ok()
+        .flatten();
+    let Some((src, ctype, rev)) = found else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let etag = format!("\"{rev}\"");
+    let cache = [
+        (
+            header::CACHE_CONTROL,
+            "public, max-age=31536000".to_string(),
+        ),
+        (header::ETAG, etag.clone()),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+    ];
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+    {
+        return (StatusCode::NOT_MODIFIED, cache).into_response();
+    }
+    let body: Vec<u8> = match src {
+        crate::fonts::FontFile::Bundled(b) => b.to_vec(),
+        crate::fonts::FontFile::User(p) => match tokio::fs::read(p).await {
+            Ok(b) => b,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        },
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, ctype.to_string())],
+        cache,
+        body,
+    )
+        .into_response()
 }
 
 async fn art_handler(
@@ -2788,6 +3054,13 @@ pub async fn run_serve(
     std::fs::create_dir_all(&data_dir)?;
     let _ = JOBS_ROOT.set(data_dir.join("jobs"));
     std::fs::create_dir_all(jobs_root())?;
+    // libass reads `<data dir>/fonts`: the bundled fonts go there, beside the
+    // creator's, and Looks and layout learn the creator's families.
+    crate::provision::set_data_dir(data_dir.clone());
+    if let Err(e) = crate::provision::ensure_fonts() {
+        tracing::warn!("fonts: could not write the bundled fonts: {e}");
+    }
+    crate::fonts::Library::active().publish();
     let token = token.filter(|t| !t.is_empty()).unwrap_or_else(|| {
         // Per-boot token: local-only auth without stored secrets.
         format!("{:x}{:x}", now_ms(), std::process::id())
@@ -2803,6 +3076,7 @@ pub async fn run_serve(
         bus,
         id_counter: AtomicU64::new(1),
         mcp: mcp::Mcp::default(),
+        preview: Default::default(),
     };
     st.settings = Mutex::new(st.load_settings());
     st.jobs = Mutex::new(reload_jobs());
@@ -2813,6 +3087,7 @@ pub async fn run_serve(
     let app = axum::Router::new()
         .route("/ws", get(ws_handler))
         .route("/art/{job}/{file}", get(art_handler))
+        .route("/font/{file}", get(font_handler))
         .route("/src/{job}", get(src_handler))
         // Loopback-only daemon, token-gated URLs: permissive CORS lets the
         // desktop webview fetch blobs (downloads) without a proxy.
@@ -2860,6 +3135,62 @@ mod tests {
         assert_eq!(args_for(&src, &out, &o, &s).unwrap().caption_anim, "words");
         o.caption_anim = Some("bogus".into());
         assert_eq!(args_for(&src, &out, &o, &s).unwrap().caption_anim, "pop");
+    }
+
+    #[test]
+    fn look_reaches_args_and_only_when_set() {
+        let (src, out, mut o, s) = opts();
+        let plain = args_for(&src, &out, &o, &s).unwrap();
+        assert!(plain.look.is_none());
+        // No look, `{}`, null and junk leave the argv alone.
+        for v in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("nope")),
+        ] {
+            o.look = v;
+            let a = args_for(&src, &out, &o, &s).unwrap();
+            assert!(a.look.is_none(), "{:?}", o.look);
+        }
+        // A look travels as compact JSON and parses back to the same thing.
+        o.look =
+            Some(serde_json::json!({"v": 1, "captions": {"x": 0.5, "y": 0.25, "anim": "bounce"}}));
+        let a = args_for(&src, &out, &o, &s).unwrap();
+        let raw = a.look.clone().unwrap();
+        assert!(!raw.contains('\n') && !raw.contains(": "), "{raw}");
+        let c = crate::look::Look::from_arg(&raw).captions.unwrap();
+        assert_eq!((c.x, c.y), (Some(0.5), Some(0.25)));
+        assert_eq!(c.anim, Some(crate::captions::ass::Anim::Bounce));
+        // Everything else in the argv is unchanged.
+        let b = crate::cli::Args { look: None, ..a };
+        assert_eq!(format!("{b:?}"), format!("{plain:?}"));
+    }
+
+    #[test]
+    fn job_options_with_an_odd_look_still_deserialise() {
+        let o: JobOptions = serde_json::from_str(
+            r#"{"style":"hormozi","look":{"v":9,"future":[1,2],"captions":{"x":0.2,"sparkle":true,"font":42},"hologram":{"on":1}},"also_new":1}"#,
+        )
+        .unwrap();
+        assert_eq!(o.style.as_deref(), Some("hormozi"));
+        let look = o.look.clone().unwrap();
+        assert_eq!(look["captions"]["sparkle"], true);
+        // A look of the wrong JSON type does not break the frame either.
+        let o2: JobOptions = serde_json::from_str(r#"{"look":"not an object"}"#).unwrap();
+        let (src, out, _, s) = opts();
+        assert!(args_for(&src, &out, &o2, &s).unwrap().look.is_none());
+        // Saved presets carry it through a round trip.
+        let p = Preset {
+            name: "x".into(),
+            options: o,
+        };
+        let back: Preset = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.options.look, Some(look));
+        // The engine side reads what it understands and ignores the rest.
+        let a = args_for(&src, &out, &back.options, &s).unwrap();
+        let l = crate::look::Look::from_arg(a.look.as_deref().unwrap());
+        assert_eq!(l.captions.unwrap().x, Some(0.2));
     }
 
     #[test]
@@ -3205,6 +3536,268 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn hello_announces_what_the_engine_can_do() {
+        let (bus, _) = broadcast::channel::<ServerMsg>(8);
+        let st = Arc::new(AppState {
+            token: "t".into(),
+            data_dir: std::env::temp_dir().join(format!("digiclip-hello-{}", std::process::id())),
+            jobs: Mutex::new(HashMap::new()),
+            settings: Mutex::new(Settings::default()),
+            model_runs: Mutex::new(HashMap::new()),
+            worker: Semaphore::new(1),
+            bus,
+            id_counter: AtomicU64::new(1),
+            mcp: mcp::Mcp::default(),
+            preview: Default::default(),
+        });
+        let msg: ClientMsg = serde_json::from_str(r#"{"id":1,"cmd":"hello"}"#).unwrap();
+        let replies = handle_cmd(st, msg).await;
+        let ServerMsg::Res {
+            ok: true,
+            data: Some(data),
+            ..
+        } = &replies[0]
+        else {
+            panic!("hello did not answer ok: {replies:?}");
+        };
+        let caps: Vec<&str> = data["caps"]
+            .as_array()
+            .expect("caps is an array")
+            .iter()
+            .filter_map(|c| c.as_str())
+            .collect();
+        assert!(caps.contains(&"look"), "{caps:?}");
+        for s in ["captions", "headline", "bar", "logo"] {
+            assert!(caps.contains(&format!("look.{s}").as_str()), "{caps:?}");
+        }
+        assert_eq!(caps, crate::look::CAPS);
+        assert!(caps.contains(&"preview_frame"), "{caps:?}");
+    }
+
+    // ---- preview_frame ---------------------------------------------------
+
+    fn preview_state(name: &str) -> Arc<AppState> {
+        let (bus, _) = broadcast::channel::<ServerMsg>(8);
+        Arc::new(AppState {
+            token: "t".into(),
+            data_dir: std::env::temp_dir().join(format!("digiclip-{name}-{}", std::process::id())),
+            jobs: Mutex::new(HashMap::new()),
+            settings: Mutex::new(Settings::default()),
+            model_runs: Mutex::new(HashMap::new()),
+            worker: Semaphore::new(1),
+            bus,
+            id_counter: AtomicU64::new(1),
+            mcp: mcp::Mcp::default(),
+            preview: Default::default(),
+        })
+    }
+
+    fn job_with(id: &str, source: &Path, dir: &Path, clip_title: Option<&str>) -> LiveJob {
+        let clips: Vec<ClipState> = clip_title
+            .map(|t| {
+                serde_json::from_value(serde_json::json!({
+                    "rank": 1, "title": t, "hook": "h", "start_s": 0.0, "end_s": 4.0,
+                    "tight_dur": 4.0, "style": "karaoke", "source": "llm", "score": 1.0,
+                    "mp4": null, "poster": null, "ass": null, "srt": null, "kit": null
+                }))
+                .unwrap()
+            })
+            .into_iter()
+            .collect();
+        LiveJob::new(JobRecord {
+            id: id.into(),
+            name: "Job title".into(),
+            source: source.display().to_string(),
+            status: JobStatus::Done,
+            options: JobOptions::default(),
+            clips,
+            error: None,
+            created_ms: 1,
+            out_dir: dir.display().to_string(),
+            duration_s: 4.0,
+            url: None,
+            origin: None,
+        })
+    }
+
+    fn reply(msgs: Vec<ServerMsg>) -> (bool, Option<String>, Option<serde_json::Value>) {
+        match msgs.into_iter().next() {
+            Some(ServerMsg::Res {
+                ok, error, data, ..
+            }) => (ok, error, data),
+            other => panic!("not a reply: {other:?}"),
+        }
+    }
+
+    async fn ask(
+        st: &Arc<AppState>,
+        json: &str,
+    ) -> (bool, Option<String>, Option<serde_json::Value>) {
+        let msg: ClientMsg = serde_json::from_str(json).unwrap();
+        reply(handle_cmd(st.clone(), msg).await)
+    }
+
+    #[test]
+    fn preview_frame_frames_parse() {
+        let m: ClientMsg = serde_json::from_str(
+            r#"{"id":9,"cmd":"preview_frame","job":"job-1","start_s":128.06,"len_s":12,"t":3.5,
+                "options":{"style":"hormozi","aspect":"9:16","headline":"",
+                           "look":{"captions":{"y":0.35,"size":1.4}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(m.id, 9);
+        match m.cmd {
+            Cmd::PreviewFrame {
+                job,
+                start_s,
+                len_s,
+                t,
+                options,
+            } => {
+                assert_eq!(job, "job-1");
+                assert_eq!((start_s, len_s, t), (128.06, 12.0, 3.5));
+                assert_eq!(options.style.as_deref(), Some("hormozi"));
+                assert_eq!(options.headline.as_deref(), Some(""));
+                assert_eq!(options.look.unwrap()["captions"]["y"], 0.35);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+        // Everything but the job has a default: the Studio's 12 s window.
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"id":1,"cmd":"preview_frame","job":"j"}"#).unwrap();
+        assert!(matches!(
+            m.cmd,
+            Cmd::PreviewFrame { start_s, len_s, t, ref options, .. }
+                if start_s == 0.0 && len_s == 12.0 && t == 0.0 && options.look.is_none()
+        ));
+    }
+
+    #[tokio::test]
+    async fn preview_frame_failures_are_replies() {
+        let st = preview_state("preview-errors");
+        // Unknown job.
+        let (ok, e, data) = ask(&st, r#"{"id":1,"cmd":"preview_frame","job":"nope"}"#).await;
+        assert!(!ok && data.is_none());
+        assert_eq!(e.as_deref(), Some("unknown job"));
+        // A job whose source is gone.
+        let dir =
+            std::env::temp_dir().join(format!("digiclip-preview-gone-{}", std::process::id()));
+        st.jobs.lock().await.insert(
+            "job-x".into(),
+            job_with("job-x", &dir.join("missing.mp4"), &dir, None),
+        );
+        let (ok, e, _) = ask(&st, r#"{"id":2,"cmd":"preview_frame","job":"job-x","t":1}"#).await;
+        assert!(!ok);
+        assert!(e.unwrap().contains("source video is not reachable"));
+        // No window to speak of.
+        let (ok, e, _) = ask(
+            &st,
+            r#"{"id":3,"cmd":"preview_frame","job":"job-x","len_s":0}"#,
+        )
+        .await;
+        assert!(!ok && e.unwrap().contains("len_s"));
+        // Nothing was written next to the job.
+        assert!(!dir.join("preview-0.jpg").exists());
+    }
+
+    /// The whole path on a real (synthetic) video: needs ffmpeg with libass,
+    /// skipped without.
+    #[tokio::test]
+    async fn preview_frame_draws_a_still() {
+        let Some(ffmpeg) = crate::binaries::resolve("ffmpeg") else {
+            return;
+        };
+        if !crate::binaries::ffmpeg_has_libass(&ffmpeg) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.mp4");
+        let made = crate::process::command(&ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=duration=4:size=640x360:rate=30")
+            .args([
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+            ])
+            .arg(&src)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            return;
+        }
+        let words: Vec<serde_json::Value> = (0..8)
+            .map(|i| {
+                serde_json::json!({"w": format!("word{i}"), "s": 0.4 * i as f64 + 0.1, "e": 0.4 * i as f64 + 0.45})
+            })
+            .collect();
+        std::fs::write(
+            dir.path().join("transcript.json"),
+            serde_json::json!({"words": words, "segments": [], "language": "en", "model": "x"})
+                .to_string(),
+        )
+        .unwrap();
+        let st = preview_state("preview-still");
+        st.jobs.lock().await.insert(
+            "job-p".into(),
+            job_with("job-p", &src, dir.path(), Some("First clip")),
+        );
+        // A bad Look still renders; t past the window is clamped to its end.
+        let (ok, e, data) = ask(
+            &st,
+            r##"{"id":1,"cmd":"preview_frame","job":"job-p","start_s":0.5,"len_s":3,"t":99,
+                "options":{"style":"hormozi","aspect":"1:1","headline":"","progress_bar":"#FF3B30",
+                           "look":{"v":9,"captions":{"y":"low","x":7,"size":1.4,"box":"#123"},"hologram":1}}}"##,
+        )
+        .await;
+        assert!(ok, "{e:?}");
+        let d = data.unwrap();
+        assert_eq!(
+            (d["width"].as_u64(), d["height"].as_u64()),
+            (Some(720), Some(720))
+        );
+        assert_eq!(d["t"], 3.0);
+        assert_eq!(d["layout"], "single");
+        assert!(d["words"].as_u64().unwrap() > 0 && d["rev"].as_u64().is_some());
+        let file = d["file"].as_str().unwrap().to_string();
+        let jpg = std::fs::read(dir.path().join(&file)).unwrap();
+        assert!(jpg.starts_with(&[0xFF, 0xD8]), "not a JPEG");
+        assert_eq!(
+            crate::render::image_size(&dir.path().join(&file)),
+            Some((720, 720))
+        );
+        // The next picture gets another name, and only a few ever exist.
+        let (ok, _, data) = ask(
+            &st,
+            r#"{"id":2,"cmd":"preview_frame","job":"job-p","start_s":0,"len_s":3,"t":1,
+                "options":{"aspect":"9:16","layout":"split"}}"#,
+        )
+        .await;
+        assert!(ok);
+        let d2 = data.unwrap();
+        assert_ne!(d2["file"].as_str().unwrap(), file);
+        assert_eq!(d2["layout"], "split");
+        assert_eq!(d2["height"], 720);
+        for i in 3..7 {
+            let (ok, ..) = ask(
+                &st,
+                &format!(r#"{{"id":{i},"cmd":"preview_frame","job":"job-p","t":0.{i}}}"#),
+            )
+            .await;
+            assert!(ok);
+        }
+        let previews = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("preview-"))
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".jpg"))
+            .count();
+        assert!(previews <= 4, "{previews} preview files");
+    }
+
     #[test]
     fn ai_models_wire_names() {
         let m: ClientMsg =
@@ -3299,5 +3892,185 @@ mod tests {
         assert_eq!(c.rev, 0);
         assert!(c.why.is_empty() && c.scores.is_none() && c.hashtags.is_empty());
         assert_eq!(c.render_status, "pending");
+    }
+
+    // ---- fonts -------------------------------------------------------------
+
+    fn fonts_state(name: &str) -> Arc<AppState> {
+        let st = preview_state(name);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+        st
+    }
+
+    #[test]
+    fn font_frames_parse_and_keep_their_frame_id() {
+        let m: ClientMsg = serde_json::from_str(r#"{"id":3,"cmd":"fonts_list"}"#).unwrap();
+        assert!(matches!(m.cmd, Cmd::FontsList));
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"id":4,"cmd":"fonts_add","path":"C:\\f\\x.ttf"}"#).unwrap();
+        assert!(matches!(m.cmd, Cmd::FontsAdd { ref path } if path == "C:\\f\\x.ttf"));
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"id":5,"cmd":"fonts_remove","font":"Pacifico"}"#).unwrap();
+        assert_eq!(m.id, 5);
+        assert!(matches!(m.cmd, Cmd::FontsRemove { ref font } if font == "Pacifico"));
+        assert!(crate::look::CAPS.contains(&"look.fonts"));
+    }
+
+    #[tokio::test]
+    async fn fonts_list_add_and_remove_over_the_socket() {
+        use crate::captions::metrics::testfont;
+        let st = fonts_state("serve-font-cmds");
+        let (ok, e, data) = ask(&st, r#"{"id":1,"cmd":"fonts_list"}"#).await;
+        assert!(ok, "{e:?}");
+        let d = data.unwrap();
+        let n = crate::fonts::BUNDLED.len();
+        assert_eq!(d["fonts"].as_array().unwrap().len(), n);
+        assert_eq!(d["fonts"][0]["family"], "Anton");
+        assert_eq!(d["fonts"][0]["bundled"], true);
+        assert_eq!(d["fonts"][0]["category"], "display");
+        assert_eq!(d["fonts"][0]["file"], "Anton-Regular.ttf");
+        assert_eq!(d["fonts"][0]["url"], "/font/Anton-Regular.ttf");
+        assert_eq!(d["max_bytes"], 20 * 1024 * 1024);
+        assert!(d["dir"].as_str().unwrap().ends_with("fonts"));
+        // Add a font from a file path, answered with its entry.
+        let src = st.data_dir.join("incoming");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("Serve Marker.ttf");
+        std::fs::write(&file, testfont::build("Serve Marker", false)).unwrap();
+        let path = serde_json::to_string(&file.display().to_string()).unwrap();
+        let add = format!(r#"{{"id":2,"cmd":"fonts_add","path":{path}}}"#);
+        let (ok, e, data) = ask(&st, &add).await;
+        assert!(ok, "{e:?}");
+        let f = data.unwrap()["font"].clone();
+        assert_eq!(
+            (f["family"].as_str(), f["file"].as_str()),
+            (Some("Serve Marker"), Some("Serve-Marker.ttf"))
+        );
+        assert_eq!(
+            (f["bundled"].as_bool(), f["category"].as_str()),
+            (Some(false), Some("custom"))
+        );
+        assert!(st.data_dir.join("fonts").join("Serve-Marker.ttf").is_file());
+        // Listed after the bundled ones; a repeat is refused.
+        let (_, _, data) = ask(&st, r#"{"id":3,"cmd":"fonts_list"}"#).await;
+        let all = data.unwrap()["fonts"].clone();
+        assert_eq!(all.as_array().unwrap().len(), n + 1);
+        assert_eq!(all[n]["family"], "Serve Marker");
+        let (ok, e, _) = ask(&st, &add).await;
+        assert!(!ok && e.unwrap().contains("already added"));
+        // A Look can name it now.
+        assert_eq!(crate::fonts::resolve("serve marker"), Some("Serve Marker"));
+        // Refusals come back as errors, not crashes.
+        let junk = src.join("junk.ttf");
+        std::fs::write(&junk, b"not a font").unwrap();
+        let jp = serde_json::to_string(&junk.display().to_string()).unwrap();
+        let (ok, e, _) = ask(&st, &format!(r#"{{"id":5,"cmd":"fonts_add","path":{jp}}}"#)).await;
+        assert!(!ok && e.unwrap().contains("cannot add “junk.ttf”"));
+        let (ok, e, _) = ask(&st, r#"{"id":6,"cmd":"fonts_remove","font":"Anton"}"#).await;
+        assert!(!ok && e.unwrap().contains("cannot be removed"));
+        // Remove it again.
+        let rm = r#"{"id":7,"cmd":"fonts_remove","font":"Serve Marker"}"#;
+        let (ok, e, data) = ask(&st, rm).await;
+        assert!(ok, "{e:?}");
+        assert_eq!(data.unwrap()["font"]["file"], "Serve-Marker.ttf");
+        assert!(!st.data_dir.join("fonts").join("Serve-Marker.ttf").exists());
+        assert_eq!(crate::fonts::resolve("Serve Marker"), None);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    async fn get_font(
+        st: &Arc<AppState>,
+        uri: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/font/{file}", get(font_handler))
+            .with_state(st.clone());
+        let mut req = axum::http::Request::builder().uri(uri);
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        let res = app
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let body = axum::body::to_bytes(res.into_body(), 64 << 20)
+            .await
+            .unwrap();
+        (status, headers, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn the_font_route_serves_listed_fonts_and_nothing_else() {
+        use crate::captions::metrics::testfont;
+        let st = fonts_state("serve-font-route");
+        let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+        let src = st.data_dir.join("src.otf");
+        std::fs::create_dir_all(&st.data_dir).unwrap();
+        std::fs::write(&src, testfont::build("Route Marker", true)).unwrap();
+        let mine = lib.add(&src).unwrap();
+        // Things that must stay out of reach: beside the fonts, and above.
+        std::fs::write(
+            st.data_dir.join("settings.json"),
+            r#"{"openrouter_key":"private"}"#,
+        )
+        .unwrap();
+        std::fs::write(lib.dir().join("notes.txt"), "private").unwrap();
+        // The right token, a bundled font: its bytes, type and caching.
+        let (code, h, body) = get_font(&st, "/font/Anton-Regular.ttf?token=t", &[]).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(h["content-type"], "font/ttf");
+        assert!(h["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("max-age=31536000"));
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(body, crate::fonts::BUNDLED[0].bytes);
+        // 304 on a repeat with the validator.
+        let etag = h["etag"].to_str().unwrap().to_string();
+        let (code, _, body) = get_font(
+            &st,
+            "/font/Anton-Regular.ttf?token=t",
+            &[("if-none-match", &etag)],
+        )
+        .await;
+        assert_eq!((code, body.len()), (StatusCode::NOT_MODIFIED, 0));
+        // The creator's font, as read from disk.
+        let uri = format!("/font/{}?token=t&v={}", mine.file, mine.rev);
+        let (code, h, body) = get_font(&st, &uri, &[]).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(h["content-type"], "font/otf");
+        assert_eq!(body, std::fs::read(&src).unwrap());
+        // No token, a wrong token.
+        let unauth = |q: &'static str| format!("/font/Anton-Regular.ttf{q}");
+        // (No token at all is refused before the handler runs.)
+        assert!(!get_font(&st, &unauth(""), &[]).await.0.is_success());
+        assert_eq!(
+            get_font(&st, &unauth("?token=x"), &[]).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        // Nothing else is readable through it, however it is spelled.
+        for bad in [
+            "notes.txt",
+            "settings.json",
+            "..%2Fsettings.json",
+            "..%5Csettings.json",
+            "%2E%2E%2Fsettings.json",
+            "%2e%2e%5c%2e%2e%5csettings.json",
+            "Anton-Regular.ttf%00.txt",
+            "C%3A%5CWindows%5Cwin.ini",
+            "nothere.ttf",
+            "Anton-Regular.ttf.part",
+            ".ttf",
+        ] {
+            let (code, _, body) = get_font(&st, &format!("/font/{bad}?token=t"), &[]).await;
+            assert_ne!(code, StatusCode::OK, "{bad}");
+            assert!(!String::from_utf8_lossy(&body).contains("private"), "{bad}");
+        }
+        let (code, _, _) = get_font(&st, "/font/a/b.ttf?token=t", &[]).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 }

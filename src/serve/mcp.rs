@@ -1469,6 +1469,7 @@ fn options_schema() -> Value {
             "focus": { "type": "string", "description": "Topic to steer picking toward, e.g. \"pricing, AI agents\"." },
             "style": { "type": "string", "enum": ["tiktok", "karaoke", "hormozi", "minimal", "beast", "neon", "highlight", "ghost"], "description": "Caption style." },
             "caption_anim": { "type": "string", "enum": ["pop", "words", "none"] },
+            "look": { "type": "object", "description": "How clips look. Sections: captions, headline, bar, logo, camera, effects, layout. Positions x, y are the centre of the element as a fraction of the frame (0..1). look.captions: x, y, size (0.5..2), font (Anton, Archivo Black, Inter Medium, JetBrains Mono), case (upper, asis), color, active, accent, outline (#RRGGBB), outline_w, shadow, box (#RRGGBB, or none), box_opacity, max_words (1..8), anim (pop, words, none, fade, slide, bounce). look.headline (while a headline is on): x, y, size (0.5..2), ink, card (#RRGGBB, or none), accent (#RRGGBB), anim (pop, fade, none), seconds (0 = whole clip). look.bar (while the progress bar is on): pos (bottom, top), height (0.5..3). look.logo (while a logo is set): x, y (win over logo_pos), size (0.4..2.5), opacity (0..1). look.camera: feel (locked = one framing per shot, steady, smooth = today, lively), zoom (0.8..1.4, how tight the face framing is, 1 = today), punch (1..1.4, peak scale of the emphasis punch-ins while punch-ins are on). look.effects (picture only, never captions, headline, logo or bar): vignette (0..1), grade (none, warm, cool, mono, punchy), fill_dim (0..1, darkness of the blurred fill behind letterboxed video; 0.4 = today). look.layout: split (0.3..0.7, the top panel's share of the height in split-screen, 0.5 = today). Unset fields keep today's look." },
             "aspect": { "type": "string", "description": "Canvas(es): 9:16 (default), 4:5, 1:1, 16:9; comma-separate for extra versions, e.g. \"9:16,1:1\"." },
             "framing": { "type": "string", "enum": ["smart", "center"], "description": "smart follows faces." },
             "layout": { "type": "string", "enum": ["auto", "single", "split"], "description": "Two-person split screen." },
@@ -1834,6 +1835,7 @@ mod tests {
             bus,
             id_counter: std::sync::atomic::AtomicU64::new(1),
             mcp: Mcp::default(),
+            preview: Default::default(),
         })
     }
 

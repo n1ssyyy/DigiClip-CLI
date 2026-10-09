@@ -60,11 +60,12 @@ fn median_face(fs: &[&Face]) -> Face {
 /// Half-canvas crops for a pair of typical faces (`x`/`y` are centers).
 /// Each crop keeps the face a little above center and stops short of the
 /// other person where it can.
-fn pair_rects(l: &Face, r: &Face, sw: f64, sh: f64, canvas: Canvas) -> (Rect, Rect) {
-    let aspect = canvas.w as f64 / (canvas.h as f64 / 2.0);
-    let min_h = canvas.min_crop_h() / 2.0;
+fn pair_rects(l: &Face, r: &Face, sw: f64, sh: f64, canvas: Canvas, top_frac: f64) -> (Rect, Rect) {
     let sep = (r.x - l.x).abs();
-    let one = |f: &Face| {
+    // The top panel takes `top_frac` of the height (half today).
+    let one = |f: &Face, share: f64| {
+        let aspect = canvas.w as f64 / (canvas.h as f64 * share);
+        let min_h = canvas.min_crop_h() * share;
         let mut h = (f.h * HEADROOM).max(min_h).min(sh);
         // Stay off the neighbor, but never tighter than the face needs.
         let floor = (f.h * 1.6).max(min_h);
@@ -78,12 +79,14 @@ fn pair_rects(l: &Face, r: &Face, sw: f64, sh: f64, canvas: Canvas) -> (Rect, Re
         }
         Rect::from_center(f.x, f.y + 0.12 * h, w, h).clamped(sw, sh)
     };
-    (one(l), one(r))
+    (one(l, top_frac), one(r, 1.0 - top_frac))
 }
 
 /// Crops per source shot over `[a, b)`: `(shot start, top, bottom)`. A
 /// shot with too few sightings borrows its neighbor's crops (then the
-/// clip's). Empty without any sighting.
+/// clip's). Empty without any sighting. `top_frac`: the top panel's share of
+/// the height (0.5 = an even split).
+#[allow(clippy::too_many_arguments)]
 pub fn plan(
     duo: &[Duo],
     shots: &[f64],
@@ -92,6 +95,7 @@ pub fn plan(
     sw: f64,
     sh: f64,
     canvas: Canvas,
+    top_frac: f64,
 ) -> Vec<(f64, Rect, Rect)> {
     if duo.is_empty() {
         return vec![];
@@ -99,7 +103,7 @@ pub fn plan(
     let rects_of = |ds: &[&Duo]| {
         let l: Vec<&Face> = ds.iter().map(|d| &d.left).collect();
         let r: Vec<&Face> = ds.iter().map(|d| &d.right).collect();
-        pair_rects(&median_face(&l), &median_face(&r), sw, sh, canvas)
+        pair_rects(&median_face(&l), &median_face(&r), sw, sh, canvas, top_frac)
     };
     let all: Vec<&Duo> = duo.iter().collect();
     let whole = rects_of(&all);
@@ -170,7 +174,7 @@ mod tests {
     #[test]
     fn crops_frame_each_person_in_a_half() {
         let duo: Vec<Duo> = (0..30).map(|i| pod(i as f64 * 0.1)).collect();
-        let p = plan(&duo, &[], 0.0, 3.0, 1920.0, 1080.0, Canvas::TALL);
+        let p = plan(&duo, &[], 0.0, 3.0, 1920.0, 1080.0, Canvas::TALL, 0.5);
         assert_eq!(p.len(), 1);
         let (top, bot) = at(&p, 1.0).unwrap();
         for (r, cx) in [(top, 560.0), (bot, 1400.0)] {
@@ -186,6 +190,24 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_seam_gives_each_panel_its_own_aspect() {
+        let duo: Vec<Duo> = (0..30).map(|i| pod(i as f64 * 0.1)).collect();
+        let crops = |frac: f64| {
+            let p = plan(&duo, &[], 0.0, 3.0, 1920.0, 1080.0, Canvas::TALL, frac);
+            at(&p, 1.0).unwrap()
+        };
+        let (top, bot) = crops(0.6);
+        // 1080x1152 on top, 1080x768 below.
+        assert!((top.w / top.h - 1080.0 / 1152.0).abs() < 1e-6);
+        assert!((bot.w / bot.h - 1080.0 / 768.0).abs() < 1e-6);
+        assert!(top.x >= 0.0 && top.x + top.w <= 1920.0 + 1e-9);
+        assert!(bot.y >= 0.0 && bot.y + bot.h <= 1080.0 + 1e-9);
+        // 0.5 is the even split, as before.
+        let (t5, b5) = crops(0.5);
+        assert!((t5.w / t5.h - 1.125).abs() < 1e-6 && (b5.w / b5.h - 1.125).abs() < 1e-6);
+    }
+
+    #[test]
     fn shots_get_their_own_crops_and_thin_shots_borrow() {
         let mut duo: Vec<Duo> = (0..10).map(|i| pod(i as f64 * 0.2)).collect();
         // After the cut at 5s the pair sits further right.
@@ -195,7 +217,16 @@ mod tests {
             d.right.x += 200.0;
             duo.push(d);
         }
-        let p = plan(&duo, &[5.0, 9.0], 0.0, 12.0, 1920.0, 1080.0, Canvas::TALL);
+        let p = plan(
+            &duo,
+            &[5.0, 9.0],
+            0.0,
+            12.0,
+            1920.0,
+            1080.0,
+            Canvas::TALL,
+            0.5,
+        );
         assert_eq!(p.len(), 3);
         let (a, _) = at(&p, 1.0).unwrap();
         let (b, _) = at(&p, 6.0).unwrap();
@@ -203,6 +234,6 @@ mod tests {
         assert!(b.cx() > a.cx() + 150.0);
         // No sightings after 9s: the previous shot's crops hold.
         assert_eq!(b, c);
-        assert!(plan(&[], &[], 0.0, 1.0, 1920.0, 1080.0, Canvas::TALL).is_empty());
+        assert!(plan(&[], &[], 0.0, 1.0, 1920.0, 1080.0, Canvas::TALL, 0.5).is_empty());
     }
 }
