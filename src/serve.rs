@@ -5,7 +5,9 @@
 //!   `{id, cmd, …params}` commands and gets `{type: "res", id, ok, …}`
 //!   replies plus `{type: "ev", …}` push events. On `hello` the server
 //!   answers with a full `snapshot` (jobs, settings, models, health),
-//!   so reconnects resync without a single HTTP fetch.
+//!   so reconnects resync without a single HTTP fetch. `health` is the last
+//!   background probe, or `null` before the first one finished; the probe
+//!   never delays an answer and its result arrives as a `health` event.
 //! - `GET /art/<job>/<file>?token=…` — job artifacts (mp4 with Range
 //!   seeks for `<video>`, posters, ass/srt/kit) via [`ServeFile`].
 //!
@@ -73,6 +75,7 @@ use tower_http::services::ServeFile;
 use crate::progress::{ClipArtifact, Emitter, JobEvent, Stage};
 
 mod diag;
+mod health;
 pub mod mcp;
 mod mcp_apps;
 mod watch;
@@ -651,7 +654,7 @@ struct ModelState {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct Health {
     version: String,
     ffmpeg_ok: bool,
@@ -665,6 +668,45 @@ struct Health {
     jobs_dir: String,
 }
 
+/// Does this ffmpeg have libass? It cannot change while the same file is in
+/// place, and finding out starts ffmpeg twice, so the answer is kept for the
+/// same path, size and modified time (a replaced ffmpeg is asked again).
+fn ffmpeg_libass_cached(ffmpeg: &Path) -> bool {
+    type Key = (PathBuf, u64, Option<SystemTime>);
+    static KNOWN: std::sync::Mutex<Option<(Key, bool)>> = std::sync::Mutex::new(None);
+    let key: Key = match std::fs::metadata(ffmpeg) {
+        Ok(m) => (ffmpeg.to_path_buf(), m.len(), m.modified().ok()),
+        Err(_) => return crate::binaries::ffmpeg_has_libass(ffmpeg),
+    };
+    if let Some((k, v)) = KNOWN.lock().unwrap().as_ref() {
+        if *k == key {
+            return *v;
+        }
+    }
+    let v = crate::binaries::ffmpeg_has_libass(ffmpeg);
+    *KNOWN.lock().unwrap() = Some((key, v));
+    v
+}
+
+#[cfg(test)]
+impl Health {
+    /// A made-up result that tells tests which probe it came from.
+    fn fake(tag: &str) -> Health {
+        Health {
+            version: tag.into(),
+            ffmpeg_ok: true,
+            ffmpeg_libass: true,
+            encoder: "libx264".into(),
+            whisper_cli: true,
+            whisper_vulkan: false,
+            yunet_ok: true,
+            gpu_available: false,
+            gpu_reason: "test".into(),
+            jobs_dir: String::new(),
+        }
+    }
+}
+
 fn probe_health() -> Health {
     let ffmpeg = crate::binaries::resolve("ffmpeg");
     let whisper_cli = crate::binaries::resolve("whisper-cli").is_some();
@@ -674,9 +716,7 @@ fn probe_health() -> Health {
     Health {
         version: env!("CARGO_PKG_VERSION").into(),
         ffmpeg_ok: ffmpeg.is_some(),
-        ffmpeg_libass: ffmpeg
-            .as_ref()
-            .is_some_and(|f| crate::binaries::ffmpeg_has_libass(f)),
+        ffmpeg_libass: ffmpeg.as_ref().is_some_and(|f| ffmpeg_libass_cached(f)),
         encoder: crate::render::pick_encoder(gpu_available),
         whisper_cli,
         whisper_vulkan,
@@ -685,15 +725,6 @@ fn probe_health() -> Health {
         gpu_reason,
         jobs_dir: jobs_root().display().to_string(),
     }
-}
-
-/// `probe_health` shells out (ffmpeg, nvidia-smi and a WMI query that can
-/// take seconds), so async callers run it on the blocking pool instead of
-/// stalling a runtime worker and, with it, the socket.
-async fn health() -> Health {
-    tokio::task::spawn_blocking(probe_health)
-        .await
-        .expect("health probe panicked")
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +977,8 @@ struct AppState {
     bus: broadcast::Sender<ServerMsg>,
     id_counter: AtomicU64,
     mcp: mcp::Mcp,
+    /// The last health probe and the one-at-a-time gate (see `health`).
+    health: health::HealthCache,
     /// `preview_frame`: one still at a time, and their numbering.
     preview: crate::preview::Gate,
 }
@@ -1691,7 +1724,7 @@ async fn snapshot(st: &AppState) -> serde_json::Value {
         "jobs": records,
         "settings": settings,
         "models": models,
-        "health": health().await,
+        "health": st.health.known(&st.bus),
         "mcp": mcp::public(st).await,
         // What this engine can do, so the app only enables live controls.
         "caps": crate::look::CAPS,
@@ -2065,11 +2098,13 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                         body: mid.clone(),
                     },
                 });
-                let _ = st2.bus.send(ServerMsg::Ev {
-                    ev: Event::Health {
-                        health: health().await,
-                    },
-                });
+                // A probe that starts now (the binaries may have changed):
+                // it is stored, and sent to every client here.
+                if let Some(health) = st2.health.fresh(&st2.bus).await {
+                    let _ = st2.bus.send(ServerMsg::Ev {
+                        ev: Event::Health { health },
+                    });
+                }
             });
             vec![ok(id, None)]
         }
@@ -2102,7 +2137,10 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 Err(e) => vec![err(id, e)],
             }
         }
-        Cmd::HealthGet => vec![ok(id, Some(serde_json::json!(health().await)))],
+        Cmd::HealthGet => match st.health.fresh(&st.bus).await {
+            Some(h) => vec![ok(id, Some(serde_json::json!(h)))],
+            None => vec![err(id, "the health probe failed")],
+        },
         Cmd::AiModels { provider, refresh } => match ai_models(&st, provider, refresh).await {
             Ok(v) => vec![ok(id, Some(v))],
             Err(e) => vec![err(id, e)],
@@ -3072,6 +3110,7 @@ pub async fn run_serve(
         bus,
         id_counter: AtomicU64::new(1),
         mcp: mcp::Mcp::default(),
+        health: health::HealthCache::default(),
         preview: Default::default(),
     };
     // What a first `hello` reports: the saved settings and the saved jobs.
@@ -3138,7 +3177,9 @@ async fn serve_ready(
 /// - the MCP server: the bridge copy of this executable, its port,
 ///   `server.json` and the probe of the AI apps' config files (`mcp_start`).
 ///   Until it is done a hello says `mcp.running = false, mcp.starting = true`,
-///   and the app gets an `mcp` event when it is up.
+///   and the app gets an `mcp` event when it is up;
+/// - the first health probe (ffmpeg, GPU). Until it is done a hello says
+///   `health: null`, and the app gets a `health` event when it is stored.
 async fn boot_after_banner<W, F, Fut>(st: Arc<AppState>, fonts: W, mcp_start: F)
 where
     W: FnOnce() + Send + 'static,
@@ -3146,6 +3187,9 @@ where
     Fut: std::future::Future<Output = ()> + Send,
 {
     tokio::spawn(watch::run(st.clone()));
+    // The first health probe: stored and pushed when it finishes. A hello
+    // before that says `health: null`.
+    st.health.refresh_in_background(&st.bus);
     let fonts = tokio::task::spawn_blocking(fonts);
     mcp_start(st).await;
     let _ = fonts.await;
@@ -3600,6 +3644,7 @@ mod tests {
             bus,
             id_counter: AtomicU64::new(1),
             mcp: mcp::Mcp::default(),
+            health: health::HealthCache::instant(),
             preview: Default::default(),
         });
         let msg: ClientMsg = serde_json::from_str(r#"{"id":1,"cmd":"hello"}"#).unwrap();
@@ -3640,6 +3685,7 @@ mod tests {
             bus,
             id_counter: AtomicU64::new(1),
             mcp: mcp::Mcp::default(),
+            health: health::HealthCache::instant(),
             preview: Default::default(),
         })
     }
@@ -4148,6 +4194,7 @@ mod tests {
             bus,
             id_counter: AtomicU64::new(1),
             mcp: mcp::Mcp::with_bridge_source(exe),
+            health: health::HealthCache::instant(),
             preview: Default::default(),
         })
     }
@@ -4232,7 +4279,18 @@ mod tests {
         assert_eq!(m["starting"], true);
         assert!(m["installed"].is_object(), "{m}");
         assert_eq!(m["port"], mcp_port);
-        assert!(bus.try_recv().is_err(), "no mcp event before the start");
+        // The first health probe is not held back: its event may be there.
+        while let Ok(m) = bus.try_recv() {
+            assert!(
+                matches!(
+                    m,
+                    ServerMsg::Ev {
+                        ev: Event::Health { .. }
+                    }
+                ),
+                "no mcp event before the start: {m:?}"
+            );
+        }
         assert!(tokio::net::TcpStream::connect(("127.0.0.1", mcp_port))
             .await
             .is_err());
@@ -4240,11 +4298,16 @@ mod tests {
         // Let the start finish: up, announced, and the file is written.
         release.send(()).unwrap();
         wait_for("mcp-done").await;
-        let ServerMsg::Ev {
-            ev: Event::Mcp { mcp },
-        } = bus.recv().await.unwrap()
-        else {
-            panic!("expected the mcp event");
+        let mcp = loop {
+            match bus.recv().await.unwrap() {
+                ServerMsg::Ev {
+                    ev: Event::Mcp { mcp },
+                } => break mcp,
+                ServerMsg::Ev {
+                    ev: Event::Health { .. },
+                } => {}
+                other => panic!("expected the mcp event: {other:?}"),
+            }
         };
         assert_eq!(mcp["running"], true);
         assert_eq!(mcp["starting"], false);
@@ -4264,5 +4327,73 @@ mod tests {
         );
         assert!(at("banner") < at("mcp-asked"), "{order:?}");
         server.abort();
+    }
+
+    // ---- health is never waited for ----------------------------------------
+
+    /// A hello answers at once, with `health: null`, while the first probe is
+    /// still running (here held back by hand); the health event comes when it
+    /// finishes, and the next hello carries it without starting another.
+    #[tokio::test]
+    async fn hello_answers_while_the_health_probe_is_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = boot_state(dir.path(), free_port().await);
+        let (cache, calls, release) = health::tests::held_probe();
+        Arc::get_mut(&mut st).unwrap().health = cache;
+        let mut bus = st.bus.subscribe();
+        let boot = boot_after_banner(st.clone(), || {}, |_| async {});
+        tokio::spawn(boot);
+        for _ in 0..500 {
+            if calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "boot starts the probe");
+
+        let t0 = std::time::Instant::now();
+        let (ok, _, data) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ask(&st, r#"{"id":1,"cmd":"hello"}"#),
+        )
+        .await
+        .expect("hello waited for the probe");
+        assert!(ok);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        let data = data.unwrap();
+        assert!(data.get("health").is_some_and(|h| h.is_null()), "{data}");
+        // Another hello joins the running probe instead of starting one.
+        let (_, _, again) = ask(&st, r#"{"id":2,"cmd":"hello"}"#).await;
+        assert!(again.unwrap()["health"].is_null());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(bus.try_recv().is_err(), "no event while the probe runs");
+
+        release.send(()).unwrap();
+        let ServerMsg::Ev {
+            ev: Event::Health { health },
+        } = tokio::time::timeout(std::time::Duration::from_secs(5), bus.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected the health event");
+        };
+        assert_eq!(health.version, "probe-1");
+        let (_, _, data) = ask(&st, r#"{"id":3,"cmd":"hello"}"#).await;
+        assert_eq!(data.unwrap()["health"]["version"], "probe-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// `health_get` still returns a result from a probe of its own, and the
+    /// next hello carries it.
+    #[tokio::test]
+    async fn health_get_probes_afresh_and_stores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = boot_state(dir.path(), free_port().await);
+        let (ok, _, data) = ask(&st, r#"{"id":1,"cmd":"health_get"}"#).await;
+        assert!(ok);
+        assert_eq!(data.unwrap()["version"], "instant");
+        let (_, _, hello) = ask(&st, r#"{"id":2,"cmd":"hello"}"#).await;
+        assert_eq!(hello.unwrap()["health"]["version"], "instant");
     }
 }

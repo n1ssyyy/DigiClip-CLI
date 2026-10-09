@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use super::mcp_apps as apps;
 use super::{
-    handle_cmd, health, now_ms, AppState, ClientMsg, Cmd, Event, JobOptions, JobRecord, JobStatus,
+    handle_cmd, now_ms, AppState, ClientMsg, Cmd, Event, JobOptions, JobRecord, JobStatus,
     ServerMsg,
 };
 
@@ -1156,7 +1156,7 @@ async fn call_tool(
                 .collect();
             Ok(out_json(&json!({
                 "engine_version": env!("CARGO_PKG_VERSION"),
-                "health": health().await,
+                "health": st.health.known(&st.bus),
                 "jobs_by_status": counts,
                 "active_jobs": active,
                 "models_downloaded": downloaded,
@@ -1888,6 +1888,7 @@ mod tests {
             bus,
             id_counter: std::sync::atomic::AtomicU64::new(1),
             mcp: Mcp::default(),
+            health: crate::serve::health::HealthCache::instant(),
             preview: Default::default(),
         })
     }
