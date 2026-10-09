@@ -48,6 +48,13 @@ const CLIENT_HEADER: &str = "x-mcp-client";
 #[derive(Default)]
 pub struct Mcp {
     inner: std::sync::Mutex<Inner>,
+    /// Held for the whole of a (re)start and while `server.json` is rewritten
+    /// for a new token: starts run one after another, never into each other
+    /// (two listeners, a stale `server.json`).
+    lifecycle: tokio::sync::Mutex<()>,
+    /// The executable the bridge copy is made from; `None` is this one.
+    /// Only tests set it (a test binary is far too big to copy).
+    bridge_src: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -62,6 +69,10 @@ struct Inner {
     /// Per AI app: found on this machine / DigiClip added (cached, reading
     /// the config files on every broadcast would be wasteful).
     installed: Value,
+    /// (Re)starts asked for and not finished yet (queued or running).
+    pending: usize,
+    /// A start has finished at least once since the process began.
+    settled: bool,
 }
 
 #[derive(Clone)]
@@ -83,6 +94,14 @@ struct Activity {
 }
 
 impl Mcp {
+    #[cfg(test)]
+    pub(super) fn with_bridge_source(src: PathBuf) -> Mcp {
+        Mcp {
+            bridge_src: Some(src),
+            ..Mcp::default()
+        }
+    }
+
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut g)
@@ -122,6 +141,10 @@ pub(super) async fn public(st: &AppState) -> Value {
             "on": on,
             "port": port,
             "running": m.running_port.is_some(),
+            // The first start runs after the engine begins serving: until it
+            // (and any restart queued behind it) is done, `running` is false
+            // because it is not up yet, and an `mcp` event follows.
+            "starting": !m.settled || m.pending > 0,
             "error": m.error,
             "url": url,
             "token": token,
@@ -132,7 +155,7 @@ pub(super) async fn public(st: &AppState) -> Value {
                 .iter()
                 .map(|t| json!({ "name": t["name"], "title": t["title"], "description": t["description"] }))
                 .collect::<Vec<_>>(),
-            "installed": m.installed,
+            "installed": if m.installed.is_null() { json!({}) } else { m.installed.clone() },
             "configs": {
                 "stdio": bridge.as_ref().map(|b| json!({
                     "mcpServers": { "digiclip": { "command": b, "args": ["--mcp"] } }
@@ -186,12 +209,28 @@ fn secret() -> String {
 /// Boxed: `handle_cmd` restarts this server, whose handler runs
 /// `handle_cmd`; the erased type breaks that cycle for the compiler.
 pub(super) fn restart(st: &Arc<AppState>) -> BoxFut<'_> {
-    Box::pin(restart_inner(st))
+    // Counted when asked for, not when first polled, so a hello in between
+    // already says "starting". The guard gives the count back if the future
+    // is dropped unfinished (a closed socket).
+    st.mcp.with(|m| m.pending += 1);
+    let pending = Pending(st.clone());
+    Box::pin(restart_inner(st, pending))
+}
+
+struct Pending(Arc<AppState>);
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.0.mcp.with(|m| m.pending = m.pending.saturating_sub(1));
+    }
 }
 
 type BoxFut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
-async fn restart_inner(st: &Arc<AppState>) {
+async fn restart_inner(st: &Arc<AppState>, pending: Pending) {
+    // One start at a time. The settings are read after the lock is won, so a
+    // start queued behind another one acts on the newest settings.
+    let _life = st.mcp.lifecycle.lock().await;
     let (on, port) = {
         let mut s = st.settings.lock().await;
         if s.mcp_token.as_deref().is_none_or(|t| t.len() < 16) {
@@ -210,7 +249,8 @@ async fn restart_inner(st: &Arc<AppState>) {
         let _ = h.await;
     }
     let dir = st.data_dir.join(DIR);
-    let bridge = tokio::task::spawn_blocking(move || copy_bridge(&dir))
+    let src = st.mcp.bridge_src.clone();
+    let bridge = tokio::task::spawn_blocking(move || copy_bridge(&dir, src))
         .await
         .ok()
         .flatten();
@@ -246,6 +286,8 @@ async fn restart_inner(st: &Arc<AppState>) {
     }
     write_server_file(st).await;
     refresh_installed(st).await;
+    st.mcp.with(|m| m.settled = true);
+    drop(pending);
     broadcast(st).await;
 }
 
@@ -269,7 +311,10 @@ pub(super) async fn rotate_token(st: &Arc<AppState>) {
         st.save_settings(&s);
     }
     st.mcp.with(|m| m.sessions.clear());
-    write_server_file(st).await;
+    {
+        let _life = st.mcp.lifecycle.lock().await;
+        write_server_file(st).await;
+    }
     broadcast(st).await;
 }
 
@@ -314,8 +359,11 @@ fn bridge_name() -> &'static str {
 /// Copy this engine (plus the VC runtime DLLs on Windows) to
 /// `<data>/mcp/`, once per version. A copy an AI app is running stays as
 /// it is until it quits.
-fn copy_bridge(dir: &Path) -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+fn copy_bridge(dir: &Path, src: Option<PathBuf>) -> Option<PathBuf> {
+    let exe = match src {
+        Some(p) => p,
+        None => std::env::current_exe().ok()?,
+    };
     let target = dir.join(bridge_name());
     let stamp = dir.join("digiclip-mcp.version");
     let want = format!(
@@ -430,10 +478,15 @@ pub(super) async fn install(
     client: &str,
     remove: bool,
 ) -> Result<String, String> {
-    let bridge = st.mcp.with(|m| m.bridge.clone());
+    let (bridge, starting) = st
+        .mcp
+        .with(|m| (m.bridge.clone(), !m.settled || m.pending > 0));
     let exe = match (&bridge, remove) {
         (_, true) => None,
         (Some(b), false) => Some(b.display().to_string()),
+        (None, false) if starting => {
+            return Err("the MCP server is still starting, try again in a moment".into())
+        }
         (None, false) => return Err("the MCP bridge couldn't be set up (see the log)".into()),
     };
     let Some(app) = apps::app(client) else {
@@ -1845,6 +1898,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A settings change that lands while the boot-time start is still
+    /// running must queue behind it: one listener, on the newest port, and a
+    /// `server.json` that says the same.
+    #[tokio::test]
+    async fn restarts_run_one_after_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("fake-engine.exe");
+        std::fs::write(&exe, b"not really an engine").unwrap();
+        let mut st = state(dir.path());
+        Arc::get_mut(&mut st).unwrap().mcp = Mcp::with_bridge_source(exe);
+        let (a, b) = {
+            let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            (
+                l1.local_addr().unwrap().port(),
+                l2.local_addr().unwrap().port(),
+            )
+        };
+        st.settings.lock().await.mcp_port = a;
+        let first = tokio::spawn({
+            let st = st.clone();
+            async move { restart(&st).await }
+        });
+        tokio::task::yield_now().await;
+        st.settings.lock().await.mcp_port = b;
+        restart(&st).await;
+        first.await.unwrap();
+
+        let p = public(&st).await;
+        assert_eq!(p["running"], true);
+        assert_eq!(p["starting"], false);
+        assert_eq!(p["error"], Value::Null, "{p}");
+        tokio::net::TcpStream::connect(("127.0.0.1", b))
+            .await
+            .expect("newest port is listening");
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", a))
+                .await
+                .is_err(),
+            "the older listener is gone"
+        );
+        let file = std::fs::read_to_string(dir.path().join(DIR).join(SERVER_FILE)).unwrap();
+        assert!(file.contains(&format!("\"port\": {b}")), "{file}");
     }
 
     #[tokio::test]
