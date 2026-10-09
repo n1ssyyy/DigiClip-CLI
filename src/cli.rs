@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// DigiClip CLI — drop a video, get TikTok-ready clips.
 ///
@@ -330,8 +330,9 @@ pub struct Args {
     #[arg(long)]
     pub token: Option<String>,
 
-    /// Serve data dir: jobs + settings.json (default: the provision
-    /// root, i.e. %APPDATA%/digiclip on Windows).
+    /// Data dir: jobs + settings.json for --serve, and the `fonts` folder
+    /// (the bundled fonts and the ones you added) for every run (default: the
+    /// provision root, i.e. %APPDATA%/digiclip on Windows).
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 
@@ -417,4 +418,35 @@ pub enum Framing {
     Center,
     Plan,
     Smart,
+}
+
+/// `digiclip fonts`: the fonts a Look can use (`captions.font`,
+/// `headline.font`), bundled and the creator's own.
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "digiclip fonts",
+    about = "List, add and remove the fonts a Look can use"
+)]
+pub struct FontsArgs {
+    #[command(subcommand)]
+    pub action: Option<FontsAction>,
+
+    /// Data dir whose `fonts` folder holds the added fonts (default: the
+    /// provision root, as for --serve).
+    #[arg(long, global = true)]
+    pub data_dir: Option<PathBuf>,
+
+    /// Print JSON (the `fonts_list` reply) instead of a table.
+    #[arg(long, global = true, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum FontsAction {
+    /// Every usable family, bundled first (the default).
+    List,
+    /// Add a .ttf or .otf file to the fonts folder.
+    Add { file: PathBuf },
+    /// Remove an added font, by family or file name.
+    Remove { font: String },
 }

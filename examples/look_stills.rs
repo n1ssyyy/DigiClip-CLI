@@ -6,7 +6,13 @@
 //! Run: `cargo run --example look_stills -- <out_dir> [--look <json|@file>]
 //!       [--style <name>] [--aspect 9:16] [--headline "<text>"]
 //!       [--bar <#RRGGBB>] [--logo <png> [--logo-pos tl|tr|bl|br]]
-//!       [--scene flat|crop|letterbox|split] [--width 540]`
+//!       [--scene flat|crop|letterbox|split] [--width 540]
+//!       [--data-dir <dir>] [--add-font <ttf|otf>]...`
+//!
+//! `--data-dir` runs the stills against that data dir's `fonts` folder (the
+//! bundled fonts are written there) instead of the real one, and `--add-font`
+//! adds a creator's font to it first (as `fonts_add` does), so a Look can name
+//! it in `captions.font` / `headline.font`.
 //!
 //! `--strip <n>` writes a strip instead of the usual five moments: stills
 //! every 40 ms from 200 ms before sample word `n` (0-based) starts to one
@@ -91,7 +97,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: look_stills <out_dir> [--look <json|@file>] [--style <name>] [--aspect 9:16] \
          [--headline \"<text>\"] [--bar <#RRGGBB>] [--logo <png> [--logo-pos tr]] \
-         [--scene flat|crop|letterbox|split] [--strip <word index>] [--hstrip enter|exit]          [--at <s>,<s>...] [--width <px>]"
+         [--scene flat|crop|letterbox|split] [--strip <word index>] [--hstrip enter|exit] [--at <s>,<s>...] [--width <px>] \n         [--data-dir <dir>] [--add-font <file>]..."
     );
     std::process::exit(2)
 }
@@ -363,6 +369,8 @@ fn main() {
     let mut hstrip: Option<String> = None;
     let mut at: Vec<f64> = Vec::new();
     let mut width = 540u32;
+    let mut data_dir: Option<PathBuf> = None;
+    let mut add_fonts: Vec<PathBuf> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -389,6 +397,8 @@ fn main() {
                     .map(|v| v.clamp(120, 4096) & !1)
                     .unwrap_or_else(|| usage())
             }
+            "--data-dir" => data_dir = Some(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
+            "--add-font" => add_fonts.push(PathBuf::from(it.next().unwrap_or_else(|| usage()))),
             "--hstrip" => hstrip = Some(it.next().unwrap_or_else(|| usage())),
             "--strip" => strip = it.next().and_then(|v| v.parse().ok()).or_else(|| usage()),
             _ if a.starts_with("--") => usage(),
@@ -432,7 +442,26 @@ fn main() {
         })
         .map_or(out_dir, PathBuf::from);
 
+    // The fonts folder libass reads: the bundled fonts, then the creator's.
+    if let Some(d) = data_dir {
+        std::fs::create_dir_all(&d).expect("create --data-dir");
+        digiclip_rs::provision::set_data_dir(d);
+    }
+    digiclip_rs::provision::ensure_fonts().expect("write the bundled fonts");
+    for f in &add_fonts {
+        match digiclip_rs::fonts::Library::active().add(f) {
+            Ok(e) => println!("added font {} ({})", e.family, e.file),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2)
+            }
+        }
+    }
+    digiclip_rs::fonts::Library::active().publish();
     let look = look_arg.as_deref().map(Look::from_arg).unwrap_or_default();
+    for note in Look::font_notes(look_arg.as_deref().unwrap_or("{}")) {
+        eprintln!("warning: {note}");
+    }
     // The Look's bar colour wins over the flat one, which still switches the bar on.
     let bar = compose::bar_color(bar, look.bar.as_ref());
     // The logo as a render would build it: corner, then the Look's section.

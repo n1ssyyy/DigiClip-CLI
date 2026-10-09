@@ -230,6 +230,12 @@ pub fn render(req: &Request) -> anyhow::Result<Output> {
     args.music = None;
     let canvas = args.canvas();
     let look = crate::pipeline::look_for(&args)?;
+    // A font the Look names that is not installed: said, and the default used.
+    if let Some(raw) = args.look.as_deref() {
+        warnings.extend(crate::look::Look::font_notes(raw));
+    }
+    // libass reads the fonts folder: the bundled fonts must be in it.
+    crate::provision::ensure_fonts()?;
 
     let ffmpeg = crate::binaries::require("ffmpeg")?;
     if !req.source.is_file() {

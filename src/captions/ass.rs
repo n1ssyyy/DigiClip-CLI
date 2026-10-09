@@ -3609,7 +3609,7 @@ mod tests {
         84.0
     }
 
-    fn face() -> &'static crate::captions::metrics::Face {
+    fn face() -> std::sync::Arc<crate::captions::metrics::Face> {
         crate::captions::metrics::face("Archivo Black").unwrap()
     }
 
@@ -4513,7 +4513,7 @@ mod tests {
         rows.into_iter().map(|r| r.1).collect()
     }
 
-    fn arch() -> &'static crate::captions::metrics::Face {
+    fn arch() -> std::sync::Arc<crate::captions::metrics::Face> {
         crate::captions::metrics::face("Archivo Black").unwrap()
     }
 
@@ -5049,7 +5049,7 @@ mod tests {
 
     #[test]
     fn font_case_and_spacing_are_the_captions_fields() {
-        for f in crate::look::FONTS {
+        for f in crate::fonts::bundled_families() {
             let ass = tall(&format!(r#"{{"font":"{f}"}}"#));
             let h = style_line(&ass, "Headline");
             assert_eq!(h[1], f);
@@ -5137,7 +5137,7 @@ mod tests {
     #[test]
     fn the_positioned_headline_works_on_every_style_canvas_and_font() {
         for (w, h) in [(1080, 1920), (1080, 1350), (1080, 1080), (1920, 1080)] {
-            for f in crate::look::FONTS {
+            for f in crate::fonts::bundled_families() {
                 let ass = hl2(
                     &format!(
                         r##"{{"font":"{f}","card":{{"color":"#101010","opacity":0.8,"radius":0.5}},"ink":"#FFFFFF",
@@ -5184,5 +5184,89 @@ mod tests {
         );
         let n = hl_events(&ass).len();
         assert!((10..250).contains(&n), "{n} events");
+    }
+
+    /// Every `\pos(x,y)` in the dialogue lines of an `.ass`.
+    fn all_positions(ass: &str) -> Vec<(f64, f64)> {
+        ass.lines()
+            .filter(|l| l.starts_with("Dialogue:"))
+            .filter_map(|l| {
+                let rest = &l[l.find("\\pos(")? + 5..];
+                let (x, y) = rest[..rest.find(')')?].split_once(',')?;
+                Some((x.parse().ok()?, y.parse().ok()?))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_bundled_font_lays_out_word_level_captions_and_a_headline_inside_the_frame() {
+        for f in crate::fonts::bundled_families() {
+            // Captions: word by word, each in its own box.
+            let ass = build_look(
+                "karaoke",
+                &r##"{"font":"FONT","size":1.4,"box":{"color":"#101010","per":"word","radius":0.4},
+                      "words":{"mode":"build","active":{"scale":1.2}}}"##
+                    .replace("FONT", f),
+            );
+            assert_eq!(style_line(&ass, "Karaoke")[1], f);
+            let pos = all_positions(&ass);
+            assert!(pos.len() >= 11, "{f}: {} events", pos.len());
+            for (x, y) in pos {
+                assert!(
+                    (0.0..=1080.0).contains(&x) && (0.0..=1920.0).contains(&y),
+                    "{f}: {x},{y}"
+                );
+            }
+            // Headline, v2: the card and every word stay in the frame.
+            let ass = tall(
+                &r##"{"font":"FONT","card":{"color":"#101010","radius":0.5},"ink":"#FFFFFF","width":0.9}"##
+                    .replace("FONT", f),
+            );
+            assert_eq!(style_line(&ass, "Headline")[1], f);
+            let (x, y, cw, ch) = card_box(&ass);
+            assert!(
+                x - cw / 2.0 >= 0.0 && x + cw / 2.0 <= 1080.0,
+                "{f}: card {x} {cw}"
+            );
+            assert!(
+                y - ch / 2.0 >= 0.0 && y + ch / 2.0 <= 1920.0,
+                "{f}: card {y} {ch}"
+            );
+            assert!(!hl_words(&ass).is_empty(), "{f}");
+        }
+    }
+
+    #[test]
+    fn a_font_the_creator_added_is_laid_out_like_a_bundled_one_truetype_or_cff() {
+        use crate::captions::metrics::testfont;
+        let dir = std::env::temp_dir().join(format!("digiclip-ass-fonts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = crate::fonts::Library::new(dir.join("fonts"));
+        for (name, cff, file) in [
+            ("Ass Added TT", false, "tt.ttf"),
+            ("Ass Added CFF", true, "cff.otf"),
+        ] {
+            let src = dir.join(file);
+            std::fs::write(&src, testfont::build(name, cff)).unwrap();
+            lib.add(&src).unwrap();
+            let ass = build_look(
+                "karaoke",
+                &r##"{"font":"NAME","box":{"color":"#101010","per":"word"},"words":{"mode":"build"}}"##
+                    .replace("NAME", &name.to_lowercase()),
+            );
+            assert_eq!(style_line(&ass, "Karaoke")[1], name, "{name}");
+            assert!(all_positions(&ass).len() >= 11, "{name}");
+            let ass = tall(&r##"{"font":"NAME","card":{"radius":0.3}}"##.replace("NAME", name));
+            assert_eq!(style_line(&ass, "Headline")[1], name, "{name}");
+            let (x, _, cw, _) = card_box(&ass);
+            assert!(x - cw / 2.0 >= 0.0 && x + cw / 2.0 <= 1080.0, "{name}");
+            assert!(!hl_words(&ass).is_empty(), "{name}");
+            lib.remove(name).unwrap();
+        }
+        // Once removed, the name is not a font any more: the default is used.
+        let ass = build_look("karaoke", r#"{"font":"Ass Added TT"}"#);
+        assert_eq!(style_line(&ass, "Karaoke")[1], "Archivo Black");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

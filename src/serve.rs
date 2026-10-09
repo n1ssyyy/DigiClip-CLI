@@ -27,6 +27,28 @@
 //! names in rotation) and fetched through `/art/<job>/<file>?token=…&v=<rev>`.
 //! See [`crate::preview`] for what it draws and what it leaves out.
 //!
+//! Fonts: `fonts_list`, `fonts_add` and `fonts_remove` manage the creator's own
+//! fonts, and `GET /font/<file>?token=…` serves a listed font file for the
+//! app's preview. Capability `look.fonts`.
+//!
+//! ```text
+//! → { id, cmd: "fonts_list" }
+//! ← { type: "res", id, ok: true, data: { fonts: [Font], dir, max_bytes } }
+//!     Font = { family, file, bundled, category, weight, bytes, licence?,
+//!              rev, url }
+//!     bundled fonts first (in the picker's order), then the creator's by
+//!     family; `family` is what a Look puts in captions.font /
+//!     headline.font; `category` is display | sans | rounded | comic | serif
+//!     | hand | mono for bundled fonts and `custom` for the creator's;
+//!     `url` is `/font/<file>` (add `?token=…&v=<rev>`).
+//!
+//! → { id, cmd: "fonts_add", path }          (a local .ttf or .otf file)
+//! ← { ok: true, data: { font: Font } } | { ok: false, error }
+//!
+//! → { id, cmd: "fonts_remove", font }       (a family or a file name)
+//! ← { ok: true, data: { font: Font } } | { ok: false, error }
+//! ```
+//!
 //! Single-user desktop assumptions: bind 127.0.0.1 only, one per-boot
 //! token (Tauri spawns the sidecar with `--token`), one GPU worker
 //! (jobs queue behind a semaphore). Pause/resume is intentionally
@@ -791,6 +813,17 @@ enum Cmd {
         t: f64,
         #[serde(default)]
         options: JobOptions,
+    },
+    /// Every usable font family: the bundled ones, then the creator's.
+    FontsList,
+    /// Add a `.ttf` / `.otf` file from disk to the creator's fonts.
+    FontsAdd {
+        path: String,
+    },
+    /// Remove one of the creator's fonts (a family or a file name). `font`,
+    /// not `id`: a param named `id` would overwrite the frame id.
+    FontsRemove {
+        font: String,
     },
     /// Write a redacted diagnostics bundle; replies with its path.
     Diagnostics,
@@ -2182,6 +2215,38 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             t,
             options,
         } => preview_frame(&st, id, job, (start_s, len_s, t), options).await,
+        Cmd::FontsList => {
+            let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+            match tokio::task::spawn_blocking(move || (lib.list(), lib.dir().to_path_buf())).await {
+                Ok((fonts, dir)) => vec![ok(
+                    id,
+                    Some(serde_json::json!({
+                        "fonts": fonts,
+                        "dir": dir.display().to_string(),
+                        "max_bytes": crate::fonts::MAX_BYTES,
+                    })),
+                )],
+                Err(e) => vec![err(id, format!("fonts: {e}"))],
+            }
+        }
+        Cmd::FontsAdd { path } => {
+            let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+            let added = tokio::task::spawn_blocking(move || lib.add(Path::new(path.trim()))).await;
+            match added {
+                Ok(Ok(font)) => vec![ok(id, Some(serde_json::json!({ "font": font })))],
+                Ok(Err(e)) => vec![err(id, e)],
+                Err(e) => vec![err(id, format!("fonts: {e}"))],
+            }
+        }
+        Cmd::FontsRemove { font } => {
+            let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+            let gone = tokio::task::spawn_blocking(move || lib.remove(&font)).await;
+            match gone {
+                Ok(Ok(font)) => vec![ok(id, Some(serde_json::json!({ "font": font })))],
+                Ok(Err(e)) => vec![err(id, e)],
+                Err(e) => vec![err(id, format!("fonts: {e}"))],
+            }
+        }
         Cmd::TranscriptGet { job } => {
             let out_dir = {
                 let jobs = st.jobs.lock().await;
@@ -2828,6 +2893,59 @@ async fn socket_loop(st: Arc<AppState>, socket: WebSocket) {
     write.abort();
 }
 
+/// `GET /font/<file>?token=…`: a listed font file (bundled, or one the
+/// creator added) with its content type and a year of caching. Only a name
+/// the fonts listing holds is served, so no other file can be read through
+/// it; the cache key is the file name plus `?v=<rev>` from the listing.
+async fn font_handler(
+    AxPath(file): AxPath<String>,
+    Query(q): Query<TokenQ>,
+    headers: axum::http::HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    use axum::http::header;
+    if q.token != st.token {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+    let found = tokio::task::spawn_blocking(move || lib.locate(&file))
+        .await
+        .ok()
+        .flatten();
+    let Some((src, ctype, rev)) = found else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let etag = format!("\"{rev}\"");
+    let cache = [
+        (
+            header::CACHE_CONTROL,
+            "public, max-age=31536000".to_string(),
+        ),
+        (header::ETAG, etag.clone()),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+    ];
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+    {
+        return (StatusCode::NOT_MODIFIED, cache).into_response();
+    }
+    let body: Vec<u8> = match src {
+        crate::fonts::FontFile::Bundled(b) => b.to_vec(),
+        crate::fonts::FontFile::User(p) => match tokio::fs::read(p).await {
+            Ok(b) => b,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        },
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, ctype.to_string())],
+        cache,
+        body,
+    )
+        .into_response()
+}
+
 async fn art_handler(
     AxPath((job, file)): AxPath<(String, String)>,
     Query(q): Query<TokenQ>,
@@ -2936,6 +3054,13 @@ pub async fn run_serve(
     std::fs::create_dir_all(&data_dir)?;
     let _ = JOBS_ROOT.set(data_dir.join("jobs"));
     std::fs::create_dir_all(jobs_root())?;
+    // libass reads `<data dir>/fonts`: the bundled fonts go there, beside the
+    // creator's, and Looks and layout learn the creator's families.
+    crate::provision::set_data_dir(data_dir.clone());
+    if let Err(e) = crate::provision::ensure_fonts() {
+        tracing::warn!("fonts: could not write the bundled fonts: {e}");
+    }
+    crate::fonts::Library::active().publish();
     let token = token.filter(|t| !t.is_empty()).unwrap_or_else(|| {
         // Per-boot token: local-only auth without stored secrets.
         format!("{:x}{:x}", now_ms(), std::process::id())
@@ -2962,6 +3087,7 @@ pub async fn run_serve(
     let app = axum::Router::new()
         .route("/ws", get(ws_handler))
         .route("/art/{job}/{file}", get(art_handler))
+        .route("/font/{file}", get(font_handler))
         .route("/src/{job}", get(src_handler))
         // Loopback-only daemon, token-gated URLs: permissive CORS lets the
         // desktop webview fetch blobs (downloads) without a proxy.
@@ -3766,5 +3892,185 @@ mod tests {
         assert_eq!(c.rev, 0);
         assert!(c.why.is_empty() && c.scores.is_none() && c.hashtags.is_empty());
         assert_eq!(c.render_status, "pending");
+    }
+
+    // ---- fonts -------------------------------------------------------------
+
+    fn fonts_state(name: &str) -> Arc<AppState> {
+        let st = preview_state(name);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+        st
+    }
+
+    #[test]
+    fn font_frames_parse_and_keep_their_frame_id() {
+        let m: ClientMsg = serde_json::from_str(r#"{"id":3,"cmd":"fonts_list"}"#).unwrap();
+        assert!(matches!(m.cmd, Cmd::FontsList));
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"id":4,"cmd":"fonts_add","path":"C:\\f\\x.ttf"}"#).unwrap();
+        assert!(matches!(m.cmd, Cmd::FontsAdd { ref path } if path == "C:\\f\\x.ttf"));
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"id":5,"cmd":"fonts_remove","font":"Pacifico"}"#).unwrap();
+        assert_eq!(m.id, 5);
+        assert!(matches!(m.cmd, Cmd::FontsRemove { ref font } if font == "Pacifico"));
+        assert!(crate::look::CAPS.contains(&"look.fonts"));
+    }
+
+    #[tokio::test]
+    async fn fonts_list_add_and_remove_over_the_socket() {
+        use crate::captions::metrics::testfont;
+        let st = fonts_state("fonts-cmds");
+        let (ok, e, data) = ask(&st, r#"{"id":1,"cmd":"fonts_list"}"#).await;
+        assert!(ok, "{e:?}");
+        let d = data.unwrap();
+        let n = crate::fonts::BUNDLED.len();
+        assert_eq!(d["fonts"].as_array().unwrap().len(), n);
+        assert_eq!(d["fonts"][0]["family"], "Anton");
+        assert_eq!(d["fonts"][0]["bundled"], true);
+        assert_eq!(d["fonts"][0]["category"], "display");
+        assert_eq!(d["fonts"][0]["file"], "Anton-Regular.ttf");
+        assert_eq!(d["fonts"][0]["url"], "/font/Anton-Regular.ttf");
+        assert_eq!(d["max_bytes"], 20 * 1024 * 1024);
+        assert!(d["dir"].as_str().unwrap().ends_with("fonts"));
+        // Add a font from a file path, answered with its entry.
+        let src = st.data_dir.join("incoming");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("Serve Marker.ttf");
+        std::fs::write(&file, testfont::build("Serve Marker", false)).unwrap();
+        let path = serde_json::to_string(&file.display().to_string()).unwrap();
+        let add = format!(r#"{{"id":2,"cmd":"fonts_add","path":{path}}}"#);
+        let (ok, e, data) = ask(&st, &add).await;
+        assert!(ok, "{e:?}");
+        let f = data.unwrap()["font"].clone();
+        assert_eq!(
+            (f["family"].as_str(), f["file"].as_str()),
+            (Some("Serve Marker"), Some("Serve-Marker.ttf"))
+        );
+        assert_eq!(
+            (f["bundled"].as_bool(), f["category"].as_str()),
+            (Some(false), Some("custom"))
+        );
+        assert!(st.data_dir.join("fonts").join("Serve-Marker.ttf").is_file());
+        // Listed after the bundled ones; a repeat is refused.
+        let (_, _, data) = ask(&st, r#"{"id":3,"cmd":"fonts_list"}"#).await;
+        let all = data.unwrap()["fonts"].clone();
+        assert_eq!(all.as_array().unwrap().len(), n + 1);
+        assert_eq!(all[n]["family"], "Serve Marker");
+        let (ok, e, _) = ask(&st, &add).await;
+        assert!(!ok && e.unwrap().contains("already added"));
+        // A Look can name it now.
+        assert_eq!(crate::fonts::resolve("serve marker"), Some("Serve Marker"));
+        // Refusals come back as errors, not crashes.
+        let junk = src.join("junk.ttf");
+        std::fs::write(&junk, b"not a font").unwrap();
+        let jp = serde_json::to_string(&junk.display().to_string()).unwrap();
+        let (ok, e, _) = ask(&st, &format!(r#"{{"id":5,"cmd":"fonts_add","path":{jp}}}"#)).await;
+        assert!(!ok && e.unwrap().contains("cannot add “junk.ttf”"));
+        let (ok, e, _) = ask(&st, r#"{"id":6,"cmd":"fonts_remove","font":"Anton"}"#).await;
+        assert!(!ok && e.unwrap().contains("cannot be removed"));
+        // Remove it again.
+        let rm = r#"{"id":7,"cmd":"fonts_remove","font":"Serve Marker"}"#;
+        let (ok, e, data) = ask(&st, rm).await;
+        assert!(ok, "{e:?}");
+        assert_eq!(data.unwrap()["font"]["file"], "Serve-Marker.ttf");
+        assert!(!st.data_dir.join("fonts").join("Serve-Marker.ttf").exists());
+        assert_eq!(crate::fonts::resolve("Serve Marker"), None);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    async fn get_font(
+        st: &Arc<AppState>,
+        uri: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/font/{file}", get(font_handler))
+            .with_state(st.clone());
+        let mut req = axum::http::Request::builder().uri(uri);
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        let res = app
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let body = axum::body::to_bytes(res.into_body(), 64 << 20)
+            .await
+            .unwrap();
+        (status, headers, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn the_font_route_serves_listed_fonts_and_nothing_else() {
+        use crate::captions::metrics::testfont;
+        let st = fonts_state("fonts-route");
+        let lib = crate::fonts::Library::new(st.data_dir.join("fonts"));
+        let src = st.data_dir.join("src.otf");
+        std::fs::create_dir_all(&st.data_dir).unwrap();
+        std::fs::write(&src, testfont::build("Route Marker", true)).unwrap();
+        let mine = lib.add(&src).unwrap();
+        // Things that must stay out of reach: beside the fonts, and above.
+        std::fs::write(
+            st.data_dir.join("settings.json"),
+            r#"{"openrouter_key":"private"}"#,
+        )
+        .unwrap();
+        std::fs::write(lib.dir().join("notes.txt"), "private").unwrap();
+        // The right token, a bundled font: its bytes, type and caching.
+        let (code, h, body) = get_font(&st, "/font/Anton-Regular.ttf?token=t", &[]).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(h["content-type"], "font/ttf");
+        assert!(h["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("max-age=31536000"));
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(body, crate::fonts::BUNDLED[0].bytes);
+        // 304 on a repeat with the validator.
+        let etag = h["etag"].to_str().unwrap().to_string();
+        let (code, _, body) = get_font(
+            &st,
+            "/font/Anton-Regular.ttf?token=t",
+            &[("if-none-match", &etag)],
+        )
+        .await;
+        assert_eq!((code, body.len()), (StatusCode::NOT_MODIFIED, 0));
+        // The creator's font, as read from disk.
+        let uri = format!("/font/{}?token=t&v={}", mine.file, mine.rev);
+        let (code, h, body) = get_font(&st, &uri, &[]).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(h["content-type"], "font/otf");
+        assert_eq!(body, std::fs::read(&src).unwrap());
+        // No token, a wrong token.
+        let unauth = |q: &'static str| format!("/font/Anton-Regular.ttf{q}");
+        // (No token at all is refused before the handler runs.)
+        assert!(!get_font(&st, &unauth(""), &[]).await.0.is_success());
+        assert_eq!(
+            get_font(&st, &unauth("?token=x"), &[]).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        // Nothing else is readable through it, however it is spelled.
+        for bad in [
+            "notes.txt",
+            "settings.json",
+            "..%2Fsettings.json",
+            "..%5Csettings.json",
+            "%2E%2E%2Fsettings.json",
+            "%2e%2e%5c%2e%2e%5csettings.json",
+            "Anton-Regular.ttf%00.txt",
+            "C%3A%5CWindows%5Cwin.ini",
+            "nothere.ttf",
+            "Anton-Regular.ttf.part",
+            ".ttf",
+        ] {
+            let (code, _, body) = get_font(&st, &format!("/font/{bad}?token=t"), &[]).await;
+            assert_ne!(code, StatusCode::OK, "{bad}");
+            assert!(!String::from_utf8_lossy(&body).contains("private"), "{bad}");
+        }
+        let (code, _, _) = get_font(&st, "/font/a/b.ttf?token=t", &[]).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 }

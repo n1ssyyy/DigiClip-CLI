@@ -96,11 +96,9 @@ pub const CAPS: &[&str] = &[
     "look.camera",
     "look.effects",
     "look.layout",
+    "look.fonts",
     "preview_frame",
 ];
-
-/// The fonts libass can reach (the provisioned ones).
-pub const FONTS: [&str; 4] = ["Anton", "Archivo Black", "Inter Medium", "JetBrains Mono"];
 
 /// An sRGB colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,7 +361,7 @@ pub struct CaptionsLook {
     pub y: Option<f64>,
     /// Type size multiplier, 0.5..2.
     pub size: Option<f64>,
-    /// One of [`FONTS`].
+    /// A listed font family (see [`crate::fonts`]).
     pub font: Option<&'static str>,
     pub case: Option<Case>,
     /// Text colour (not-yet-spoken; also the spoken colour unless `active`
@@ -487,7 +485,7 @@ pub struct HeadlineLook {
     pub anim: Option<HeadlineAnim>,
     /// Seconds on screen, >= 0 (0 = the whole clip).
     pub seconds: Option<f64>,
-    /// One of [`FONTS`] (Archivo Black unless set).
+    /// A listed font family (Archivo Black unless set).
     pub font: Option<&'static str>,
     pub case: Option<Case>,
     /// Letter spacing, -0.05..0.3 em.
@@ -699,6 +697,25 @@ impl Look {
         }
     }
 
+    /// One line per font a look asks for (`captions.font`, `headline.font`)
+    /// that is not installed, so the app can say the default was used:
+    /// `font “X” is not installed; used the default`. `arg` is a `--look`
+    /// argument (JSON text or `@path`); anything unreadable has no notes.
+    pub fn font_notes(arg: &str) -> Vec<String> {
+        let a = arg.trim();
+        let text = match a.strip_prefix('@') {
+            Some(p) => std::fs::read_to_string(Path::new(p.trim())).unwrap_or_default(),
+            None => a.to_string(),
+        };
+        let Ok(v) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) else {
+            return Vec::new();
+        };
+        let names = ["captions", "headline"]
+            .iter()
+            .filter_map(|k| v.get(k)?.get("font")?.as_str());
+        crate::fonts::missing_font_notes(names)
+    }
+
     /// Parse JSON text. Malformed JSON is no look, with one warning line.
     pub fn parse(text: &str) -> Look {
         match serde_json::from_str::<Value>(text) {
@@ -754,12 +771,7 @@ fn captions(o: &Obj) -> CaptionsLook {
         x: num(o, "x", 0.0, 1.0),
         y: num(o, "y", 0.0, 1.0),
         size: num(o, "size", 0.5, 2.0),
-        font: o.get("font").and_then(Value::as_str).and_then(|f| {
-            FONTS
-                .iter()
-                .find(|n| n.eq_ignore_ascii_case(f.trim()))
-                .copied()
-        }),
+        font: font(o),
         case: match word(o, "case").as_deref() {
             Some("upper") => Some(Case::Upper),
             Some("asis") => Some(Case::AsIs),
@@ -972,13 +984,12 @@ fn exit(o: &Obj) -> ExitLook {
     }
 }
 
+/// `font`: any listed family, bundled or added by the creator (matched
+/// without regard to case); a name that is not installed is dropped.
 fn font(o: &Obj) -> Option<&'static str> {
-    o.get("font").and_then(Value::as_str).and_then(|f| {
-        FONTS
-            .iter()
-            .find(|n| n.eq_ignore_ascii_case(f.trim()))
-            .copied()
-    })
+    o.get("font")
+        .and_then(Value::as_str)
+        .and_then(crate::fonts::resolve)
 }
 
 fn case(o: &Obj) -> Option<Case> {
@@ -1716,6 +1727,76 @@ mod tests {
     fn caps_announce_the_headline_bar_and_logo_depth() {
         for c in ["look.headline.v2", "look.bar.v2", "look.logo.v2"] {
             assert!(CAPS.contains(&c), "{c}");
+        }
+    }
+
+    #[test]
+    fn every_listed_family_is_accepted_for_captions_and_headline() {
+        assert!(CAPS.contains(&"look.fonts"));
+        assert!(crate::fonts::bundled_families().count() >= 14);
+        for f in crate::fonts::bundled_families() {
+            // The exact name, in any case, with stray spaces.
+            for spelled in [
+                f.to_string(),
+                f.to_uppercase(),
+                format!("  {}  ", f.to_lowercase()),
+            ] {
+                let l = Look::parse(&format!(
+                    r#"{{"captions":{{"font":"{spelled}"}},"headline":{{"font":"{spelled}"}}}}"#
+                ));
+                assert_eq!(l.captions.unwrap().font, Some(f), "{spelled}");
+                assert_eq!(l.headline.unwrap().font, Some(f), "{spelled}");
+            }
+        }
+        // Not installed: dropped, as before.
+        let l =
+            Look::parse(r#"{"captions":{"font":"Comic Sans","size":1.2},"headline":{"font":""}}"#);
+        assert_eq!(l.captions.unwrap().font, None);
+        assert_eq!(l.headline.unwrap().font, None);
+    }
+
+    #[test]
+    fn a_font_the_creator_added_is_accepted_until_it_is_removed() {
+        use crate::captions::metrics::testfont;
+        let dir = std::env::temp_dir().join(format!("digiclip-look-fonts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("look-added.ttf");
+        std::fs::write(&src, testfont::build("Look Added Sans", false)).unwrap();
+        let lib = crate::fonts::Library::new(dir.join("fonts"));
+        let json =
+            r#"{"captions":{"font":"look added sans"},"headline":{"font":"LOOK ADDED SANS"}}"#;
+        assert_eq!(Look::parse(json).captions.unwrap().font, None);
+        lib.add(&src).unwrap();
+        let l = Look::parse(json);
+        assert_eq!(l.captions.unwrap().font, Some("Look Added Sans"));
+        assert_eq!(l.headline.unwrap().font, Some("Look Added Sans"));
+        lib.remove("Look Added Sans").unwrap();
+        assert_eq!(Look::parse(json).captions.unwrap().font, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_font_is_one_warning_line() {
+        let notes = Look::font_notes(
+            r#"{"captions":{"font":"Papyrus"},"headline":{"font":"Anton"},"bar":{"pos":"top"}}"#,
+        );
+        assert_eq!(
+            notes,
+            vec!["font “Papyrus” is not installed; used the default".to_string()]
+        );
+        // Both sections, the same missing name: once.
+        let both =
+            Look::font_notes(r#"{"captions":{"font":"Papyrus"},"headline":{"font":"Papyrus"}}"#);
+        assert_eq!(both.len(), 1);
+        for ok in [
+            r#"{"captions":{"font":"anton"}}"#,
+            r#"{"captions":{"font":42},"headline":{"font":null}}"#,
+            r#"{}"#,
+            "not json",
+            "@C:/no/such/look.json",
+        ] {
+            assert!(Look::font_notes(ok).is_empty(), "{ok}");
         }
     }
 }

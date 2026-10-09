@@ -110,6 +110,7 @@ digiclip input.mp4 --headline "Why most founders quit" --progress-bar "#FFD400" 
 digiclip input.mp4 --look '{"camera":{"feel":"steady","zoom":1.15},"effects":{"grade":"warm","vignette":0.4,"fill_dim":0.6}}'   # calmer, tighter camera and a gentle warm grade (look.layout.split moves the split-screen seam)
 digiclip input.mp4 --progress-bar               # watch-time bar along the bottom (or --progress-bar "#00E5FF")
 digiclip input.mp4 --headline --progress-bar --look '{"headline":{"font":"Anton","card":{"color":"#101826","opacity":0.7,"radius":1},"glow":{"color":"#00E5FF","size":16},"enter":{"kind":"slide_down","ms":400},"exit":{"kind":"blur"},"delay_s":0.5,"seconds":4},"bar":{"inset":0.04,"radius":1,"track":"#FFFFFF","track_opacity":0.3,"glow":{"size":14}}}'   # a dressed headline and bar (look.logo takes rotate, shadow and glow)
+digiclip input.mp4 --look '{"captions":{"font":"Bebas Neue"},"headline":{"font":"DM Serif Display"}}'   # fifteen fonts are bundled and you can add your own: `digiclip fonts` lists them (see Fonts)
 digiclip input.mp4 --logo logo.png --logo-pos br   # corner logo: tl, tr (default), bl, br
 digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked under speech
 ```
@@ -118,7 +119,7 @@ digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked un
 - **Headline.** A white title card shown for the whole clip, top centre, below the platform's top bar: at most two balanced lines, one accented word, a quick pop-in. Bare `--headline` uses each clip's title (the AI picker writes a 3–7 word headline); offline, a short self-contained sentence from the clip's first seconds, or no headline when nothing reads well on its own.
 - **Headline, bar and logo depth.** `look.headline`, `look.bar` and `look.logo` take the same kind of fields as the captions. Every field is optional; leave them all out and the render is the one you had, byte for byte. Lengths are px on a 1080 wide canvas (they scale with the canvas, like the captions'), `em` means a share of the type size. Out-of-range numbers are clamped, wrong types and unknown names are dropped, and an object left with nothing in it is no object. The capabilities `look.headline.v2`, `look.bar.v2` and `look.logo.v2` announce them.
   - **Headline.**
-    - Type: `font` (`Anton`, `Archivo Black`, `Inter Medium`, `JetBrains Mono`; default `Archivo Black`), `case` (`upper` or `asis`), `spacing` (−0.05–0.3 em after every character), `align` (`left`, `center`, `right`, inside the block), `max_lines` (1–3, default 3 when the text needs it) and `width` (0.4–1, the widest the text block may be, as a share of the frame width; default is today's room, the frame minus its side margins and the logo's corner).
+    - Type: `font` (any family of [Fonts](#-fonts), bundled or your own; default `Archivo Black`), `case` (`upper` or `asis`), `spacing` (−0.05–0.3 em after every character), `align` (`left`, `center`, `right`, inside the block), `max_lines` (1–3, default 3 when the text needs it) and `width` (0.4–1, the widest the text block may be, as a share of the frame width; default is today's room, the frame minus its side margins and the logo's corner).
     - `stroke` (`{color, width}`, 0–12 px), `shadow` (`{color, x, y, blur, opacity}`, offsets −30–30, blur 0–20, opacity 0–1) and `glow` (`{color, size, strength}`, size 0–40, strength 0–1) mean what the caption fields of the same name mean, with the same defaults: a glow is the text grown by 0.55 of `size` and blurred by 0.6 of it, a shadow is a separate blurred copy of the text. Layer order, bottom to top: card, shadow, glow, text; all four are above the captions. Bare type (`card: "none"`) keeps its dark edge unless `stroke` says otherwise; a card has no stroke unless `stroke` asks for one.
     - `card` is a `#RRGGBB` (v1), `"none"` (v1), or an object `{color, opacity, pad, radius}`: `opacity` 0–1 (0 is no card), `pad` 0–80 px on every side (default 24 × `size`), `radius` 0–1 as a fraction of half the card's shorter side (0 is square, 1 is a pill). One card wraps every row. It always stays inside the frame, whatever `x`, `y` and `size` ask.
     - `accent_word`: `auto` (the word the headline accents today), `first`, `last` or `none`. The accent colour is the v1 `accent`.
@@ -128,7 +129,7 @@ digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked un
     - Rows: a text longer than 18 characters is spread over two balanced rows (as today), at most `max_lines`; a short one stays on one row. When `width` is too narrow for `max_lines` rows the block widens up to what the card leaves of the frame, and only when even that is not enough does the headline lose words from its end (never ending on a word that hangs), as the one-event writer does for its 48-character limit. The headline text is still cut at 48 characters.
   - **Progress bar.** `color` (`#RRGGBB`, wins over the flat `--progress-bar` colour, which still switches the bar on; the Look alone never does), `track` (the unfilled colour) and `track_opacity` (0–1: a `track` alone is 55 %, an opacity alone is the dark track at that strength, neither leaves today's dimmed picture), `inset` (0–0.1: the margin from the left, right and the edge it sits on, as a share of the frame width), `radius` (0–1, a fraction of half the bar's thickness: rounds the ends of the track and the leading end of the fill, with antialiased edges) and `glow` (`{color, size, strength}`, a soft halo of the fill, in the fill's colour unless `color` is given, grown and blurred like a caption glow; it follows the fill's end and stays within its own reach of the bar). Order, bottom to top: picture, track, glow, fill. Vignette and grade are applied before the bar, so the bar keeps its colours. A bar with none of `track`, `track_opacity`, `inset`, `radius`, `glow` is drawn by the old code, pixel for pixel.
   - **Logo.** `rotate` (−30–30 degrees, positive clockwise, about the logo's centre, keeping its transparency), `shadow` and `glow` (as above; a glow with no colour is white). Shadow and glow follow the shape of the logo's own transparency, not its box. Each is made from the logo's alpha in the encoder graph, stacked shadow, glow, logo, and the stack takes the logo's `opacity` once. The logo keeps its centre where it would have been without them (corner or `x`/`y`). A turn under 0.01 degrees is no turn.
-  - Limits, nothing left out: the logo glow grows the shape with one-pixel steps that alternate square and diamond, so it is round to within a pixel or two, not exact; `bar.glow` and the bar's `radius` are computed per frame for the fill only and cost nothing outside the bar's rows and the halo's reach; the word-level headline needs the font's metrics (all four listed fonts have them).
+  - Limits, nothing left out: the logo glow grows the shape with one-pixel steps that alternate square and diamond, so it is round to within a pixel or two, not exact; `bar.glow` and the bar's `radius` are computed per frame for the fill only and cost nothing outside the bar's rows and the halo's reach; the word-level headline needs the font's metrics (every bundled font and every font you add has them; an OpenType/CFF font's ink box is estimated, see [Fonts](#-fonts)).
 - **Caption motion.** `pop` (default): each line pops in and fades out, keywords bump as they're spoken, lines never flash for a split second or run across a sentence end. `words`: the same, with words appearing one by one as they're spoken. `none`: static lines, as before.
 - **Word-level captions.** `look.captions` takes three optional sections that give every word its own small timeline. Leave them out and the captions render exactly as before; `words: {}` changes nothing either.
   - `words.mode`: `all` (every word of the line is on screen from the start, the default), `build` (a word appears when it is spoken, and the line keeps its final layout, so nothing shifts as words arrive), `single` (one word at a time at the caption position, each up until the next word starts).
@@ -154,6 +155,55 @@ digiclip input.mp4 --music bed.mp3 --music-db -12  # looped music bed, ducked un
 - **Music.** Normalised to `--music-db` below the speech (default −16), looped to length, faded in and out, and ducked by roughly 6–9 dB while someone talks. The mix still lands on −14 LUFS.
 - **Focus.** The LLM is told the topic, the offline scorer boosts sentences that mention it, and every candidate that covers it ranks first. When nothing matches, the best clips overall are used.
 - **Batch.** Pass several files or a folder. Each video gets its own `<name>-digiclip/` folder, under `--out-dir` when given. If one video fails, the rest still run and the run exits with an error that lists the failures.
+
+### 🔤 Fonts
+
+`look.captions.font` and `look.headline.font` take any listed family, bundled or your own, by name (case does not matter). A name that is not installed is ignored, as before: the style's own font is used, and the engine says so in one line (`font “X” is not installed; used the default`), in the `warnings` of a `preview_frame` and in the log of a job. A Look with no `font` renders byte for byte what it did.
+
+Bundled with the engine, one static file per family (licences in [`resources/fonts/licenses/`](resources/fonts/licenses/), sources in [`resources/fonts/README.md`](resources/fonts/README.md); all SIL Open Font License 1.1 except Luckiest Guy and Permanent Marker, Apache 2.0):
+
+| Category | Families (the names a Look uses) |
+| --- | --- |
+| display | `Anton`, `Bebas Neue` (capitals only), `Oswald`, `Archivo Black` (the default) |
+| rounded | `Lilita One` |
+| comic | `Bangers`, `Luckiest Guy` |
+| sans | `Inter Medium`, `Montserrat ExtraBold`, `Poppins`, `Space Grotesk` |
+| serif | `DM Serif Display` |
+| hand | `Permanent Marker` |
+| mono | `JetBrains Mono`, `Space Mono` |
+
+```bash
+digiclip fonts                          # every usable family: bundled first, then yours
+digiclip fonts add ~/Downloads/Pacifico-Regular.ttf
+digiclip fonts remove Pacifico          # by family or file name (bundled ones stay)
+digiclip fonts --json                   # the same data the app gets from fonts_list
+digiclip input.mp4 --look '{"captions":{"font":"Montserrat ExtraBold"},"headline":{"font":"Bebas Neue"}}'
+```
+
+- **Your own fonts.** `.ttf` and `.otf` files, one family each, up to 20 MB. They are stored in `fonts/` under the data dir the engine runs with (`--data-dir`, by default `%APPDATA%/digiclip` on Windows), next to the bundled fonts: libass is given that one folder, so a render, the CLI's or serve's, and a `preview_frame` see both sets, and two data dirs never share fonts. You can also drop a file into the folder by hand. The name a Look uses is the font's family name (name id 1 of its `name` table), shown by `digiclip fonts`.
+- **What is refused on add**, each with a plain message: a file that is not a TrueType or OpenType font, a cut-off or damaged one, one without the tables the engine needs (`head`, `hhea`, `hmtx`, `cmap` with a Unicode map, `name`, and outlines), without a usable family name (1–64 characters, no comma, braces, backslash or semicolon: they would break a caption style), over 20 MB, a font collection (`.ttc`), a web font (`.woff`), a family that is already bundled or already added, and a file name that belongs to a bundled font. The stored file name is sanitised (the last path part only, letters, digits, `-` and `_`, a numbered suffix when it is taken). A font file that is broken after the fact is skipped, never a crash at render time.
+- **Layout of OpenType/CFF fonts.** The caption and headline layout read advances, the line box and the cap height from any font. A TrueType font (`glyf` outlines) also gives the real ink box of every glyph, which the per-word boxes and the headline card hug. An OpenType font with CFF outlines (most `.otf`) has no `glyf`; reading charstrings would need a Type 2 interpreter, so for those the ink's side bearings count as zero and its height is estimated from the cap height, with an allowance below the baseline only when the text has a letter that hangs there (`gjpqyQ` and brackets). A box around CFF text can therefore be a pixel or two looser at the sides. Kerning is not applied to the layout for any font (libass does draw it): a pair kern is a pixel or two.
+- **Serve protocol** (capability `look.fonts` in `hello`):
+
+```jsonc
+// → { "id": 3, "cmd": "fonts_list" }
+// ← { "type": "res", "id": 3, "ok": true, "data": { "dir": "…/fonts", "max_bytes": 20971520, "fonts": [
+//      { "family": "Anton", "file": "Anton-Regular.ttf", "bundled": true, "category": "display",
+//        "weight": 400, "bytes": 170812, "licence": "OFL-1.1", "rev": "bundled", "url": "/font/Anton-Regular.ttf" },
+//      …,
+//      { "family": "Pacifico", "file": "Pacifico-Regular.ttf", "bundled": false, "category": "custom",
+//        "weight": 400, "bytes": 329380, "rev": "505a4-…", "url": "/font/Pacifico-Regular.ttf" } ] } }
+// → { "id": 4, "cmd": "fonts_add", "path": "C:\\Users\\me\\Downloads\\Pacifico-Regular.ttf" }
+// ← { "type": "res", "id": 4, "ok": true, "data": { "font": { …the entry… } } }
+// ← or { "type": "res", "id": 4, "ok": false, "error": "cannot add “x.ttc”: font collections (.ttc) are not supported: add a single .ttf or .otf file" }
+// → { "id": 5, "cmd": "fonts_remove", "font": "Pacifico" }          (a family or a file name)
+// ← { "type": "res", "id": 5, "ok": true, "data": { "font": { …the removed entry… } } }
+// ← or { "type": "res", "id": 5, "ok": false, "error": "“Anton” is installed with DigiClip and cannot be removed" }
+```
+
+  The list is bundled fonts first, in the picker's order, then yours by family. `category` groups a picker (`display`, `sans`, `rounded`, `comic`, `serif`, `hand`, `mono`; `custom` for yours), `weight` is the file's `usWeightClass`, `rev` changes when the file does. `fonts_remove` and `fonts_add` take effect for the next render and preview at once.
+- **Font files for the app's preview.** `GET /font/<file>?token=…` serves a listed font file by its file name (`file` from the list; add `&v=<rev>`), bundled or yours, as `font/ttf` or `font/otf` with `Cache-Control: public, max-age=31536000` and an `ETag` (a repeat with `If-None-Match` answers 304), so the app's preview draws with the very same bytes libass reads. Only a name the font list holds is served: the request text is never turned into a path, and anything else, `..`, separators, drive letters, encoded forms, other files in the folder, answers 404 (a missing or wrong token, 400 or 401).
+- Limits: a font is read into memory while the engine runs (up to 20 MB each); a variable font works at its default weight only; a font whose family name equals another's, bundled or added, is refused rather than shadowed.
 
 ### 🖼 Exact frame (serve mode)
 

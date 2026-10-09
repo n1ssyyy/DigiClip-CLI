@@ -10,6 +10,7 @@ pub mod compose;
 pub mod decide;
 pub mod fetch;
 pub mod ffmpeg;
+pub mod fonts;
 pub mod framing;
 pub mod gpu;
 pub mod kit;

@@ -903,6 +903,11 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     );
 
     let look = look_for(args)?;
+    if let Some(raw) = args.look.as_deref() {
+        for note in crate::look::Look::font_notes(raw) {
+            tracing::warn!("look: {note}");
+        }
+    }
     let tag = look.canvas.tag();
     if look.canvas != crate::compose::Canvas::TALL {
         tracing::info!(

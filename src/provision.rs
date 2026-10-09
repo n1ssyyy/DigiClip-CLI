@@ -7,7 +7,8 @@
 //!   ~80MB auto-download; macOS/Linux: system install, never downloaded)
 //! - `yunet_2026may.onnx` (face detector, ~230KB)
 //! - `models/ggml-*.bin` (whisper weights, via [`crate::models`])
-//! - `fonts/*.ttf` (embedded in the exe, 1MB — written out for libass)
+//! - `fonts/*.ttf` (the bundled fonts, embedded in the exe, ~2.3MB — written
+//!   out for libass — and the creator's own `.ttf`/`.otf`, see [`crate::fonts`])
 //!
 //! Everything is cached; later runs are fully offline. If a download fails
 //! (offline machine), callers fall back gracefully: system PATH ffmpeg,
@@ -18,25 +19,6 @@ use std::path::{Path, PathBuf};
 pub const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
 pub const YUNET_URL: &str = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2026may.onnx";
 pub const YUNET_FILE: &str = "yunet_2026may.onnx";
-
-pub(crate) const FONTS: &[(&str, &[u8])] = &[
-    (
-        "Anton-Regular.ttf",
-        include_bytes!("../resources/fonts/Anton-Regular.ttf"),
-    ),
-    (
-        "ArchivoBlack-Regular.ttf",
-        include_bytes!("../resources/fonts/ArchivoBlack-Regular.ttf"),
-    ),
-    (
-        "Inter-Medium.ttf",
-        include_bytes!("../resources/fonts/Inter-Medium.ttf"),
-    ),
-    (
-        "JetBrainsMono-Variable.ttf",
-        include_bytes!("../resources/fonts/JetBrainsMono-Variable.ttf"),
-    ),
-];
 
 /// Root of the provisioned user-data dir.
 pub fn root() -> PathBuf {
@@ -49,25 +31,48 @@ pub fn bin_dir() -> PathBuf {
     root().join("bin")
 }
 
+/// The data dir the engine runs with, once `--data-dir` has set it.
+static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Make `dir` the data dir for this process (serve does it at boot): the
+/// fonts folder, and so what libass is given, follows it.
+pub fn set_data_dir(dir: PathBuf) {
+    let _ = DATA_DIR.set(dir);
+}
+
+/// The data dir in use: `--data-dir`, else [`root`].
+pub fn data_dir() -> PathBuf {
+    DATA_DIR.get().cloned().unwrap_or_else(root)
+}
+
+/// The one folder libass reads fonts from: the bundled fonts and the
+/// creator's own (see [`crate::fonts`]), under the data dir in use.
 pub fn fonts_dir() -> PathBuf {
-    root().join("fonts")
+    data_dir().join("fonts")
 }
 
 pub fn yunet_path() -> PathBuf {
     root().join(YUNET_FILE)
 }
 
-/// Write embedded fonts out for libass (no-op when already present).
+/// Write the bundled fonts out for libass (no-op when already present and
+/// whole). The creator's fonts are in the same folder.
 pub fn ensure_fonts() -> anyhow::Result<PathBuf> {
-    let dir = fonts_dir();
-    std::fs::create_dir_all(&dir)?;
-    for (name, bytes) in FONTS {
-        let p = dir.join(name);
-        if !p.is_file() {
-            std::fs::write(&p, bytes)?;
+    ensure_fonts_in(&fonts_dir())
+}
+
+/// [`ensure_fonts`] for a given folder.
+pub fn ensure_fonts_in(dir: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    for f in crate::fonts::BUNDLED {
+        let p = dir.join(f.file);
+        let whole =
+            std::fs::metadata(&p).is_ok_and(|m| m.is_file() && m.len() == f.bytes.len() as u64);
+        if !whole {
+            std::fs::write(&p, f.bytes)?;
         }
     }
-    Ok(dir)
+    Ok(dir.to_path_buf())
 }
 
 pub async fn download_to(
