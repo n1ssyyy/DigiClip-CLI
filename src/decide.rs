@@ -193,7 +193,7 @@ impl Decider {
             Pick::Laya => {
                 if !laya::is_ready() {
                     tracing::info!("Laya bundle missing — downloading once (~1.6 GB)…");
-                    if let Err(e) = laya::download(None).await {
+                    if let Err(e) = laya::download(crate::download::Hooks::default()).await {
                         tracing::warn!("Laya download failed ({e:#}) — no System One judging");
                         return None;
                     }

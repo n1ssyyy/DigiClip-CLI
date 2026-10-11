@@ -94,6 +94,12 @@ jobs:
       - name: Render smoke
         run: cargo run --release --example render_smoke
 
+      # The real first-run downloads on this system: the portable ffmpeg is
+      # fetched into an empty folder, unpacked and started (it must have
+      # libass), and a download is resumed from a partial file.
+      - name: Provision smoke
+        run: cargo run --release --example provision_smoke
+
   build:
     name: Build (${{ matrix.os }})
     needs: test

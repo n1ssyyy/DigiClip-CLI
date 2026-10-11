@@ -62,7 +62,7 @@ pub fn tool() -> Option<PathBuf> {
 }
 
 /// yt-dlp, downloading the official build into `bin/` once if missing.
-pub async fn ensure_tool(progress: Option<&crate::progress::ByteFn>) -> anyhow::Result<PathBuf> {
+pub async fn ensure_tool(hooks: crate::download::Hooks<'_>) -> anyhow::Result<PathBuf> {
     if let Some(p) = tool() {
         return Ok(p);
     }
@@ -72,8 +72,15 @@ pub async fn ensure_tool(progress: Option<&crate::progress::ByteFn>) -> anyhow::
         "yt-dlp"
     });
     tracing::info!("yt-dlp not found — downloading the official build (once)…");
-    crate::provision::download_to(&format!("{RELEASE}{}", asset()), &dest, "yt-dlp", progress)
-        .await?;
+    // The smallest official build is a few MB: less is an error page.
+    crate::download::fetch(
+        &format!("{RELEASE}{}", asset()),
+        &dest,
+        "yt-dlp",
+        1 << 20,
+        hooks,
+    )
+    .await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -253,6 +260,28 @@ pub fn download(
     Ok(f)
 }
 
+/// What yt-dlp is asked for. Joining a video stream to a sound stream needs
+/// ffmpeg; without one, only a single file that already has both is any
+/// use (yt-dlp would otherwise leave the two streams apart, and the job
+/// would get a video with no sound).
+fn format_for(has_ffmpeg: bool) -> &'static str {
+    if has_ffmpeg {
+        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b"
+    } else {
+        "b[height<=1080][ext=mp4]/b[height<=1080]/b"
+    }
+}
+
+/// `Title.f399.mp4`: one stream of a download that was never joined.
+fn is_unjoined_stream(p: &Path) -> bool {
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.rsplit_once(".f"))
+        .is_some_and(|(_, id)| {
+            !id.is_empty() && id.len() <= 5 && id.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
 /// One yt-dlp run; its progress stays at or below 99.
 fn attempt(
     tool: &Path,
@@ -261,6 +290,10 @@ fn attempt(
     on_pct: &dyn Fn(u8),
     cancel: &crate::progress::CancelFlag,
 ) -> anyhow::Result<PathBuf> {
+    let ffmpeg = crate::binaries::resolve("ffmpeg");
+    if ffmpeg.is_none() {
+        tracing::warn!("no ffmpeg yet: asking for a single file with video and sound");
+    }
     let mut cmd = crate::process::command(tool);
     cmd.args([
         "--no-playlist",
@@ -272,14 +305,14 @@ fn attempt(
         "--print",
         "after_move:DLFILE %(filepath)s",
         "-f",
-        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
+        format_for(ffmpeg.is_some()),
         "--merge-output-format",
         "mp4",
         "-o",
         "%(title).80B.%(ext)s",
     ]);
     cmd.arg("-P").arg(dir);
-    if let Some(ff) = crate::binaries::resolve("ffmpeg") {
+    if let Some(ff) = ffmpeg {
         cmd.arg("--ffmpeg-location").arg(ff);
     }
     cmd.arg("--").arg(url);
@@ -340,12 +373,12 @@ fn attempt(
             .unwrap_or_else(|| format!("exit {status}"));
         anyhow::bail!("download failed: {}", why.trim_start_matches("ERROR: "));
     }
-    // The printed path; else the newest video in the folder.
+    // The printed path; else the newest whole video in the folder.
     let found = file.filter(|f| f.is_file()).or_else(|| {
         std::fs::read_dir(dir)
             .ok()?
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| is_video(p))
+            .filter(|p| is_video(p) && !is_unjoined_stream(p))
             .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
     });
     found.ok_or_else(|| anyhow::anyhow!("download finished but no video file was written"))
@@ -364,6 +397,21 @@ mod tests {
         assert!(!is_url("https://a.com/x y"));
         assert_eq!(host("https://www.youtube.com/watch?v=abc"), "youtube.com");
         assert_eq!(host("https://m.tiktok.com/@a/video/1"), "tiktok.com");
+    }
+
+    #[test]
+    fn without_ffmpeg_only_a_single_file_is_asked_for() {
+        assert!(format_for(true).contains("+ba"));
+        assert!(!format_for(false).contains('+'));
+    }
+
+    #[test]
+    fn unjoined_streams_are_told_from_videos() {
+        assert!(is_unjoined_stream(Path::new("Cop Shot 4 Times.f399.mp4")));
+        assert!(is_unjoined_stream(Path::new("a/b/Talk.f140.m4a")));
+        assert!(!is_unjoined_stream(Path::new("Talk.mp4")));
+        assert!(!is_unjoined_stream(Path::new("Talk.final.mp4")));
+        assert!(!is_unjoined_stream(Path::new("Talk.f.mp4")));
     }
 
     #[test]
