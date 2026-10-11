@@ -78,6 +78,7 @@ mod diag;
 mod health;
 pub mod mcp;
 mod mcp_apps;
+mod setup;
 mod watch;
 
 use diag::diagnostics;
@@ -660,6 +661,10 @@ struct Health {
     ffmpeg_ok: bool,
     ffmpeg_libass: bool,
     encoder: String,
+    /// Speech-to-text is part of this executable: nothing to install. (The
+    /// two below are optional helper programs; `whisper_vulkan` is the one
+    /// that runs speech-to-text on the graphics card.)
+    stt_embedded: bool,
     whisper_cli: bool,
     whisper_vulkan: bool,
     yunet_ok: bool,
@@ -697,6 +702,7 @@ impl Health {
             ffmpeg_ok: true,
             ffmpeg_libass: true,
             encoder: "libx264".into(),
+            stt_embedded: true,
             whisper_cli: true,
             whisper_vulkan: false,
             yunet_ok: true,
@@ -711,13 +717,14 @@ fn probe_health() -> Health {
     let ffmpeg = crate::binaries::resolve("ffmpeg");
     let whisper_cli = crate::binaries::resolve("whisper-cli").is_some();
     let whisper_vulkan = crate::binaries::resolve("whisper-cli-vulkan").is_some();
-    let yunet_ok = crate::provision::yunet_path().is_file();
+    let yunet_ok = crate::provision::yunet_ready();
     let (gpu_available, gpu_reason) = crate::gpu::resolve_mode(true);
     Health {
         version: env!("CARGO_PKG_VERSION").into(),
         ffmpeg_ok: ffmpeg.is_some(),
         ffmpeg_libass: ffmpeg.as_ref().is_some_and(|f| ffmpeg_libass_cached(f)),
         encoder: crate::render::pick_encoder(gpu_available),
+        stt_embedded: true,
         whisper_cli,
         whisper_vulkan,
         yunet_ok,
@@ -785,6 +792,10 @@ enum Cmd {
         id: String,
     },
     HealthGet,
+    /// What first-run setup has fetched and what it is still fetching.
+    SetupGet,
+    /// Try what failed again now (it also tries by itself, later).
+    SetupRetry,
     /// Model list of a Clip AI provider (default: the active one).
     AiModels {
         #[serde(default)]
@@ -934,6 +945,11 @@ enum Event {
         done: u64,
         total: u64,
     },
+    /// First-run setup changed (see `setup`): every item, as a `hello`
+    /// lists them.
+    Setup {
+        setup: Vec<setup::Item>,
+    },
     ModelsState {
         models: HashMap<String, ModelState>,
     },
@@ -973,6 +989,8 @@ struct AppState {
     jobs: Mutex<HashMap<String, LiveJob>>,
     settings: Mutex<Settings>,
     model_runs: Mutex<HashMap<String, ModelRun>>,
+    /// First-run downloads (see `setup`).
+    setup: setup::Setup,
     worker: Semaphore,
     bus: broadcast::Sender<ServerMsg>,
     id_counter: AtomicU64,
@@ -1725,6 +1743,7 @@ async fn snapshot(st: &AppState) -> serde_json::Value {
         "settings": settings,
         "models": models,
         "health": st.health.known(&st.bus),
+        "setup": setup::items(st).await,
         "mcp": mcp::public(st).await,
         // What this engine can do, so the app only enables live controls.
         "caps": crate::look::CAPS,
@@ -1975,6 +1994,12 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             let pub_ = s.public();
             st.save_settings(&s);
             drop(s);
+            if ["stt_model", "decider", "jev_key"]
+                .iter()
+                .any(|k| patch.get(k).is_some())
+            {
+                st.setup.kick();
+            }
             // A new key, provider or address: fetch that provider's models
             // now (this also picks one when none is set yet).
             for pid in refresh {
@@ -1999,113 +2024,27 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
             if mid != LAYA && crate::models::meta(&mid).is_err() {
                 return vec![err(id, format!("unknown model [{mid}]"))];
             }
-            {
-                let mut runs = st.model_runs.lock().await;
-                if runs.get(&mid).is_some_and(|r| r.downloading) {
-                    return vec![err(id, "already downloading")];
-                }
-                runs.insert(
-                    mid.clone(),
-                    ModelRun {
-                        downloading: true,
-                        progress: None,
-                        error: None,
-                    },
-                );
+            if mid == LAYA {
+                // Asked for again: setup may keep it there from now on.
+                let _ = std::fs::remove_file(setup::laya_off());
             }
-            let models = {
-                let runs = st.model_runs.lock().await;
-                st.models_state(&runs)
-            };
-            let _ = st.bus.send(ServerMsg::Ev {
-                ev: Event::ModelsState { models },
-            });
+            if let Err(e) = begin_model_download(&st, &mid).await {
+                return vec![err(id, e)];
+            }
             let st2 = st.clone();
             tokio::spawn(async move {
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<JobEvent>();
-                let emit = Emitter::new(tx);
-                let hook = emit.byte_hook(&mid);
-                let dl = async {
-                    if mid == LAYA {
-                        crate::decide::laya::download(hook.map(Arc::from))
-                            .await
-                            .map(|_| PathBuf::new())
-                    } else {
-                        crate::models::download_with(&mid, hook.as_deref()).await
-                    }
-                };
-                // Forward byte progress while downloading.
-                let st3 = st2.clone();
-                let mid3 = mid.clone();
-                let fwd = tokio::spawn(async move {
-                    while let Some(ev) = rx.recv().await {
-                        if let JobEvent::ModelsProgress { done, total, .. } = ev {
-                            let pct =
-                                done.saturating_mul(100).checked_div(total).unwrap_or(0) as u8;
-                            {
-                                let mut runs = st3.model_runs.lock().await;
-                                if let Some(r) = runs.get_mut(&mid3) {
-                                    r.progress = Some(pct);
-                                }
-                            }
-                            let _ = st3.bus.send(ServerMsg::Ev {
-                                ev: Event::ModelsProgress {
-                                    id: mid3.clone(),
-                                    done,
-                                    total,
-                                },
-                            });
-                        }
-                    }
-                });
-                let res = dl.await;
-                drop(emit);
-                let _ = fwd.await;
-                {
-                    let mut runs = st2.model_runs.lock().await;
-                    match &res {
-                        Ok(_) => {
-                            runs.remove(&mid);
-                        }
-                        Err(e) => {
-                            runs.insert(
-                                mid.clone(),
-                                ModelRun {
-                                    downloading: false,
-                                    progress: None,
-                                    error: Some(truncate(&e.to_string(), 200)),
-                                },
-                            );
-                        }
-                    }
-                }
-                let models = {
-                    let runs = st2.model_runs.lock().await;
-                    st2.models_state(&runs)
-                };
-                let _ = st2.bus.send(ServerMsg::Ev {
-                    ev: Event::ModelsState { models },
-                });
-                let _ = st2.bus.send(ServerMsg::Ev {
-                    ev: Event::Toast {
-                        tone: if res.is_ok() { "success" } else { "error" }.into(),
-                        title: if res.is_ok() {
-                            "Model ready"
-                        } else {
-                            "Download failed"
-                        }
-                        .into(),
-                        body: mid.clone(),
-                    },
-                });
-                // A probe that starts now (the binaries may have changed):
-                // it is stored, and sent to every client here.
-                if let Some(health) = st2.health.fresh(&st2.bus).await {
-                    let _ = st2.bus.send(ServerMsg::Ev {
-                        ev: Event::Health { health },
-                    });
-                }
+                download_model(st2, mid, true).await;
             });
+            vec![ok(id, None)]
+        }
+        Cmd::SetupGet => {
+            vec![ok(
+                id,
+                Some(serde_json::json!({ "setup": setup::items(&st).await })),
+            )]
+        }
+        Cmd::SetupRetry => {
+            st.setup.kick();
             vec![ok(id, None)]
         }
         Cmd::ModelsDelete { id: mid } => {
@@ -2119,12 +2058,14 @@ async fn handle_cmd(st: Arc<AppState>, msg: ClientMsg) -> Vec<ServerMsg> {
                 }
             }
             let gone = if mid == LAYA {
+                let _ = std::fs::write(setup::laya_off(), b"");
                 crate::decide::laya::remove().map_err(anyhow::Error::from)
             } else {
                 crate::models::file_for(&mid).map(|p| {
                     let _ = std::fs::remove_file(p);
                 })
             };
+            st.setup.touch();
             match gone {
                 Ok(()) => {
                     let runs = st.model_runs.lock().await;
@@ -2394,6 +2335,142 @@ async fn preview_frame(
 /// is built under the jobs lock; when a redo is already waiting for the
 /// worker the new spec joins it (same rank replaces) instead of queueing
 /// another run.
+/// Mark `mid` as downloading and say so. `Err` when it already is.
+async fn begin_model_download(st: &AppState, mid: &str) -> Result<(), &'static str> {
+    let models = {
+        let mut runs = st.model_runs.lock().await;
+        if runs.get(mid).is_some_and(|r| r.downloading) {
+            return Err("already downloading");
+        }
+        runs.insert(
+            mid.to_string(),
+            ModelRun {
+                downloading: true,
+                progress: None,
+                error: None,
+            },
+        );
+        st.models_state(&runs)
+    };
+    let _ = st.bus.send(ServerMsg::Ev {
+        ev: Event::ModelsState { models },
+    });
+    st.setup.touch();
+    Ok(())
+}
+
+/// Download a model marked by [`begin_model_download`] (a speech model, or
+/// the Laya bundle); `true` when it is on disk. `asked`: the creator asked
+/// for it, so a toast says how it ended (setup's own downloads stay quiet:
+/// they try again by themselves).
+async fn download_model(st: Arc<AppState>, mid: String, asked: bool) -> bool {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<JobEvent>();
+    let emit = Emitter::new(tx);
+    let hook = emit.byte_hook(&mid);
+    let (stw, midw) = (st.clone(), mid.clone());
+    let status = move |why: Option<&str>| stw.setup.set_waiting(&midw, why);
+    let hooks = crate::download::Hooks {
+        progress: hook.as_deref(),
+        cancel: None,
+        status: Some(&status),
+    };
+    let dl = async {
+        if mid == LAYA {
+            crate::decide::laya::download(hooks)
+                .await
+                .map(|_| PathBuf::new())
+        } else {
+            crate::models::download_with(&mid, hooks).await
+        }
+    };
+    // Forward byte progress while downloading.
+    let st3 = st.clone();
+    let mid3 = mid.clone();
+    let fwd = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if let JobEvent::ModelsProgress { done, total, .. } = ev {
+                let pct = done.saturating_mul(100).checked_div(total).unwrap_or(0) as u8;
+                {
+                    let mut runs = st3.model_runs.lock().await;
+                    if let Some(r) = runs.get_mut(&mid3) {
+                        r.progress = Some(pct);
+                    }
+                }
+                let _ = st3.bus.send(ServerMsg::Ev {
+                    ev: Event::ModelsProgress {
+                        id: mid3.clone(),
+                        done,
+                        total,
+                    },
+                });
+                st3.setup.touch();
+            }
+        }
+    });
+    let res = dl.await;
+    // The forwarder ends when every sender is gone: the emitter and the
+    // byte hook made from it.
+    drop(emit);
+    drop(hook);
+    let _ = fwd.await;
+    st.setup.set_waiting(&mid, None);
+    if let Err(e) = &res {
+        tracing::warn!("{mid}: download failed: {e:#}");
+    }
+    let models = {
+        let mut runs = st.model_runs.lock().await;
+        match &res {
+            Ok(_) => {
+                runs.remove(&mid);
+            }
+            Err(e) => {
+                runs.insert(
+                    mid.clone(),
+                    ModelRun {
+                        downloading: false,
+                        progress: None,
+                        error: Some(truncate(&e.to_string(), 300)),
+                    },
+                );
+            }
+        }
+        st.models_state(&runs)
+    };
+    let _ = st.bus.send(ServerMsg::Ev {
+        ev: Event::ModelsState { models },
+    });
+    st.setup.touch();
+    if asked {
+        let _ = st.bus.send(ServerMsg::Ev {
+            ev: Event::Toast {
+                tone: if res.is_ok() { "success" } else { "error" }.into(),
+                title: if res.is_ok() {
+                    "Model ready"
+                } else {
+                    "Download failed"
+                }
+                .into(),
+                body: match &res {
+                    Ok(_) => mid.clone(),
+                    Err(e) => format!("{mid}: {}", truncate(&e.to_string(), 200)),
+                },
+            },
+        });
+    }
+    // A probe that starts now (the binaries may have changed): it is
+    // stored, and sent to every client here. On its own, so whoever waits
+    // for this download does not also wait for a slow probe.
+    let sth = st.clone();
+    tokio::spawn(async move {
+        if let Some(health) = sth.health.fresh(&sth.bus).await {
+            let _ = sth.bus.send(ServerMsg::Ev {
+                ev: Event::Health { health },
+            });
+        }
+    });
+    res.is_ok()
+}
+
 /// Queue a job on a local file.
 async fn start_job(
     st: &Arc<AppState>,
@@ -2517,7 +2594,13 @@ async fn fetch_then_run(st: Arc<AppState>, jid: String) {
         });
     };
     stage(Some(0));
-    let got = match crate::fetch::ensure_tool(None).await {
+    // yt-dlp joins the video and the sound with ffmpeg, so ffmpeg comes
+    // first: without it the download is a video with no sound.
+    let hooks = crate::download::Hooks::default().with_cancel(&cancel);
+    if let Err(e) = crate::provision::ensure_ffmpeg_with(hooks).await {
+        tracing::warn!("no ffmpeg for the download ({e}): taking a single file");
+    }
+    let got = match crate::fetch::ensure_tool(hooks).await {
         Ok(tool) => {
             let (bus, j) = (st.bus.clone(), jid.clone());
             let c = cancel.clone();
@@ -3106,6 +3189,7 @@ pub async fn run_serve(
         jobs: Mutex::new(HashMap::new()),
         settings: Mutex::new(Settings::default()),
         model_runs: Mutex::new(HashMap::new()),
+        setup: setup::Setup::default(),
         worker: Semaphore::new(1),
         bus,
         id_counter: AtomicU64::new(1),
@@ -3132,6 +3216,17 @@ pub async fn run_serve(
         },
         |st| async move { mcp::restart(&st).await },
     );
+    // First-run downloads start once the rest of boot is done.
+    // `DIGICLIP_NO_SETUP` keeps the engine from fetching anything by itself.
+    let auto_setup = std::env::var_os("DIGICLIP_NO_SETUP").is_none();
+    let st_setup = st.clone();
+    let boot = async move {
+        boot.await;
+        tokio::spawn(setup::announce(st_setup.clone()));
+        if auto_setup {
+            tokio::spawn(setup::run(st_setup));
+        }
+    };
     serve_ready(
         listener,
         st,
@@ -3645,6 +3740,7 @@ mod tests {
             jobs: Mutex::new(HashMap::new()),
             settings: Mutex::new(Settings::default()),
             model_runs: Mutex::new(HashMap::new()),
+            setup: setup::Setup::default(),
             worker: Semaphore::new(1),
             bus,
             id_counter: AtomicU64::new(1),
@@ -3687,6 +3783,7 @@ mod tests {
             jobs: Mutex::new(HashMap::new()),
             settings: Mutex::new(Settings::default()),
             model_runs: Mutex::new(HashMap::new()),
+            setup: setup::Setup::default(),
             worker: Semaphore::new(1),
             bus,
             id_counter: AtomicU64::new(1),
@@ -4196,6 +4293,7 @@ mod tests {
             jobs: Mutex::new(HashMap::new()),
             settings: Mutex::new(settings),
             model_runs: Mutex::new(HashMap::new()),
+            setup: setup::Setup::default(),
             worker: Semaphore::new(1),
             bus,
             id_counter: AtomicU64::new(1),

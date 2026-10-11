@@ -61,23 +61,13 @@ pub fn meta(model: &str) -> anyhow::Result<ModelMeta> {
 }
 
 pub fn dir() -> PathBuf {
-    let base = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("digiclip")
-        .join("models");
+    let base = crate::provision::root().join("models");
     let _ = std::fs::create_dir_all(&base);
     base
 }
 
 pub fn file_for(model: &str) -> anyhow::Result<PathBuf> {
     Ok(dir().join(meta(model)?.file))
-}
-
-pub fn part_path(model: &str) -> anyhow::Result<PathBuf> {
-    Ok(PathBuf::from(format!(
-        "{}.part",
-        file_for(model)?.display()
-    )))
 }
 
 pub fn download_url(model: &str) -> anyhow::Result<String> {
@@ -129,64 +119,19 @@ pub fn ensure_bundled() {
     }
 }
 
-/// Stream-download with resume via Range + indicatif progress bar.
-/// `progress` (serve hook) also gets `(done, total)` byte updates.
+/// Fetch the model (see [`crate::download`]: resumed, retried, checked).
 pub async fn download(model: &str) -> anyhow::Result<PathBuf> {
-    download_with(model, None).await
+    download_with(model, crate::download::Hooks::default()).await
 }
 
 pub async fn download_with(
     model: &str,
-    progress: Option<&crate::progress::ByteFn>,
+    hooks: crate::download::Hooks<'_>,
 ) -> anyhow::Result<PathBuf> {
     let url = download_url(model)?;
-    let dest = part_path(model)?;
-    let final_path = file_for(model)?;
-    if let Some(p) = dest.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-    let resume_from = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-
-    let client = reqwest::Client::new();
-    let mut req = client.get(&url);
-    if resume_from > 0 {
-        req = req.header("Range", format!("bytes={resume_from}-"));
-    }
-    let resp = req.send().await?;
-    if !resp.status().is_success() && resp.status().as_u16() != 206 {
-        anyhow::bail!("Model download failed: HTTP {}", resp.status());
-    }
-    let total = resp.content_length().unwrap_or(0) + resume_from;
-    let bar = indicatif::ProgressBar::new(total.max(1));
-    bar.set_style(
-        indicatif::ProgressStyle::with_template("{msg} [{bar:40}] {bytes}/{total_bytes} ({eta})")
-            .unwrap(),
-    );
-    bar.set_message(format!("downloading {model}"));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(resume_from > 0)
-        .write(true)
-        .truncate(resume_from == 0)
-        .open(&dest)
-        .await?;
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
-    let mut stream = resp.bytes_stream();
-    let mut done = resume_from;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        done += chunk.len() as u64;
-        bar.set_position(done);
-        if let Some(p) = progress {
-            p(done, total);
-        }
-    }
-    file.flush().await?;
-    drop(file);
-    bar.finish_and_clear();
-    tokio::fs::rename(&dest, &final_path).await?;
-    Ok(final_path)
+    let dest = file_for(model)?;
+    // Anything `is_downloaded` would turn down is not the model.
+    let min = meta(model)?.size_mb * 1024 * 1024 / 10 * 9 + 1;
+    crate::download::fetch(&url, &dest, &format!("speech model {model}"), min, hooks).await?;
+    Ok(dest)
 }

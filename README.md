@@ -75,11 +75,11 @@ flowchart LR
 
 Download your binary from the [latest release](https://github.com/n1ssyyy/DigiClip-CLI/releases/latest) — `digiclip-win-x64.exe`, `digiclip-linux-x64` or `digiclip-macos-arm64` — and run it.
 
-- 🎞️ **ffmpeg with libass** — Windows downloads it on first run; macOS `brew install ffmpeg`; Linux `sudo apt install ffmpeg`.
+- 🎞️ **ffmpeg with libass** — one on your PATH is used; when there is none, DigiClip downloads a portable build on first run (Windows, macOS and Linux, x64 and arm64).
 - 🪟 Windows needs the [Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) (most PCs already have it).
 - 🐧 Linux needs glibc 2.38+ (Ubuntu 24.04+, Debian 13+, Fedora 39+). 🍎 macOS: Apple Silicon.
 
-The first run grabs what it needs — whisper model, face model, ffmpeg on Windows — then it works offline for good. `digiclip --provision` fetches it all up front.
+The first run grabs what it needs — whisper model, face model, ffmpeg when you have none — then it works offline for good. `digiclip --provision` fetches it all up front. Downloads survive a bad connection: they resume where they stopped, retry by themselves, and are checked before they are used. In `--serve` mode the engine fetches all of it (and Laya, and yt-dlp) by itself as soon as it is up.
 
 ## 🚀 Use it
 

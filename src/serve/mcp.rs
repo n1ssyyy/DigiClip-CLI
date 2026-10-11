@@ -1884,6 +1884,7 @@ mod tests {
             jobs: Default::default(),
             settings: tokio::sync::Mutex::new(s),
             model_runs: Default::default(),
+            setup: Default::default(),
             worker: tokio::sync::Semaphore::new(1),
             bus,
             id_counter: std::sync::atomic::AtomicU64::new(1),

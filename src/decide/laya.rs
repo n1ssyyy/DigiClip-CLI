@@ -41,11 +41,9 @@ pub fn is_ready() -> bool {
         .all(|(f, min)| std::fs::metadata(d.join(f)).is_ok_and(|m| m.is_file() && m.len() >= *min))
 }
 
-/// Fetch the missing bundle files (resumable). `progress` gets bytes over
-/// the whole bundle.
-pub async fn download(
-    progress: Option<std::sync::Arc<crate::progress::ByteFn>>,
-) -> anyhow::Result<()> {
+/// Fetch the missing bundle files (see [`crate::download`]: resumed,
+/// retried, checked). `hooks.progress` gets bytes over the whole bundle.
+pub async fn download(hooks: crate::download::Hooks<'_>) -> anyhow::Result<()> {
     let d = dir();
     let mut base = 0u64;
     for (f, min) in FILES {
@@ -56,13 +54,16 @@ pub async fn download(
             continue;
         }
         let offset = base;
-        let progress = progress.clone();
-        let hook = move |done: u64, _total: u64| {
-            if let Some(p) = &progress {
+        let over_all = move |done: u64, _total: u64| {
+            if let Some(p) = hooks.progress {
                 p((offset + done).min(TOTAL_BYTES), TOTAL_BYTES);
             }
         };
-        crate::provision::download_to(&format!("{REPO}{f}"), &dest, "laya", Some(&hook)).await?;
+        let hooks = crate::download::Hooks {
+            progress: Some(&over_all),
+            ..hooks
+        };
+        crate::download::fetch(&format!("{REPO}{f}"), &dest, "Laya", *min, hooks).await?;
         base += std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
     }
     if !is_ready() {

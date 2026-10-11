@@ -8,6 +8,7 @@ pub mod chapters;
 pub mod cli;
 pub mod compose;
 pub mod decide;
+pub mod download;
 pub mod fetch;
 pub mod ffmpeg;
 pub mod fonts;

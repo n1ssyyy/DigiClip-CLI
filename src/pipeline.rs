@@ -18,6 +18,7 @@ use crate::audio::Envelope;
 use crate::camera::{self, Kind, Pose, Target};
 use crate::cli::{Args, Framing, Mode};
 use crate::compose::Rect;
+use crate::download::Hooks;
 use crate::progress::{CancelFlag, ClipArtifact, Emitter, JobEvent, Stage};
 use crate::timeline::{CutPlan, Keep};
 use crate::track::RawTarget;
@@ -442,13 +443,16 @@ async fn resolve_timeline(
         }
         Framing::Smart => {
             if tracker.is_none() {
-                let model = match crate::provision::ensure_yunet().await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!("face model unavailable ({e}): center fallback");
-                        return None;
-                    }
-                };
+                let model =
+                    match crate::provision::ensure_yunet_with(Hooks::default().with_cancel(cancel))
+                        .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!("face model unavailable ({e}): center fallback");
+                            return None;
+                        }
+                    };
                 match crate::track::Tracker::load(&model, gpu_on) {
                     Ok(t) => *tracker = Some(t),
                     Err(e) => {
@@ -721,7 +725,11 @@ async fn fetch_links(mut args: Args) -> anyhow::Result<Args> {
     if !args.input.iter().chain(&args.more).any(is_link) {
         return Ok(args);
     }
-    let tool = crate::fetch::ensure_tool(None).await?;
+    // yt-dlp joins video and sound with ffmpeg: have it first.
+    if let Err(e) = crate::provision::ensure_ffmpeg().await {
+        tracing::warn!("no ffmpeg for the download ({e}): taking a single file");
+    }
+    let tool = crate::fetch::ensure_tool(Hooks::default()).await?;
     let dir = args
         .out_dir
         .clone()
@@ -858,7 +866,8 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     // Prefer an existing ffmpeg (system or bundled); download only on gap.
     if crate::binaries::resolve("ffmpeg").is_none() {
         let hook = emit.byte_hook("ffmpeg");
-        crate::provision::ensure_ffmpeg_with(hook.as_deref()).await?;
+        crate::provision::ensure_ffmpeg_with(Hooks::progress(hook.as_deref()).with_cancel(cancel))
+            .await?;
     }
     let ffmpeg = crate::binaries::require("ffmpeg")?;
     tracing::info!("ffmpeg: {}", ffmpeg.display());
@@ -872,7 +881,11 @@ pub async fn run_inner(args: &Args, ctx: &JobCtx<'_>) -> anyhow::Result<Vec<Clip
     if !crate::models::is_downloaded(&args.model) {
         tracing::info!("STT model '{}' missing — downloading (once)…", args.model);
         let hook = emit.byte_hook(&args.model);
-        crate::models::download_with(&args.model, hook.as_deref()).await?;
+        crate::models::download_with(
+            &args.model,
+            Hooks::progress(hook.as_deref()).with_cancel(cancel),
+        )
+        .await?;
     }
     // Master GPU switch: one policy drives STT (Vulkan sidecar vs embedded),
     // tracking (DirectML vs CPU) and renders (NVENC vs libx264).
